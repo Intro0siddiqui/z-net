@@ -1,4 +1,4 @@
-# Zawra Networking Stack 🚀
+# z-net 🚀
 
 A next-generation, high-performance networking framework designed for modern browsers and applications. Built with cutting-edge technologies (Zig, Mojo, Rust) for enterprise-grade performance, security, and reliability.
 
