@@ -1,0 +1,16 @@
+[package]
+name = "z-pipeline"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "z_pipeline"
+crate-type = ["staticlib", "cdylib"]
+path = "pipeline.rs"
+
+[dependencies]
+# Essential async primitives
+tokio = { version = "1.0", features = ["sync", "time", "net", "rt"] }
+
+# Removed unused heavy dependencies: reqwest, hyper, prometheus, async-std, clap
+# These were identified as binary size bloat.
