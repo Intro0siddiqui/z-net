@@ -6,27 +6,38 @@ A next-generation, high-performance networking framework designed for modern bro
 
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3, QUIC with 0-RTT
 - **High Performance**: <3ms HTTP/3, <5ms HTTP/2, >90% cache hit rate
-- **Enterprise Security**: TLS 1.3, Certificate Transparency, Privacy DNS
+- **Enterprise Security**: TLS 1.3, Certificate Transparency, Privacy DNS, Policy Engine (SOP/CORS/CSP)
 - **Real-time Monitoring**: Interactive dashboards, performance budgets
+- **Web API Integration**: Event Loop, Service Workers, WebSockets
+- **Advanced Storage**: BrowserDB integration (localStorage, IndexedDB, Cache API)
+- **Zig Engineering Rules**: Adherence to Unified I/O and OS-Agnosticism ("1 API, 3 Fast Code Paths")
 - **Production Ready**: Zero-downtime deployment, automated recovery
 
 ## 📦 Module Overview
 
 | Module | Purpose | Language | Lines |
 |--------|---------|----------|-------|
-| **z_socket** | Raw TCP/UDP I/O foundation | Zig | 339 |
-| **z_tls** | TLS 1.3 with mbedTLS | Zig | 326 |
-| **z_dns** | Multi-protocol DNS resolution | Zig | 440 |
-| **z_http** | HTTP/1.1 + HTTP/2 engine | Mojo | 617 |
-| **z_quic** | QUIC transport protocol | Zig | 613 |
-| **z_http3** | HTTP/3 over QUIC | Mojo | 727 |
-| **z_cache** | BrowserDB caching | Zig | 651 |
-| **z_pipeline** | Async orchestration | Rust | 775 |
-| **z_fetch** | Public API interface | Mojo | - |
-| **z_security** | Enterprise security suite | Zig/Mojo | 2,833 |
-| **z_monitoring** | Observability platform | Zig/Mojo | 3,647 |
-| **z_testing** | QA & testing framework | Zig/Mojo | 6,313 |
-| **z_deployment** | Production operations | Zig/Mojo | 6,218 |
+| **z_socket** | Raw TCP/UDP I/O foundation | Zig | 257 |
+| **z_tls** | TLS 1.3 with mbedTLS | Zig | 211 |
+| **z_dns** | Multi-protocol DNS resolution | Zig | 441 |
+| **z_http** | HTTP/1.1 + HTTP/2 engine | Mojo | 616 |
+| **z_quic** | QUIC transport protocol | Zig | 612 |
+| **z_http3** | HTTP/3 over QUIC | Mojo | 726 |
+| **z_cache** | BrowserDB caching | Zig | 650 |
+| **z_pipeline** | Async orchestration | Rust | 774 |
+| **z_fetch** | Public API interface | Mojo | 534 |
+| **z_security** | Enterprise security suite | Zig/Mojo | 3,323 |
+| **z_monitoring** | Observability platform | Zig/Mojo | 3,087 |
+| **z_performance** | Performance optimization | Zig | 738 |
+| **z_prioritization**| HTTP/2 prioritization | Zig | 778 |
+| **z_early_hints** | HTTP 103 Early Hints | Mojo | 787 |
+| **z_event_loop** | Web API Event Loop | Zig | 2,319 |
+| **z_policy** | Browser Policy Engine | Zig | 2,783 |
+| **z_storage** | Browser Storage Bridge | Zig | 3,000 |
+| **z_websocket** | WebSocket Implementation | Zig | 2,054 |
+| **z_service_worker**| Service Worker Foundation | Zig | 5,462 |
+
+**Total Source Lines**: ~34,000+
 
 ## 🚀 Quick Start
 
@@ -36,7 +47,7 @@ A next-generation, high-performance networking framework designed for modern bro
 - Rust (latest)
 - Build system for your platform
 
-### Basic Usage
+### Basic Usage (Zig)
 
 ```zig
 const zawra = @import("zawra_netstack");
@@ -56,31 +67,20 @@ pub fn main() !void {
 }
 ```
 
-### HTTP/2 with Advanced Features
+### Advanced Usage (Mojo)
 
-```zig
-// Enable HTTP/2 with connection coalescing
-var options = zawra.FetchOptions.init();
-options.enable_http2 = true;
-options.enable_connection_coalescing = true;
-options.set_performance_budget(.{ .max_response_time = 5000 }); // 5s
+```python
+from zawra_netstack import ZawraFetch, FetchOptions
 
-const result = fetch.get("https://api.example.com/data", options);
+def main():
+    fetch = ZawraFetch()
+    options = FetchOptions()
+    options.set_header("Accept", "application/json")
 
-// Enable real-time monitoring
-var monitor = zawra.MonitoringDashboard.init(.{});
-monitor.enable_real_time_metrics();
-```
-
-### QUIC/HTTP/3 Usage
-
-```zig
-// Use QUIC for modern transport
-var quic_options = zawra.QuicOptions.init();
-quic_options.enable_0rtt = true;
-quic_options.enable_connection_migration = true;
-
-const quic_result = fetch.get_quic("https://modern-api.com", quic_options);
+    result = fetch.get("https://api.example.com/data", options)
+    if result.ok:
+        print(f"Status: {result.status}")
+        print(f"Body: {result.body}")
 ```
 
 ## 📚 Documentation Structure
@@ -97,31 +97,25 @@ const quic_result = fetch.get_quic("https://modern-api.com", quic_options);
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────┐
-│           z_fetch API               │  (Mojo)
-├─────────────────────────────────────┤
-│      z_http3 (QUIC + HTTP/3)       │  (Mojo)
-├─────────────────────────────────────┤
-│      z_prioritization (HTTP/2)      │  (Zig)
-├─────────────────────────────────────┤
-│       z_early_hints (HTTP 103)      │  (Mojo)
-├─────────────────────────────────────┤
-│      z_performance (Optimization)   │  (Zig)
-├─────────────────────────────────────┤
-│         z_pipeline Executor         │  (Rust)
-├─────────────────────────────────────┤
-│    z_cache (BrowserDB Integration)  │  (Zig)
-├─────────────────────────────────────┤
-│        z_http (HTTP/1.1 + HTTP/2)   │  (Mojo/Zig)
-├─────────────────────────────────────┤
-│         z_quic (Transport)          │  (Zig)
-├─────────────────────────────────────┤
-│        z_tls (TLS 1.3 + mbedTLS)    │  (Zig/C)
-├─────────────────────────────────────┤
-│         z_dns (DoH/DoT/UDP)         │  (Zig)
-├─────────────────────────────────────┤
-│         z_socket (TCP/UDP I/O)      │  (Zig)
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    z_fetch Public API                   │ (Mojo)
+├─────────────────────────────────────────────────────────┤
+│    z_service_worker  │  z_websocket  │  z_event_loop    │ (Zig)
+├─────────────────────────────────────────────────────────┤
+│    z_policy (SOP/CORS) │  z_storage (IDB/Cache)         │ (Zig)
+├─────────────────────────────────────────────────────────┤
+│         z_http3 (QUIC)       │      z_early_hints       │ (Mojo)
+├─────────────────────────────────────────────────────────┤
+│    z_prioritization (H2)     │   z_performance (Opt)    │ (Zig)
+├─────────────────────────────────────────────────────────┤
+│                 z_pipeline Executor                     │ (Rust)
+├─────────────────────────────────────────────────────────┤
+│    z_cache (BrowserDB)       │   z_http (H1/H2)         │ (Zig/Mojo)
+├─────────────────────────────────────────────────────────┤
+│    z_tls (TLS 1.3)           │   z_dns (DoH/DoT)        │ (Zig)
+├─────────────────────────────────────────────────────────┤
+│                 z_socket (TCP/UDP I/O)                  │ (Zig)
+└─────────────────────────────────────────────────────────┘
 ```
 
 ## 🔧 Build & Install
@@ -132,7 +126,7 @@ git clone <repository-url>
 cd zawra-netstack
 
 # Build all modules
-./build.sh
+./build.sh build
 
 # Run tests
 ./build.sh test
@@ -154,17 +148,17 @@ cd zawra-netstack
 ## 🛡️ Security Features
 
 - **TLS 1.3** with session resumption and 0-RTT
+- **Policy Engine**: Full implementation of Same-Origin Policy, CORS, and CSP
 - **Certificate Transparency** validation (RFC 6962)
 - **OCSP Stapling** with response caching
 - **HSTS Preload** mechanism
 - **Privacy DNS** (DoH3, DoT, ECH)
-- **Security Headers** automation (CSP, HSTS, etc.)
 
 ## 🧪 Testing
 
 - **Protocol Compliance**: RFC validation for all protocols
 - **Performance Testing**: Regression detection and benchmarking
-- **Security Testing**: Vulnerability assessment
+- **Security Validation**: SOP/CORS/CSP bypass testing
 - **Cross-Platform**: Linux, macOS, Windows compatibility
 - **Load Testing**: Stress testing with concurrent connections
 
@@ -182,7 +176,6 @@ cd zawra-netstack
 - **Performance Metrics**: DNS, TCP, TLS, HTTP timing APIs
 - **Resource Monitoring**: Memory, CPU, network usage tracking
 - **Alerting**: Configurable thresholds and escalation
-- **Export Formats**: JSON, Prometheus, WebSocket streaming
 
 ## 🤝 Contributing
 
