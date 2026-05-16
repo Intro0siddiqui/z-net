@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+rust_net/target/
+*.o
+js_runtime_native
+js_runtime_znet
+high_perf_server
+zig-bin/
+node_modules/
+mock_data.json

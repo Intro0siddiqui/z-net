@@ -223,7 +223,7 @@ pub const Connection = struct {
             &bytes_read,
         );
 
-        const err = @enumFromInt(NetErrorCode, result);
+        const err: NetErrorCode = @enumFromInt(result);
         switch (err) {
             .None => return bytes_read,
             .WouldBlock => return error.WouldBlock,
@@ -244,7 +244,7 @@ pub const Connection = struct {
             &bytes_written,
         );
 
-        const err = @enumFromInt(NetErrorCode, result);
+        const err: NetErrorCode = @enumFromInt(result);
         switch (err) {
             .None => return bytes_written,
             .WouldBlock => return error.WouldBlock,
@@ -264,7 +264,7 @@ pub const Connection = struct {
     /// Get state
     pub fn getState(self: *Self) ConnState {
         const state = net_conn_state(self.engine, self.handle);
-        return @enumFromInt(ConnState, state);
+        return @enumFromInt(state);
     }
 };
 

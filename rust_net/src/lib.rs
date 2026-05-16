@@ -229,6 +229,9 @@ pub extern "C" fn net_connect(
         None => return null_mut(),
     };
     
+    // Enable TCP_NODELAY to avoid 40ms stall
+    let _ = stream.set_nodelay(true);
+    
     let conn_id = engine.next_conn_id;
     engine.next_conn_id += 1;
     
