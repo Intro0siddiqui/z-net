@@ -65,13 +65,74 @@ pub fn build(b: *std.Build) void {
     // z_http - HTTP Protocol Layer
     const z_http = b.addModule(.{
         .name = "z_http",
-        .root_source_file = b.path("src/z_http/http.mojo"),
+        .root_source_file = b.path("src/z_http/http.zig"),
         .target = target,
         .optimize = optimize,
         .test = true,
         .dependencies = &.{
             z_socket,
             z_dns,
+            z_network_bridge,
+        },
+    });
+
+    // z_http3 - HTTP/3 Protocol Layer
+    const z_http3 = b.addModule(.{
+        .name = "z_http3",
+        .root_source_file = b.path("src/z_http3/http3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+        .dependencies = &.{
+            z_network_bridge,
+        },
+    });
+
+    // z_fetch - Fetch API Layer
+    const z_fetch = b.addModule(.{
+        .name = "z_fetch",
+        .root_source_file = b.path("src/z_fetch/fetch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+        .dependencies = &.{
+            z_network_bridge,
+        },
+    });
+
+    // z_early_hints - Early Hints Layer
+    const z_early_hints = b.addModule(.{
+        .name = "z_early_hints",
+        .root_source_file = b.path("src/z_early_hints/early_hints.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+        .dependencies = &.{
+            z_network_bridge,
+        },
+    });
+
+    // z_privacy_dns - Privacy DNS Layer
+    const z_privacy_dns = b.addModule(.{
+        .name = "z_privacy_dns",
+        .root_source_file = b.path("src/z_security/privacy_dns.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+        .dependencies = &.{
+            z_network_bridge,
+        },
+    });
+
+    // z_ocsp_stapling - OCSP Stapling Layer
+    const z_ocsp_stapling = b.addModule(.{
+        .name = "z_ocsp_stapling",
+        .root_source_file = b.path("src/z_security/ocsp_stapling.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+        .dependencies = &.{
+            z_network_bridge,
         },
     });
 
@@ -93,6 +154,37 @@ pub fn build(b: *std.Build) void {
         .test = true,
     });
 
+    // z_config - Configuration Validation Layer
+    const z_config = b.addModule(.{
+        .name = "z_config",
+        .root_source_file = b.path("src/z_config/validator.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+    });
+
+    // z_health - Health Monitoring Layer
+    const z_health = b.addModule(.{
+        .name = "z_health",
+        .root_source_file = b.path("src/z_health/checker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+    });
+
+    // z_monitoring - Dashboard and Metrics Layer
+    const z_monitoring = b.addModule(.{
+        .name = "z_monitoring",
+        .root_source_file = b.path("src/z_monitoring/dashboard.zig"),
+        .target = target,
+        .optimize = optimize,
+        .test = true,
+        .dependencies = &.{
+            z_config,
+            z_health,
+        },
+    });
+
     // Root module that combines everything
     b.addModule(.{
         .name = "zawra_netstack",
@@ -106,10 +198,32 @@ pub fn build(b: *std.Build) void {
             z_tls,
             z_dns,
             z_http,
+            z_http3,
+            z_fetch,
+            z_early_hints,
             z_cache,
             z_security,
+            z_privacy_dns,
+            z_ocsp_stapling,
+            z_config,
+            z_health,
+            z_monitoring,
         },
     });
+
+    // ============================================================
+    // Monitor Executable
+    // ============================================================
+    const monitor_exe = b.addExecutable(.{
+        .name = "zawra-monitor",
+        .root_source_file = b.path("src/z_monitoring/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    monitor_exe.addModule("dashboard", z_monitoring);
+    monitor_exe.addModule("z_config", z_config);
+    monitor_exe.addModule("z_health", z_health);
+    b.installArtifact(monitor_exe);
 
     // ============================================================
     // Example Programs with Rust Integration
@@ -154,6 +268,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(z_http.test);
     test_step.dependOn(z_cache.test);
     test_step.dependOn(z_security.test);
+    test_step.dependOn(z_config.test);
+    test_step.dependOn(z_health.test);
+    test_step.dependOn(z_monitoring.test);
+
+    const edge_cases_test = b.addTest(.{
+        .root_source_file = b.path("tests/edge_cases.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_edge_cases_test = b.addRunArtifact(edge_cases_test);
+    test_step.dependOn(&run_edge_cases_test.step);
+
+    const cross_platform_test = b.addTest(.{
+        .root_source_file = b.path("tests/cross_platform.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_cross_platform_test = b.addRunArtifact(cross_platform_test);
+    test_step.dependOn(&run_cross_platform_test.step);
 }
 
 // ============================================================

@@ -5,7 +5,7 @@
 const std = @import("std");
 const socket = @import("../z_socket/socket.zig");
 const tls = @import("../z_tls/tls.zig");
-const http = @import("../z_http/http.mojo");
+const http = @import("../z_http/http.zig");
 const dns = @import("../z_dns/dns.zig");
 
 /// Connection Pool Entry

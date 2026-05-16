@@ -1,6 +1,6 @@
 # Zawra API Reference 📚
 
-The primary interface for the Zawra Networking Stack is the `ZawraFetch` API, implemented in Mojo. This document describes the public classes, structures, and methods available for browser integration.
+The primary interface for the Zawra Networking Stack is the `Fetch` API, implemented in Zig. This document describes the public classes, structures, and methods available for browser integration.
 
 ## 🚀 ZawraFetch Class
 

@@ -3,8 +3,8 @@ const testing = std.testing;
 const crypto = std.crypto;
 const base64 = std.base64;
 
-const http = @import("../src/z_http/http.mojo");
-const http3 = @import("../src/z_http3/http3.mojo");
+const http = @import("../src/z_http/http.zig");
+const http3 = @import("../src/z_http3/http3.zig");
 const quic = @import("../src/z_quic/quic.zig");
 const tls = @import("../src/z_tls/tls.zig");
 const dns = @import("../src/z_dns/dns.zig");

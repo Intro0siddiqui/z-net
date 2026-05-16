@@ -12,6 +12,25 @@ const std = @import("std");
 /// Opaque handle types (matching Rust definitions)
 pub const NetEngineHandle = ?*anyopaque;
 pub const ConnectionHandle = ?*anyopaque;
+pub const FetchHandle = ?*anyopaque;
+pub const ConnHandle = ?*anyopaque;
+
+/// Fetch options
+pub const FetchOptions = extern struct {
+    method: [*:0]const u8,
+    timeout: u32,
+};
+
+/// Network metrics
+pub const NetworkMetrics = extern struct {
+    total_packets_sent: u64,
+    total_packets_received: u64,
+    packet_loss_rate: f64,
+    average_latency_ms: f64,
+    jitter_ms: f64,
+    throughput_mbps: f64,
+    connection_quality_score: f64,
+};
 
 /// Error codes (matching Rust NetError enum)
 pub const NetErrorCode = enum(i32) {
@@ -91,6 +110,15 @@ extern fn net_conn_state(
     conn: ConnectionHandle,
 ) i32;
 
+/// Fetch create
+extern fn net_fetch_create(url: [*:0]const u8, options: *const FetchOptions) FetchHandle;
+
+/// HTTP/3 connect
+extern fn net_http3_connect(engine: NetEngineHandle, host: [*:0]const u8, port: u16) ConnHandle;
+
+/// Get metrics
+extern fn net_get_metrics(engine: NetEngineHandle) *const NetworkMetrics;
+
 // ============================================================
 // High-Level Zig API
 // ============================================================
@@ -110,7 +138,7 @@ pub const NetworkEngine = struct {
     /// Destroy engine
     pub fn deinit(self: *Self) void {
         if (self.handle) |h| {
-            net_engine_create(h);
+            net_engine_destroy(h); // Fixed call to net_engine_destroy
             self.handle = null;
         }
     }
@@ -123,10 +151,11 @@ pub const NetworkEngine = struct {
 
         // Null-terminate host string
         var host_buf: [256]u8 = undefined;
+        if (host.len >= 256) return error.HostTooLong;
         @memcpy(host_buf[0..host.len], host);
         host_buf[host.len] = 0;
 
-        const conn = net_connect(self.handle, &host_buf, port);
+        const conn = net_connect(self.handle, @ptrCast(&host_buf), port);
         if (conn == null) {
             return error.ConnectionFailed;
         }
@@ -135,6 +164,44 @@ pub const NetworkEngine = struct {
             .engine = self.handle,
             .handle = conn,
         };
+    }
+
+    /// Fetch URL
+    pub fn fetch(self: *Self, url: []const u8, method: []const u8) !FetchHandle {
+        _ = self;
+        var url_buf: [1024]u8 = undefined;
+        if (url.len >= 1024) return error.UrlTooLong;
+        @memcpy(url_buf[0..url.len], url);
+        url_buf[url.len] = 0;
+
+        var method_buf: [16]u8 = undefined;
+        if (method.len >= 16) return error.MethodTooLong;
+        @memcpy(method_buf[0..method.len], method);
+        method_buf[method.len] = 0;
+
+        const opts = FetchOptions{
+            .method = @ptrCast(&method_buf),
+            .timeout = 30000,
+        };
+
+        return net_fetch_create(@ptrCast(&url_buf), &opts);
+    }
+
+    /// HTTP/3 Connect
+    pub fn connectHttp3(self: *Self, host: []const u8, port: u16) !ConnHandle {
+        var host_buf: [256]u8 = undefined;
+        if (host.len >= 256) return error.HostTooLong;
+        @memcpy(host_buf[0..host.len], host);
+        host_buf[host.len] = 0;
+
+        return net_http3_connect(self.handle, @ptrCast(&host_buf), port);
+    }
+
+    /// Get Metrics
+    pub fn getMetrics(self: *Self) !*const NetworkMetrics {
+        const metrics = net_get_metrics(self.handle);
+        if (@intFromPtr(metrics) == 0) return error.MetricsUnavailable;
+        return metrics;
     }
 };
 

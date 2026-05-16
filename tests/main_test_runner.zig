@@ -49,7 +49,7 @@ pub const TestCoordinator = struct {
         try self.runSecurityValidation();
 
         // Test Suite 4: Integration Tests (if available)
-        // Note: These would be in separate files for edge_cases.mojo, cross_platform.mojo, etc.
+        // Note: These would be in separate files for edge_cases.zig, cross_platform.zig, etc.
         
         std.debug.print("\n=== FINAL TEST SUMMARY ===\n", .{});
         self.generateFinalReport();

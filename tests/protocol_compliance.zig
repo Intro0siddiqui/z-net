@@ -1,8 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 const net = std.net;
-const http = @import("../src/z_http/http.mojo");
-const http3 = @import("../src/z_http3/http3.mojo");
+const http = @import("../src/z_http/http.zig");
+const http3 = @import("../src/z_http3/http3.zig");
 const quic = @import("../src/z_quic/quic.zig");
 
 /// Protocol Compliance Test Suite

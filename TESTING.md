@@ -10,14 +10,14 @@ Tests are located in the `tests/` directory and within individual module directo
 - `tests/protocol_compliance.zig`: Ensures adherence to RFC standards (HTTP/1.1, HTTP/2, QUIC, etc.).
 - `tests/performance_benchmarks.zig`: Measures latency, throughput, and resource usage.
 - `tests/security_validation.zig`: Tests for SOP, CORS, CSP enforcement, and TLS vulnerabilities.
-- `tests/cross_platform.mojo`: Verifies functionality across Linux, macOS, and Windows.
+- `tests/cross_platform.zig`: Verifies functionality across Linux, macOS, and Windows.
 - `tests/load_testing.zig`: Stress tests the stack with high volumes of concurrent requests.
 
 ## 🚀 Running Tests
 
 ### Full Test Suite
 ```bash
-./build.sh test
+zig build test
 ```
 
 ### Module-Specific Tests
@@ -28,14 +28,13 @@ zig test socket.zig
 
 ### Performance Benchmarks
 ```bash
-./build.sh benchmark
+zig build benchmark
 ```
 
 ## 🛠️ Testing Tools
 
 - **Zig Test**: Native Zig testing framework for unit tests.
 - **Cargo Test**: For testing Rust components in `z_pipeline`.
-- **Mojo**: Used for high-level integration and cross-platform verification tests.
 
 ## 📈 Quality Gates
 

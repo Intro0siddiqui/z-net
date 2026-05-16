@@ -1,6 +1,6 @@
 # Zawra System Architecture 🏗️
 
-The Zawra Networking Stack is a modular, high-performance system designed for modern web browsers. It employs a multi-language approach to leverage the unique strengths of Zig, Mojo, and Rust.
+The Zawra Networking Stack is a modular, high-performance system designed for modern web browsers. It employs a multi-language approach to leverage the unique strengths of Zig and Rust.
 
 ## 📐 Conceptual Overview
 
@@ -8,19 +8,19 @@ Zawra follows a layered architecture where each layer provides specific services
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    z_fetch Public API                   │ (Mojo)
+│                    z_fetch Public API                   │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_service_worker  │  z_websocket  │  z_event_loop    │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_policy (SOP/CORS) │  z_storage (IDB/Cache)         │ (Zig)
 ├─────────────────────────────────────────────────────────┤
-│         z_http3 (QUIC)       │      z_early_hints       │ (Mojo)
+│         z_http3 (QUIC)       │      z_early_hints       │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_prioritization (H2)     │   z_performance (Opt)    │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │                 z_pipeline Executor                     │ (Rust)
 ├─────────────────────────────────────────────────────────┤
-│    z_cache (BrowserDB)       │   z_http (H1/H2)         │ (Zig/Mojo)
+│    z_cache (BrowserDB)       │   z_http (H1/H2)         │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_tls (TLS 1.3)           │   z_dns (DoH/DoT)        │ (Zig)
 ├─────────────────────────────────────────────────────────┤
@@ -40,7 +40,7 @@ The foundation layer is built according to strict **Zig Engineering Rules**:
 - **Unified I/O**: Centralized I/O management using dependency injection.
 - **OS-Agnosticism**: Single public API with compile-time dispatch for Linux, macOS/BSD, and Windows (1 API, 3 Fast Code Paths).
 
-### 2. Protocol Engine (Mojo & Zig)
+### 2. Protocol Engine (Zig)
 - **z_http**: Robust engine for HTTP/1.1 and HTTP/2.
 - **z_quic**: Transport layer implementation for QUIC.
 - **z_http3**: High-level HTTP/3 implementation over QUIC.
@@ -54,7 +54,7 @@ The foundation layer is built according to strict **Zig Engineering Rules**:
 - **z_storage**: Bridge to various browser storage mechanisms including LocalStorage, IndexedDB, and the Cache API.
 - **z_service_worker**: Full implementation of the Service Worker lifecycle and interceptors.
 
-### 5. Public Interface (Mojo)
+### 5. Public Interface (Zig)
 - **z_fetch**: Provides a developer-friendly API similar to the Web Fetch API for use within the browser.
 
 ## 🔄 Request Lifecycle
@@ -71,7 +71,7 @@ The foundation layer is built according to strict **Zig Engineering Rules**:
 ## 🌉 Cross-Language Integration
 
 - **Zig to Rust**: Accomplished through C FFI for performance.
-- **Mojo to Zig/Rust**: Uses Mojo's native interoperability features to call into compiled shared libraries.
+- **Zig Interop**: Modules are linked together as a single library or binary using the Zig build system, ensuring minimal overhead.
 
 ## 🛡️ Security Architecture
 

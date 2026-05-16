@@ -23,7 +23,8 @@ Zawra can also be deployed as a high-performance networking proxy for backend se
 
 The `deployment/` directory contains various scripts for operational management:
 
-- `health_checks.mojo`: Automated health monitoring of the stack.
+- `src/z_health/checker.zig`: Automated health monitoring of the stack.
+- `src/z_monitoring/dashboard.zig`: Dashboard and metrics visualization.
 - `performance_tuning.zig`: Scripts for optimizing runtime parameters based on system load.
 - `backup_recovery.zig`: Procedures for backing up and restoring `z_storage` and `z_cache` data.
 - `rolling_updates.zig`: Orchestrates zero-downtime updates of the networking components.
@@ -48,7 +49,7 @@ Zawra provides built-in support for real-time monitoring via `z_monitoring`.
 
 - **Logs**: Check the system logs for messages from the Zawra components.
 - **Benchmarks**: Run `./build.sh benchmark` to identify performance bottlenecks.
-- **Validation**: Use `configuration_validation.mojo` to ensure your production config is correct.
+- **Validation**: Use the `z_config` validator to ensure your production config is correct.
 
 ---
 

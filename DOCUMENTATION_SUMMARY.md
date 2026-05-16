@@ -7,7 +7,7 @@ The Zawra Networking Stack documentation has been updated to accurately reflect 
 | File | Purpose | Lines | Target Audience |
 |------|---------|-------|-----------------|
 | **[README.md](README.md)** | Project overview, features, and architecture | ~160 | Everyone |
-| **[QUICKSTART.md](QUICKSTART.md)** | 5-minute getting started guide (Zig & Mojo) | ~110 | New developers |
+| **[QUICKSTART.md](QUICKSTART.md)** | 5-minute getting started guide | ~110 | New developers |
 | **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** | Comprehensive development & contribution guide | ~100 | Contributors |
 | **[API_REFERENCE.md](API_REFERENCE.md)** | Public API documentation (ZawraFetch) | ~120 | API users |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | System design and module interaction deep-dive | ~100 | Advanced users |
@@ -23,12 +23,12 @@ The Zawra Networking Stack documentation has been updated to accurately reflect 
 - Documented adherence to **Zig Engineering Rules** (Unified I/O and OS-Agnosticism).
 
 ### 2. Architecture & Technical Stack
-- Revised the Architecture diagram in `README.md` and `ARCHITECTURE.md` to show the full stack from Foundation (Zig) to Public API (Mojo).
+- Revised the Architecture diagram in `README.md` and `ARCHITECTURE.md` to show the full stack from Foundation (Zig) to Public API (Zig/Rust).
 - Clarified the role of the Rust-based `z_pipeline` as the orchestration engine.
 
 ### 3. API & Quickstart
-- Corrected the `ZawraFetch` API examples in `QUICKSTART.md` to match the Mojo implementation in `src/z_fetch/fetch.mojo`.
-- Provided both Zig (low-level) and Mojo (high-level) entry points in the Quickstart guide.
+- Corrected the `ZawraFetch` API examples in `QUICKSTART.md` to match the native implementation in `src/z_fetch/fetch.zig`.
+- Provided high-level entry points in the Quickstart guide.
 
 ### 4. Operations & Testing
 - Documented the production operations scripts found in the `deployment/` directory within `DEPLOYMENT.md`.

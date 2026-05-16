@@ -15,6 +15,22 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
+pub mod protocols {
+    pub mod http;
+    pub mod http3;
+    pub mod fetch;
+    pub mod early_hints;
+}
+
+pub mod security {
+    pub mod dns;
+    pub mod ocsp;
+}
+
+pub mod monitoring;
+
+use crate::monitoring::NetworkMetrics;
+
 // ============================================================
 // Type Definitions
 // ============================================================
@@ -24,6 +40,18 @@ pub type NetEngineHandle = *mut c_void;
 
 /// Opaque handle to connection
 pub type ConnectionHandle = *mut c_void;
+
+/// Opaque handle for Fetch
+pub type FetchHandle = *mut c_void;
+
+/// Opaque handle for Connection (Plan alias)
+pub type ConnHandle = *mut c_void;
+
+#[repr(C)]
+pub struct FetchOptions {
+    pub method: *const c_char,
+    pub timeout: u32,
+}
 
 /// Error codes
 #[repr(i32)]
@@ -387,4 +415,40 @@ pub extern "C" fn net_conn_state(
     }
     // Simplification for the C ABI
     ConnState::Connected as i32
+}
+
+// ============================================================
+// Plan Extensions
+// ============================================================
+
+#[no_mangle]
+pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOptions) -> FetchHandle {
+    // Scaffolding implementation
+    null_mut()
+}
+
+#[no_mangle]
+pub extern "C" fn net_http3_connect(_engine: NetEngineHandle, _host: *const c_char, _port: u16) -> ConnHandle {
+    // Scaffolding implementation
+    null_mut()
+}
+
+#[no_mangle]
+pub extern "C" fn net_get_metrics(engine_handle: NetEngineHandle) -> *const NetworkMetrics {
+    if engine_handle.is_null() {
+        return std::ptr::null();
+    }
+    
+    // In a real implementation, this would return a pointer to metrics stored in the engine.
+    // We use Box::into_raw to provide a stable pointer for this scaffolding.
+    let metrics = Box::new(NetworkMetrics {
+        total_packets_sent: 0,
+        total_packets_received: 0,
+        packet_loss_rate: 0.0,
+        average_latency_ms: 0.0,
+        jitter_ms: 0.0,
+        throughput_mbps: 0.0,
+        connection_quality_score: 100.0,
+    });
+    Box::into_raw(metrics)
 }

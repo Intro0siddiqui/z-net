@@ -1,6 +1,6 @@
 # z-net 🚀
 
-A next-generation, high-performance networking framework designed for modern browsers and applications. Built with cutting-edge technologies (Zig, Mojo, Rust) for enterprise-grade performance, security, and reliability.
+A next-generation, high-performance networking framework designed for modern browsers and applications. Built with cutting-edge technologies (Zig, Rust) for enterprise-grade performance, security, and reliability.
 
 ## ⚡ Key Features
 
@@ -20,17 +20,17 @@ A next-generation, high-performance networking framework designed for modern bro
 | **z_socket** | Raw TCP/UDP I/O foundation | Zig | 257 |
 | **z_tls** | TLS 1.3 with mbedTLS | Zig | 211 |
 | **z_dns** | Multi-protocol DNS resolution | Zig | 441 |
-| **z_http** | HTTP/1.1 + HTTP/2 engine | Mojo | 616 |
+| **z_http** | HTTP/1.1 + HTTP/2 engine | Zig | 616 |
 | **z_quic** | QUIC transport protocol | Zig | 612 |
-| **z_http3** | HTTP/3 over QUIC | Mojo | 726 |
+| **z_http3** | HTTP/3 over QUIC | Zig | 726 |
 | **z_cache** | BrowserDB caching | Zig | 650 |
 | **z_pipeline** | Async orchestration | Rust | 774 |
-| **z_fetch** | Public API interface | Mojo | 534 |
-| **z_security** | Enterprise security suite | Zig/Mojo | 3,323 |
-| **z_monitoring** | Observability platform | Zig/Mojo | 3,087 |
+| **z_fetch** | Public API interface | Zig | 534 |
+| **z_security** | Enterprise security suite | Zig | 3,323 |
+| **z_monitoring** | Observability platform | Zig | 3,087 |
 | **z_performance** | Performance optimization | Zig | 738 |
 | **z_prioritization**| HTTP/2 prioritization | Zig | 778 |
-| **z_early_hints** | HTTP 103 Early Hints | Mojo | 787 |
+| **z_early_hints** | HTTP 103 Early Hints | Zig | 787 |
 | **z_event_loop** | Web API Event Loop | Zig | 2,319 |
 | **z_policy** | Browser Policy Engine | Zig | 2,783 |
 | **z_storage** | Browser Storage Bridge | Zig | 3,000 |
@@ -42,45 +42,41 @@ A next-generation, high-performance networking framework designed for modern bro
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Zig 0.11+
-- Mojo (latest)
+- Zig 0.12+
 - Rust (latest)
 - Build system for your platform
 
 ### Basic Usage (Zig)
 
 ```zig
+const std = @import("std");
 const zawra = @import("zawra_netstack");
 
 pub fn main() !void {
-    var fetch = zawra.ZawraFetch.init(.{});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    try zawra.init(allocator);
+    defer zawra.deinit();
+    
+    var fetch = try zawra.Fetch.init(allocator);
     defer fetch.deinit();
     
-    var options = zawra.FetchOptions.init();
-    options.set_header("User-Agent", "MyApp/1.0");
+    var options = zawra.FetchOptions.init(allocator);
+    defer options.deinit();
+    try options.headers.put("User-Agent", "MyApp/1.0");
     
-    const result = fetch.get("https://example.com", options);
-    if (result.ok) {
-        std.log.info("Status: {}", .{result.status});
-        std.log.info("Response: {}", .{result.body});
+    const response = try fetch.get("https://example.com", options);
+    defer response.deinit();
+
+    if (response.status == 200) {
+        std.log.info("Status: {d}", .{response.status});
+        if (response.body) |body| {
+            std.log.info("Response: {s}", .{body});
+        }
     }
 }
-```
-
-### Advanced Usage (Mojo)
-
-```python
-from zawra_netstack import ZawraFetch, FetchOptions
-
-def main():
-    fetch = ZawraFetch()
-    options = FetchOptions()
-    options.set_header("Accept", "application/json")
-
-    result = fetch.get("https://api.example.com/data", options)
-    if result.ok:
-        print(f"Status: {result.status}")
-        print(f"Body: {result.body}")
 ```
 
 ## 📚 Documentation Structure
@@ -98,19 +94,19 @@ def main():
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    z_fetch Public API                   │ (Mojo)
+│                    z_fetch Public API                   │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_service_worker  │  z_websocket  │  z_event_loop    │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_policy (SOP/CORS) │  z_storage (IDB/Cache)         │ (Zig)
 ├─────────────────────────────────────────────────────────┤
-│         z_http3 (QUIC)       │      z_early_hints       │ (Mojo)
+│         z_http3 (QUIC)       │      z_early_hints       │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_prioritization (H2)     │   z_performance (Opt)    │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │                 z_pipeline Executor                     │ (Rust)
 ├─────────────────────────────────────────────────────────┤
-│    z_cache (BrowserDB)       │   z_http (H1/H2)         │ (Zig/Mojo)
+│    z_cache (BrowserDB)       │   z_http (H1/H2)         │ (Zig)
 ├─────────────────────────────────────────────────────────┤
 │    z_tls (TLS 1.3)           │   z_dns (DoH/DoT)        │ (Zig)
 ├─────────────────────────────────────────────────────────┤
@@ -126,13 +122,13 @@ git clone <repository-url>
 cd zawra-netstack
 
 # Build all modules
-./build.sh build
+zig build
 
 # Run tests
-./build.sh test
+zig build test
 
 # Run benchmarks
-./build.sh benchmark
+zig build benchmark
 ```
 
 ## 📊 Performance Benchmarks
@@ -181,7 +177,7 @@ cd zawra-netstack
 
 1. Fork the repository
 2. Create feature branch: `git checkout -b feature/amazing-feature`
-3. Run tests: `./build.sh test`
+3. Run tests: `zig build test`
 4. Commit changes: `git commit -m 'Add amazing feature'`
 5. Push to branch: `git push origin feature/amazing-feature`
 6. Open Pull Request

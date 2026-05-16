@@ -290,50 +290,74 @@ pub const OcspCertStatus = enum {
     UNKNOWN,
 };
 
-// Privacy DNS Resolver class for Mojo integration
-pub class PrivacyDnsResolver {
-    var allocator: Allocator
-    var use_encrypted_dns: Bool = True
-    var prefer_doh3: Bool = True
-    var use_ech: Bool = True
+// Privacy DNS Resolver for internal integration
+pub const PrivacyDnsResolver = struct {
+    allocator: std.mem.Allocator,
+    use_encrypted_dns: bool = true,
+    prefer_doh3: bool = true,
+    use_ech: bool = true,
     
-    def __init__(self, allocator: Allocator):
-        self.allocator = allocator
-        self.use_encrypted_dns = True
-        self.prefer_doh3 = True
-        self.use_ech = True
+    const Self = @This();
     
-    def resolve_domain(self, domain: String) -> Result[String, String]:
-        # Simplified DNS resolution with privacy enhancements
-        # In practice, would use DoH3/DoT with ECH
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .use_encrypted_dns = true,
+            .prefer_doh3 = true,
+            .use_ech = true,
+        };
+    }
+    
+    pub fn resolveDomain(self: *Self, domain: []const u8) ![]const u8 {
+        _ = self;
+        // Simplified DNS resolution with privacy enhancements
+        // In practice, would use DoH3/DoT with ECH
         
-        # For now, just return the domain as-is
-        return Ok(domain)
+        // For now, just return a copy of the domain
+        return try std.mem.Allocator.dupe(self.allocator, u8, domain);
+    }
     
-    def enable_encrypted_dns(self, enabled: Bool):
-        self.use_encrypted_dns = enabled
+    pub fn enableEncryptedDns(self: *Self, enabled: bool) void {
+        self.use_encrypted_dns = enabled;
+    }
     
-    def enable_ech(self, enabled: Bool):
-        self.use_ech = enabled
+    pub fn enableEch(self: *Self, enabled: bool) void {
+        self.use_ech = enabled;
+    }
 
-// OCSP Stapling Manager class for Mojo integration
-pub class OcspStaplingManager:
-    var allocator: Allocator
-    var cache_responses: Bool = True
+    pub fn close(self: *Self) void {
+        _ = self;
+    }
+};
+
+// OCSP Stapling Manager for internal integration
+pub const OcspStaplingManager = struct {
+    allocator: std.mem.Allocator,
+    cache_responses: bool = true,
     
-    def __init__(self, allocator: Allocator):
-        self.allocator = allocator
-        self.cache_responses = True
+    const Self = @This();
     
-    def check_certificate_status(self, cert_der: Array(UInt8)) -> OcspCertStatus:
-        # Simplified certificate status checking
-        # Would perform actual OCSP validation in practice
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .cache_responses = true,
+        };
+    }
+    
+    pub fn checkCertificateStatus(self: *Self, cert_der: []const u8) OcspCertStatus {
+        _ = self;
+        _ = cert_der;
+        // Simplified certificate status checking
+        // Would perform actual OCSP validation in practice
         
-        # For security, default to UNKNOWN if we can't verify
-        return OcspCertStatus.UNKNOWN
+        // For security, default to UNKNOWN if we can't verify
+        return OcspCertStatus.UNKNOWN;
+    }
     
-    def close(self):
-        pass
+    pub fn deinit(self: *Self) void {
+        _ = self;
+    }
+};
 
 // Convenience functions for quick security setup
 pub const SecuritySetup = struct {

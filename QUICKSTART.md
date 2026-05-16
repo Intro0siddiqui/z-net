@@ -8,8 +8,7 @@ Make sure you have these installed:
 
 ```bash
 # Check your versions
-zig version      # Should be 0.11+
-mojo --version   # Latest
+zig version      # Should be 0.12+
 rustc --version  # Latest
 ```
 
@@ -19,11 +18,11 @@ rustc --version  # Latest
 git clone <repository-url>
 cd zawra-netstack
 
-# Build everything
-./build.sh build
+# Build everything using the Zig build system
+zig build
 
-# Verify build by running tests
-./build.sh test
+# Or use the helper script
+./build.sh build
 ```
 
 ## 2. Your First Request (Zig)
@@ -41,80 +40,88 @@ pub fn main() !void {
     
     // Initialize the stack
     try zawra.init(allocator);
+    defer zawra.deinit();
     
-    // ZawraFetch is primarily a Mojo API,
-    // for Zig usage we use the underlying modules or the bridge.
-    var engine = try zawra.NetworkEngine.init(allocator);
-    defer engine.deinit();
+    // Create a fetch client
+    var fetch = try zawra.Fetch.init(allocator);
+    defer fetch.deinit();
     
-    const result = try engine.get("https://httpbin.org/get");
-    std.log.info("Status: {d}", .{result.status});
+    // Simple GET request
+    const response = try fetch.get("https://httpbin.org/get", .{});
+    defer response.deinit();
+    
+    std.debug.print("Status: {d}\n", .{response.status});
+    if (response.body) |body| {
+        std.debug.print("Body: {s}\n", .{body});
+    }
 }
 ```
 
-## 3. Your First Request (Mojo)
+## 3. Advanced Usage (Headers & POST)
 
-Create `hello_world.mojo`:
+```zig
+const std = @import("std");
+const zawra = @import("zawra_netstack");
 
-```python
-from zawra_netstack import ZawraFetch, FetchOptions
-
-def main():
-    # Initialize ZawraFetch
-    var fetch = ZawraFetch()
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
     
-    # Simple GET request
-    var result = fetch.get("https://httpbin.org/get")
+    try zawra.init(allocator);
+    defer zawra.deinit();
     
-    if result.ok:
-        print("Status Code: ", result.status)
-        # Body is a ByteArray, convert to string for printing
-        print("Response Body: ", "".join([chr(b) for b in result.body]))
-    else:
-        print("Error: ", result.error)
+    var fetch = try zawra.Fetch.init(allocator);
+    defer fetch.deinit();
+    
+    // Configure options
+    var options = zawra.FetchOptions.init(allocator);
+    defer options.deinit();
+    try options.headers.put("Content-Type", "application/json");
+    options.timeout_ms = 10000;
+    
+    // POST request with JSON body
+    const body = "{\"name\": \"Zawra\", \"version\": \"1.0\"}";
+    const response = try fetch.post("https://httpbin.org/post", body, options);
+    defer response.deinit();
+    
+    if (response.status == 200) {
+        std.debug.print("POST Successful!\n", .{});
+    }
+}
 ```
 
-## 4. Advanced Mojo Usage (Headers & POST)
+## 4. Caching & Performance
 
-```python
-from zawra_netstack import ZawraFetch, FetchOptions
+```zig
+const std = @import("std");
+const zawra = @import("zawra_netstack");
 
-def main():
-    var fetch = ZawraFetch()
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
     
-    # Configure options
-    var options = FetchOptions()
-    options.set_header("Content-Type", "application/json")
-    options.set_timeout(10.0)
+    try zawra.init(allocator);
+    defer zawra.deinit();
     
-    # POST request with JSON body
-    var body = '{"name": "Zawra", "version": "1.0"}'.encode("utf-8")
-    var result = fetch.post("https://httpbin.org/post", body, options)
+    var fetch = try zawra.Fetch.init(allocator);
+    defer fetch.deinit();
     
-    if result.ok:
-        print("POST Successful!")
-        print("Final URL: ", result.final_url)
-```
-
-## 5. Caching & Performance
-
-```python
-from zawra_netstack import ZawraFetch, FetchOptions
-
-def main():
-    var fetch = ZawraFetch()
-    var options = FetchOptions()
+    var options = zawra.FetchOptions.init(allocator);
+    defer options.deinit();
+    options.enable_cache = true;
     
-    # Enable caching for this request
-    options.enable_caching()
+    // First request - Fetch from network
+    const res1 = try fetch.get("https://httpbin.org/get", options);
+    std.debug.print("Request 1 - From Cache: {any}\n", .{res1.from_cache});
+    res1.deinit();
     
-    # First request - Fetch from network
-    var result1 = fetch.get("https://httpbin.org/get", options)
-    print("From Cache: ", result1.from_cache) # False
-    
-    # Second request - Served from local z_cache
-    var result2 = fetch.get("https://httpbin.org/get", options)
-    print("From Cache: ", result2.from_cache) # True
+    // Second request - Served from local z_cache
+    const res2 = try fetch.get("https://httpbin.org/get", options);
+    std.debug.print("Request 2 - From Cache: {any}\n", .{res2.from_cache});
+    res2.deinit();
+}
 ```
 
 ## 📚 Next Steps

@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const socket = @import("../z_socket/socket.zig");
-const http = @import("../z_http/http.mojo");
+const http = @import("../z_http/http.zig");
 
 /// HTTP/2 Frame Types
 const FRAME_TYPE_DATA: u8 = 0x0;

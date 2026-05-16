@@ -15,28 +15,41 @@
 //! 
 //! - **z_socket** - Raw TCP/UDP I/O layer (Zig)
 //! - **z_tls** - TLS 1.3 with mbedTLS (Zig/C)
-//! - **z_dns** - DNS resolution with DoH/DoT support (Mojo/Zig)
-//! - **z_http** - HTTP/1.1 and HTTP/2 protocol layer (Mojo/Zig)
+//! - **z_dns** - DNS resolution with DoH/DoT support (Zig)
+//! - **z_http** - HTTP/1.1 and HTTP/2 protocol layer (Zig)
 //! - **z_cache** - High-performance caching with BrowserDB (Zig)
 //! - **z_pipeline** - Async orchestration and scheduling (Rust)
-//! - **z_fetch** - Public API for browser integration (Mojo)
+//! - **z_fetch** - Public API for browser integration (Zig)
 //!
 //! ## Quick Start
 //!
 //! ```zig
+//! const std = @import("std");
 //! const zawra = @import("zawra_netstack");
 //!
 //! pub fn main() !void {
-//!     var fetch = zawra.ZawraFetch.init(.{});
+//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     defer _ = gpa.deinit();
+//!     const allocator = gpa.allocator();
+//!
+//!     try zawra.init(allocator);
+//!     defer zawra.deinit();
+//!
+//!     var fetch = try zawra.Fetch.init(allocator);
+//!     defer fetch.deinit();
 //!     
-//!     var options = zawra.FetchOptions.init();
-//!     options.set_header("User-Agent", "MyApp/1.0");
+//!     var options = zawra.FetchOptions.init(allocator);
+//!     defer options.deinit();
+//!     try options.headers.put("User-Agent", "MyApp/1.0");
 //!     
-//!     const result = fetch.get("https://example.com", options);
+//!     const response = try fetch.get("https://example.com", options);
+//!     defer response.deinit();
 //!     
-//!     if (result.ok) {
-//!         std.log.info("Status: {}", .{result.status});
-//!         std.log.info("Response: {}", .{result.body});
+//!     if (response.status == 200) {
+//!         std.log.info("Status: {d}", .{response.status});
+//!         if (response.body) |body| {
+//!             std.log.info("Response: {s}", .{body});
+//!         }
 //!     }
 //! }
 //! ```
@@ -84,14 +97,22 @@ pub const DnsCache = @import("z_dns/dns.zig").DnsCache;
 pub const HttpCache = @import("z_cache/cache.zig").HttpCache;
 pub const CookieCache = @import("z_cache/cache.zig").CookieCache;
 
+// Protocol Implementations
+pub const HttpClient = @import("z_http/http.zig").HttpClient;
+pub const Http3Client = @import("z_http3/http3.zig").Http3Client;
+pub const Fetch = @import("z_fetch/fetch.zig").Fetch;
+pub const FetchOptions = @import("z_fetch/fetch.zig").FetchOptions;
+pub const EarlyHintProcessor = @import("z_early_hints/early_hints.zig").EarlyHintProcessor;
+
+// Security and Privacy
+pub const PrivacyDNS = @import("z_security/privacy_dns.zig").PrivacyDNS;
+pub const OcspManager = @import("z_security/ocsp_stapling.zig").OcspManager;
+
 // Network Bridge (Rust FFI)
 pub const NetworkEngine = @import("z_network_bridge.zig").NetworkEngine;
 pub const Connection = @import("z_network_bridge.zig").Connection;
 pub const NetworkError = @import("z_network_bridge.zig").NetworkError;
 pub const poll = @import("z_network_bridge.zig").poll;
-
-// Re-export commonly used types
-pub usingnamespace @import("z_fetch/fetch.mojo"); // Note: Mojo types would need Zig bindings
 
 // Browser Policy Engine
 pub const PolicyEngine = @import("z_policy/policy_engine.zig").PolicyEngine;

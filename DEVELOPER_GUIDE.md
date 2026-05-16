@@ -4,11 +4,10 @@ Welcome to the Zawra Networking Stack developer guide. This document provides co
 
 ## 🏗️ Technical Stack
 
-The Zawra Networking Stack is built using a multi-language architecture:
+The Zawra Networking Stack is built using a high-performance native architecture:
 
 - **Zig**: Core performance-critical components (Socket, TLS, DNS, Cache, Event Loop, etc.)
-- **Mojo**: High-level protocol handling and API layers (HTTP, HTTP/3, Fetch API)
-- **Rust**: High-performance async orchestration and pipeline execution
+- **Rust**: High-performance protocol handling, async orchestration, and pipeline execution
 
 ## 📂 Repository Structure
 
@@ -22,8 +21,7 @@ The Zawra Networking Stack is built using a multi-language architecture:
 
 ### Prerequisites
 
-- **Zig 0.11+**: [Installation Guide](https://ziglang.org/learn/getting-started/)
-- **Mojo (latest)**: [Installation Guide](https://docs.modular.com/mojo/manual/get-started/)
+- **Zig 0.12.0+**: [Installation Guide](https://ziglang.org/learn/getting-started/)
 - **Rust (latest)**: [Installation Guide](https://www.rust-lang.org/tools/install)
 
 ### Initial Setup
@@ -36,9 +34,9 @@ cd zawra-netstack
 
 ## 🏗️ Build System
 
-We use a custom `build.sh` script to orchestrate the multi-language build process.
+We use a custom `build.sh` script to orchestrate the Zig and Rust build process.
 
-- `build.sh build`: Builds all components (Zig, Rust, Mojo)
+- `build.sh build`: Builds all components (Zig and Rust)
 - `build.sh clean`: Removes build artifacts
 - `build.sh test`: Runs the full test suite
 - `build.sh example`: Builds and runs usage examples
@@ -60,7 +58,6 @@ zig test socket.zig
 1. **Branching**: Use `feature/` or `fix/` prefixes for your branches.
 2. **Coding Standards**:
    - **Zig**: Follow the standard Zig style guide (use `zig fmt`).
-   - **Mojo**: Follow Python-like PEP 8 standards.
    - **Rust**: Follow standard Rust idioms (use `cargo fmt`).
 3. **Commits**: Use descriptive commit messages.
 4. **Pull Requests**: Provide a clear description of changes and link relevant issues.
@@ -86,17 +83,10 @@ When implementing OS-specific logic, use compile-time dispatch to provide the fa
 3. Add a `build.zig` if necessary.
 4. Export public types in `src/root.zig`.
 
-### Adding a New Mojo Module
-
-1. Create a directory in `src/z_<name>`.
-2. Implement your logic in `<name>.mojo`.
-3. Update `src/z_fetch/fetch.mojo` if it's a public-facing API.
-
 ## 🔍 Debugging Tips
 
 - **Zig**: Use `std.log` for logging.
 - **Rust**: Use the `log` crate or `println!`.
-- **Mojo**: Use `print()` for quick debugging.
 
 ## 📚 Documentation
 
