@@ -187,7 +187,7 @@ pub fn build(b: *std.Build) void {
 
     // Root module that combines everything
     b.addModule(.{
-        .name = "zawra_netstack",
+        .name = "znet",
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -215,7 +215,7 @@ pub fn build(b: *std.Build) void {
     // Monitor Executable
     // ============================================================
     const monitor_exe = b.addExecutable(.{
-        .name = "zawra-monitor",
+        .name = "znet-monitor",
         .root_source_file = b.path("src/z_monitoring/main.zig"),
         .target = target,
         .optimize = optimize,

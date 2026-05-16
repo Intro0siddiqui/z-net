@@ -237,33 +237,33 @@ pub const TimingCollector = struct {
         var buffer = std.ArrayList(u8).init(self.allocator);
         const writer = buffer.writer();
 
-        try writer.print("# HELP zawra_dns_latency_ns DNS lookup latency in nanoseconds\n", .{});
-        try writer.print("# TYPE zawra_dns_latency_ns histogram\n", .{});
-        try writer.print("zawra_dns_latency_ns{quantile=\"0.5\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.DNS, 0.5))) / 1_000_000_000.0});
-        try writer.print("zawra_dns_latency_ns{quantile=\"0.95\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.DNS, 0.95))) / 1_000_000_000.0});
-        try writer.print("zawra_dns_latency_ns{quantile=\"0.99\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.DNS, 0.99))) / 1_000_000_000.0});
+        try writer.print("# HELP z-net_dns_latency_ns DNS lookup latency in nanoseconds\n", .{});
+        try writer.print("# TYPE z-net_dns_latency_ns histogram\n", .{});
+        try writer.print("z-net_dns_latency_ns{quantile=\"0.5\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.DNS, 0.5))) / 1_000_000_000.0});
+        try writer.print("z-net_dns_latency_ns{quantile=\"0.95\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.DNS, 0.95))) / 1_000_000_000.0});
+        try writer.print("z-net_dns_latency_ns{quantile=\"0.99\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.DNS, 0.99))) / 1_000_000_000.0});
         
-        try writer.print("# HELP zawra_tcp_connect_latency_ns TCP connection latency in nanoseconds\n", .{});
-        try writer.print("# TYPE zawra_tcp_connect_latency_ns histogram\n", .{});
-        try writer.print("zawra_tcp_connect_latency_ns{quantile=\"0.5\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.TCP, 0.5))) / 1_000_000_000.0});
-        try writer.print("zawra_tcp_connect_latency_ns{quantile=\"0.95\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.TCP, 0.95))) / 1_000_000_000.0});
-        try writer.print("zawra_tcp_connect_latency_ns{quantile=\"0.99\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.TCP, 0.99))) / 1_000_000_000.0});
+        try writer.print("# HELP z-net_tcp_connect_latency_ns TCP connection latency in nanoseconds\n", .{});
+        try writer.print("# TYPE z-net_tcp_connect_latency_ns histogram\n", .{});
+        try writer.print("z-net_tcp_connect_latency_ns{quantile=\"0.5\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.TCP, 0.5))) / 1_000_000_000.0});
+        try writer.print("z-net_tcp_connect_latency_ns{quantile=\"0.95\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.TCP, 0.95))) / 1_000_000_000.0});
+        try writer.print("z-net_tcp_connect_latency_ns{quantile=\"0.99\"} {d}\n", .{@as(f64, @floatFromInt(self.getQuantileLatency(.TCP, 0.99))) / 1_000_000_000.0});
 
-        try writer.print("# HELP zawra_http_latency_ns HTTP request latency in nanoseconds\n", .{});
-        try writer.print("# TYPE zawra_http_latency_ns histogram\n", .{});
+        try writer.print("# HELP z-net_http_latency_ns HTTP request latency in nanoseconds\n", .{});
+        try writer.print("# TYPE z-net_http_latency_ns histogram\n", .{});
 
         const http_protocols = [_]Protocol{ .HTTP1_1, .HTTP2, .HTTP3 };
         for (http_protocols) |proto| {
             if (self.getMetrics(proto)) |metrics| {
-                try writer.print("zawra_http_latency_ns{{protocol=\"{}\",quantile=\"0.5\"}} {d}\n", .{
+                try writer.print("z-net_http_latency_ns{{protocol=\"{}\",quantile=\"0.5\"}} {d}\n", .{
                     @tagName(proto),
                     @as(f64, @floatFromInt(metrics.p95_latency_ns)) / 1_000_000_000.0,
                 });
-                try writer.print("zawra_http_latency_ns{{protocol=\"{}\",quantile=\"0.95\"}} {d}\n", .{
+                try writer.print("z-net_http_latency_ns{{protocol=\"{}\",quantile=\"0.95\"}} {d}\n", .{
                     @tagName(proto),
                     @as(f64, @floatFromInt(metrics.p95_latency_ns)) / 1_000_000_000.0,
                 });
-                try writer.print("zawra_http_latency_ns{{protocol=\"{}\",quantile=\"0.99\"}} {d}\n", .{
+                try writer.print("z-net_http_latency_ns{{protocol=\"{}\",quantile=\"0.99\"}} {d}\n", .{
                     @tagName(proto),
                     @as(f64, @floatFromInt(metrics.p99_latency_ns)) / 1_000_000_000.0,
                 });

@@ -248,14 +248,14 @@ pub const DeploymentManager = struct {
         self.logger.info("Deploying to Docker platform");
 
         // Build and tag image
-        const image_tag = try std.fmt.allocPrint(self.allocator, "zawra:{s}", .{ version });
+        const image_tag = try std.fmt.allocPrint(self.allocator, "z-net:{s}", .{ version });
         defer self.allocator.free(image_tag);
 
         try self.executeCommand(&.{ "docker", "build", "-t", image_tag, "." });
         try self.executeCommand(&.{ "docker", "tag", image_tag, image_tag });
 
         // Deploy with docker-compose or docker run
-        const container_name = try std.fmt.allocPrint(self.allocator, "zawra-{s}", .{ version });
+        const container_name = try std.fmt.allocPrint(self.allocator, "z-net-{s}", .{ version });
         defer self.allocator.free(container_name);
 
         // Stop existing container
@@ -283,7 +283,7 @@ pub const DeploymentManager = struct {
         self.logger.info("Deploying to Kubernetes platform");
 
         // Create namespace if needed
-        try self.executeCommand(&.{ "kubectl", "create", "namespace", "zawra" });
+        try self.executeCommand(&.{ "kubectl", "create", "namespace", "z-net" });
 
         // Generate Kubernetes manifests
         const manifest = try self.generateKubernetesManifest(config, version);
@@ -298,7 +298,7 @@ pub const DeploymentManager = struct {
         try self.executeCommand(&.{ "kubectl", "apply", "-f", manifest_file });
 
         // Wait for rollout
-        const rollout_command = &.{ "kubectl", "rollout", "status", "deployment/zawra-deployment" };
+        const rollout_command = &.{ "kubectl", "rollout", "status", "deployment/z-net-deployment" };
         try self.waitForCommand(rollout_command, config.deployment_timeout);
 
         result.artifacts.append(manifest_file);
@@ -308,10 +308,10 @@ pub const DeploymentManager = struct {
         self.logger.info("Deploying to bare metal platform");
 
         // Stop existing service
-        _ = self.executeCommand(&.{ "systemctl", "stop", "zawra" });
+        _ = self.executeCommand(&.{ "systemctl", "stop", "z-net" });
 
         // Deploy binary
-        const binary_path = try std.fmt.allocPrint(self.allocator, "/opt/zawra/{s}/zawra", .{ version });
+        const binary_path = try std.fmt.allocPrint(self.allocator, "/opt/z-net/{s}/z-net", .{ version });
         defer self.allocator.free(binary_path);
 
         try self.copyBinary(binary_path);
@@ -320,10 +320,10 @@ pub const DeploymentManager = struct {
         const service_content = try self.generateSystemdService(config, version);
         defer self.allocator.free(service_content);
 
-        try self.writeFile("/etc/systemd/system/zawra.service", service_content);
+        try self.writeFile("/etc/systemd/system/z-net.service", service_content);
         try self.executeCommand(&.{ "systemctl", "daemon-reload" });
-        try self.executeCommand(&.{ "systemctl", "enable", "zawra" });
-        try self.executeCommand(&.{ "systemctl", "start", "zawra" });
+        try self.executeCommand(&.{ "systemctl", "enable", "z-net" });
+        try self.executeCommand(&.{ "systemctl", "start", "z-net" });
 
         result.artifacts.append(binary_path);
     }
@@ -616,20 +616,20 @@ pub const DeploymentManager = struct {
             \\apiVersion: apps/v1
             \\kind: Deployment
             \\metadata:
-            \\  name: zawra-deployment
+            \\  name: z-net-deployment
             \\spec:
             \\  replicas: {}
             \\  selector:
             \\    matchLabels:
-            \\      app: zawra
+            \\      app: z-net
             \\  template:
             \\    metadata:
             \\      labels:
-            \\        app: zawra
+            \\        app: z-net
             \\    spec:
             \\      containers:
-            \\      - name: zawra
-            \\        image: zawra:{}
+            \\      - name: z-net
+            \\        image: z-net:{}
             \\        ports:
             \\        - containerPort: 8080
             \\        resources:
@@ -653,20 +653,20 @@ pub const DeploymentManager = struct {
     fn generateSystemdService(self: *Self, config: DeploymentConfig, version: []const u8) ![]const u8 {
         const service_content = try std.fmt.allocPrint(self.allocator,
             \\[Unit]
-            \\Description=Zawra Networking Stack
+            \\Description=z-net Networking Stack
             \\After=network.target
             \\
             \\[Service]
             \\Type=simple
-            \\User=zawra
-            \\Group=zawra
-            \\WorkingDirectory=/opt/zawra/{}
-            \\ExecStart=/opt/zawra/{}/zawra
+            \\User=z-net
+            \\Group=z-net
+            \\WorkingDirectory=/opt/z-net/{}
+            \\ExecStart=/opt/z-net/{}/z-net
             \\Restart=always
             \\RestartSec=5
             \\StandardOutput=journal
             \\StandardError=journal
-            \\SyslogIdentifier=zawra
+            \\SyslogIdentifier=z-net
             \\NoNewPrivileges=yes
             \\
             \\[Install]

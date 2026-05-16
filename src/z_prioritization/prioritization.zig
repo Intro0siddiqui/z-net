@@ -1,4 +1,4 @@
-/// Zawra HTTP/2 Prioritization System v1.0
+/// z-net HTTP/2 Prioritization System v1.0
 /// Advanced HTTP/2 stream prioritization with dependency trees,
 /// weighted fair scheduling, and server push coordination.
 

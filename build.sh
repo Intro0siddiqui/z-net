@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 
-# Zawra Networking Stack Build System
+# z-net Networking Stack Build System
 # Cross-platform build automation
 
 set -e
 
 # Configuration
-PROJECT_NAME="zawra-netstack"
+PROJECT_NAME="z-net-netstack"
 VERSION="1.1.0"
 BUILD_DIR="build"
 SOURCE_DIR="src"
@@ -83,7 +83,7 @@ check_dependencies() {
 
 # Build system
 build() {
-    log_info "Building Zawra Networking Stack..."
+    log_info "Building z-net Networking Stack..."
     zig build || {
         log_error "Zig build failed"
         exit 1
@@ -151,7 +151,7 @@ package() {
     
     # Create package info
     cat > $BUILD_DIR/PACKAGE_INFO << EOF
-Zawra Networking Stack v$VERSION
+z-net Networking Stack v$VERSION
 Platform: $PLATFORM-$ARCH
 Build Date: $(date)
 Components:
@@ -184,7 +184,7 @@ EOF
 
 # Help function
 show_help() {
-    echo "Zawra Networking Stack Build System"
+    echo "z-net Build System"
     echo ""
     echo "Usage: $0 [COMMAND]"
     echo ""

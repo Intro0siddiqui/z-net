@@ -1,6 +1,6 @@
-# Zawra Testing Framework 🧪
+# z-net Testing Framework 🧪
 
-The Zawra Networking Stack employs a multi-tiered testing strategy to ensure reliability, performance, and security across all supported platforms and protocols.
+z-net employs a multi-tiered testing strategy to ensure reliability, performance, and security across all supported platforms and protocols.
 
 ## 📂 Test Organization
 
@@ -47,7 +47,7 @@ A contribution is considered ready for merge only if:
 
 ## 🔍 CI/CD Integration
 
-The file `tests/cicd_integration.zig` contains the logic for running the Zawra test suite within various CI environments (GitHub Actions, GitLab CI, etc.).
+The file `tests/cicd_integration.zig` contains the logic for running the z-net test suite within various CI environments (GitHub Actions, GitLab CI, etc.).
 
 ---
 

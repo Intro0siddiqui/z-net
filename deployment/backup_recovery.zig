@@ -815,7 +815,7 @@ pub const BackupManager = struct {
         const cloud_backend = StorageBackend{
             .name = "cloud_s3",
             .storage_type = .cloud_s3,
-            .location = "s3://zawra-backups",
+            .location = "s3://z-net-backups",
             .config = HashMap([]const u8, []const u8).init(self.allocator),
             .enabled = true,
         };
@@ -828,7 +828,7 @@ pub const BackupManager = struct {
         const daily_config = BackupConfig{
             .name = "daily_incremental",
             .backup_type = .incremental,
-            .source_path = "/var/lib/zawra",
+            .source_path = "/var/lib/z-net",
             .storage_location = "local_storage",
             .storage_type = .local,
             .retention_days = 30,

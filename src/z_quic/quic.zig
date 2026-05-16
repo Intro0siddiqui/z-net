@@ -1,7 +1,7 @@
-/// Zawra QUIC Implementation v1.0
+/// z-net QUIC Implementation v1.0
 /// High-performance QUIC protocol stack with 0-RTT, connection migration,
 /// stream multiplexing, loss recovery, and congestion control.
-/// Integrates with the Zawra networking stack for browser-grade performance.
+/// Integrates with the z-net networking stack for browser-grade performance.
 
 const std = @import("std");
 const socket = @import("../z_socket/socket.zig");

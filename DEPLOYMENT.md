@@ -1,6 +1,6 @@
-# Zawra Deployment Guide 🚀
+# z-net Deployment Guide 🚀
 
-This guide covers the deployment and operational aspects of the Zawra Networking Stack in a production environment.
+This guide covers the deployment and operational aspects of z-net in a production environment.
 
 ## 📦 Deployment Models
 
@@ -8,7 +8,7 @@ This guide covers the deployment and operational aspects of the Zawra Networking
 The stack is designed to be compiled as a set of shared libraries and integrated directly into the browser process.
 
 ### 2. Standalone Proxy Mode
-Zawra can also be deployed as a high-performance networking proxy for backend services.
+z-net can also be deployed as a high-performance networking proxy for backend services.
 
 ## 🚀 Production Best Practices
 
@@ -31,7 +31,7 @@ The `deployment/` directory contains various scripts for operational management:
 
 ## 📊 Monitoring Integration
 
-Zawra provides built-in support for real-time monitoring via `z_monitoring`.
+z-net provides built-in support for real-time monitoring via `z_monitoring`.
 
 ### Key Metrics to Track
 - **Request Latency**: Breakdown by DNS, TLS, and Transfer times.
@@ -47,7 +47,7 @@ Zawra provides built-in support for real-time monitoring via `z_monitoring`.
 
 ## 🆘 Troubleshooting
 
-- **Logs**: Check the system logs for messages from the Zawra components.
+- **Logs**: Check the system logs for messages from the z-net components.
 - **Benchmarks**: Run `./build.sh benchmark` to identify performance bottlenecks.
 - **Validation**: Use the `z_config` validator to ensure your production config is correct.
 

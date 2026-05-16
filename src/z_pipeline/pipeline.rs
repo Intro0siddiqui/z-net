@@ -379,7 +379,7 @@ impl Pipeline {
         let mut headers = options.headers.clone();
         
         // Add default headers
-        headers.insert("User-Agent".to_string(), "Zawra NetStack/1.0".to_string());
+        headers.insert("User-Agent".to_string(), "z-net NetStack/1.0".to_string());
         headers.insert("Accept".to_string(), "*/*".to_string());
 
         // Add cookies if available

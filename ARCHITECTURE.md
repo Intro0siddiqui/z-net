@@ -1,10 +1,10 @@
-# Zawra System Architecture 🏗️
+# z-net Architecture 🏗️
 
-The Zawra Networking Stack is a modular, high-performance system designed for modern web browsers. It employs a multi-language approach to leverage the unique strengths of Zig and Rust.
+z-net is a modular, high-performance system designed for modern web browsers. It employs a multi-language approach to leverage the unique strengths of Zig and Rust.
 
 ## 📐 Conceptual Overview
 
-Zawra follows a layered architecture where each layer provides specific services to the layer above it.
+z-net follows a layered architecture where each layer provides specific services to the layer above it.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -81,4 +81,4 @@ The foundation layer is built according to strict **Zig Engineering Rules**:
 
 ---
 
-*This architecture ensures that Zawra is not only fast but also secure and extensible.*
+*This architecture ensures that z-net is not only fast but also secure and extensible.*

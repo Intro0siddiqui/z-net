@@ -334,8 +334,8 @@ pub const HealthMonitor = struct {
         var buffer = std.ArrayList(u8).init(self.allocator);
         const writer = buffer.writer();
 
-        try writer.print("# HELP zawra_connection_health_status Connection health status (0=unknown, 1=healthy, 2=degraded, 3=unhealthy, 4=critical)\n", .{});
-        try writer.print("# TYPE zawra_connection_health_status gauge\n", .{});
+        try writer.print("# HELP z-net_connection_health_status Connection health status (0=unknown, 1=healthy, 2=degraded, 3=unhealthy, 4=critical)\n", .{});
+        try writer.print("# TYPE z-net_connection_health_status gauge\n", .{});
 
         var connections_iter = self.connections.valueIterator();
         while (connections_iter.next()) |conn| {
@@ -346,34 +346,34 @@ pub const HealthMonitor = struct {
                 .UNHEALTHY => 3,
                 .CRITICAL => 4,
             };
-            try writer.print("zawra_connection_health_status{{connection=\"{s}\",host=\"{s}\",port=\"{d}\",protocol=\"{s}\"}} {d}\n",
+            try writer.print("z-net_connection_health_status{{connection=\"{s}\",host=\"{s}\",port=\"{d}\",protocol=\"{s}\"}} {d}\n",
                 .{ conn.connection_id, conn.host, conn.port, @tagName(conn.protocol), status_value });
         }
 
-        try writer.print("# HELP zawra_connection_response_time_ms Connection response time in milliseconds\n", .{});
-        try writer.print("# TYPE zawra_connection_response_time_ms gauge\n", .{});
+        try writer.print("# HELP z-net_connection_response_time_ms Connection response time in milliseconds\n", .{});
+        try writer.print("# TYPE z-net_connection_response_time_ms gauge\n", .{});
 
         connections_iter = self.connections.valueIterator();
         while (connections_iter.next()) |conn| {
-            try writer.print("zawra_connection_response_time_ms{{connection=\"{s}\"}} {d:.3f}\n",
+            try writer.print("z-net_connection_response_time_ms{{connection=\"{s}\"}} {d:.3f}\n",
                 .{ conn.connection_id, conn.response_time_ms });
         }
 
-        try writer.print("# HELP zawra_connection_success_rate Connection success rate (0-1)\n", .{});
-        try writer.print("# TYPE zawra_connection_success_rate gauge\n", .{});
+        try writer.print("# HELP z-net_connection_success_rate Connection success rate (0-1)\n", .{});
+        try writer.print("# TYPE z-net_connection_success_rate gauge\n", .{});
 
         connections_iter = self.connections.valueIterator();
         while (connections_iter.next()) |conn| {
-            try writer.print("zawra_connection_success_rate{{connection=\"{s}\"}} {d:.3f}\n",
+            try writer.print("z-net_connection_success_rate{{connection=\"{s}\"}} {d:.3f}\n",
                 .{ conn.connection_id, conn.success_rate });
         }
 
-        try writer.print("# HELP zawra_connection_health_score Connection health score (0-100)\n", .{});
-        try writer.print("# TYPE zawra_connection_health_score gauge\n", .{});
+        try writer.print("# HELP z-net_connection_health_score Connection health score (0-100)\n", .{});
+        try writer.print("# TYPE z-net_connection_health_score gauge\n", .{});
 
         connections_iter = self.connections.valueIterator();
         while (connections_iter.next()) |conn| {
-            try writer.print("zawra_connection_health_score{{connection=\"{s}\"}} {d:.1f}\n",
+            try writer.print("z-net_connection_health_score{{connection=\"{s}\"}} {d:.1f}\n",
                 .{ conn.connection_id, conn.health_score });
         }
 

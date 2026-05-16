@@ -15,7 +15,7 @@ pub fn main() !void {
     var io_ctx = std.Io.init();
     defer io_ctx.deinit();
 
-    std.log.info("Starting Zawra TLS Example", .{});
+    std.log.info("Starting z-net TLS Example", .{});
 
     // Test servers with different TLS configurations
     const test_servers = &[_]struct {

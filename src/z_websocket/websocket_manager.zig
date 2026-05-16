@@ -2,7 +2,7 @@
 //! 
 //! WebSocket handshake handler and manager that implements the WebSocket
 //! protocol handshake, connection management, and integration with the
-//! Zawra networking stack.
+//! z-net networking stack.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -391,7 +391,7 @@ pub const WebSocketManager = struct {
         
         // Set handshake headers
         handshake_request.setHeader("Origin", extractOriginFromUrl(connection.url));
-        handshake_request.setHeader("User-Agent", "Zawra/1.0");
+        handshake_request.setHeader("User-Agent", "z-net/1.0");
         
         // Add protocols if specified
         if (connection.protocols.items.len > 0) {

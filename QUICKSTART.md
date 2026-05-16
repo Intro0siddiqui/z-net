@@ -1,6 +1,6 @@
 # Quick Start Guide 🚀
 
-Get up and running with the Zawra Networking Stack in 5 minutes!
+Get up and running with z-net in 5 minutes!
 
 ## Prerequisites
 
@@ -16,11 +16,11 @@ rustc --version  # Latest
 
 ```bash
 git clone <repository-url>
-cd zawra-netstack
+cd z-net
 
 # Build everything using the Zig build system
 zig build
-
+```
 # Or use the helper script
 ./build.sh build
 ```
@@ -31,7 +31,7 @@ Create `hello_world.zig`:
 
 ```zig
 const std = @import("std");
-const zawra = @import("zawra_netstack");
+const znet = @import("znet");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -39,11 +39,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     
     // Initialize the stack
-    try zawra.init(allocator);
-    defer zawra.deinit();
+    try znet.init(allocator);
+    defer znet.deinit();
     
     // Create a fetch client
-    var fetch = try zawra.Fetch.init(allocator);
+    var fetch = try znet.Fetch.init(allocator);
     defer fetch.deinit();
     
     // Simple GET request
@@ -61,27 +61,27 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const zawra = @import("zawra_netstack");
+const znet = @import("znet");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     
-    try zawra.init(allocator);
-    defer zawra.deinit();
+    try znet.init(allocator);
+    defer znet.deinit();
     
-    var fetch = try zawra.Fetch.init(allocator);
+    var fetch = try znet.Fetch.init(allocator);
     defer fetch.deinit();
     
     // Configure options
-    var options = zawra.FetchOptions.init(allocator);
+    var options = znet.FetchOptions.init(allocator);
     defer options.deinit();
     try options.headers.put("Content-Type", "application/json");
     options.timeout_ms = 10000;
     
     // POST request with JSON body
-    const body = "{\"name\": \"Zawra\", \"version\": \"1.0\"}";
+    const body = "{\"name\": \"z-net\", \"version\": \"1.0\"}";
     const response = try fetch.post("https://httpbin.org/post", body, options);
     defer response.deinit();
     
@@ -95,20 +95,20 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const zawra = @import("zawra_netstack");
+const znet = @import("znet");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     
-    try zawra.init(allocator);
-    defer zawra.deinit();
+    try znet.init(allocator);
+    defer znet.deinit();
     
-    var fetch = try zawra.Fetch.init(allocator);
+    var fetch = try znet.Fetch.init(allocator);
     defer fetch.deinit();
     
-    var options = zawra.FetchOptions.init(allocator);
+    var options = znet.FetchOptions.init(allocator);
     defer options.deinit();
     options.enable_cache = true;
     
@@ -128,7 +128,7 @@ pub fn main() !void {
 
 - Read [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for advanced usage.
 - Check [API_REFERENCE.md](API_REFERENCE.md) for complete API documentation.
-- See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into how Zawra works.
+- See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into how z-net works.
 
 ---
 

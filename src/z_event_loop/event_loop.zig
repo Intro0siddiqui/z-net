@@ -1,6 +1,6 @@
 //! z_event_loop - Web API Event Loop Integration
 //! 
-//! Integrates Web APIs with Zawra's async event system using tokio.
+//! Integrates Web APIs with z-net's async event system using tokio.
 //! Provides bridges for WebSocket, XMLHttpRequest, Fetch, Service Workers,
 //! and Promise/callback systems.
 
@@ -409,7 +409,7 @@ pub const FetchEventHandler = struct {
         };
         
         // Set default headers
-        handler.headers.put("User-Agent", "Zawra/1.0") catch {};
+        handler.headers.put("User-Agent", "z-net/1.0") catch {};
         handler.headers.put("Accept", "*/*") catch {};
         
         return handler;

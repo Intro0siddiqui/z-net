@@ -1,10 +1,10 @@
-# Zawra Developer Guide 🛠️
+# z-net Developer Guide 🛠️
 
-Welcome to the Zawra Networking Stack developer guide. This document provides comprehensive information for contributors and developers working with the Zawra codebase.
+Welcome to the z-net developer guide. This document provides comprehensive information for contributors and developers working with the z-net codebase.
 
 ## 🏗️ Technical Stack
 
-The Zawra Networking Stack is built using a high-performance native architecture:
+The z-net is built using a high-performance native architecture:
 
 - **Zig**: Core performance-critical components (Socket, TLS, DNS, Cache, Event Loop, etc.)
 - **Rust**: High-performance protocol handling, async orchestration, and pipeline execution
@@ -28,7 +28,7 @@ The Zawra Networking Stack is built using a high-performance native architecture
 
 ```bash
 git clone <repository-url>
-cd zawra-netstack
+cd z-net
 ./build.sh deps
 ```
 
@@ -64,7 +64,7 @@ zig test socket.zig
 
 ## 📏 Zig Engineering Rules
 
-All Zig code in the Zawra project must adhere to the following core engineering rules:
+All Zig code in the z-net project must adhere to the following core engineering rules:
 
 ### 1. Unified I/O (Zig 0.16+)
 Always use the `std.Io` interface for networking, file systems, and timers. This pattern centralizes I/O and uses dependency injection.
@@ -97,4 +97,4 @@ Keep the documentation in sync with your changes:
 
 ---
 
-*Thank you for contributing to the Zawra Networking Stack!*
+*Thank you for contributing to z-net!*

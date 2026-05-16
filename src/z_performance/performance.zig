@@ -1,4 +1,4 @@
-/// Zawra Advanced Performance Features v1.0
+/// z-net Advanced Performance Features v1.0
 /// Implements connection coalescing, HTTP/2 prioritization, early hints,
 /// intelligent retry logic, and performance optimizations for browser-grade networking.
 

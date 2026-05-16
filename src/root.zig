@@ -1,11 +1,11 @@
-//! Zawra Networking Stack - Root Module
+//! z-net - Root Module
 //! 
-//! This is the main entry point for the Zawra Networking Stack v1.0
+//! This is the main entry point for z-net v1.0
 //! 
 //! ## Overview
 //! 
-//! The Zawra Networking Stack is a high-performance, modular networking stack
-//! designed for the Zawra browser project. It provides a complete solution for
+//! z-net is a high-performance, modular networking stack
+//! designed for the z-net browser project. It provides a complete solution for
 //! HTTP/HTTPS communications with advanced features like caching, DNS over HTTPS,
 //! TLS 1.3, and connection pooling.
 //!
@@ -25,20 +25,20 @@
 //!
 //! ```zig
 //! const std = @import("std");
-//! const zawra = @import("zawra_netstack");
+//! const znet = @import("znet");
 //!
 //! pub fn main() !void {
 //!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 //!     defer _ = gpa.deinit();
 //!     const allocator = gpa.allocator();
 //!
-//!     try zawra.init(allocator);
-//!     defer zawra.deinit();
+//!     try znet.init(allocator);
+//!     defer znet.deinit();
 //!
-//!     var fetch = try zawra.Fetch.init(allocator);
+//!     var fetch = try znet.Fetch.init(allocator);
 //!     defer fetch.deinit();
 //!     
-//!     var options = zawra.FetchOptions.init(allocator);
+//!     var options = znet.FetchOptions.init(allocator);
 //!     defer options.deinit();
 //!     try options.headers.put("User-Agent", "MyApp/1.0");
 //!     
@@ -211,9 +211,9 @@ pub const FEATURES = struct {
     pub const OPTIMIZE = @tagName(builtin.mode);
 };
 
-// Initialize the Zawra Networking Stack
+// Initialize z-net
 pub fn init(allocator: std.mem.Allocator) !void {
-    std.log.info("Initializing Zawra Networking Stack v{}.{}.{}", .{
+    std.log.info("Initializing z-net v{}.{}.{}", .{
         VERSION_MAJOR,
         VERSION_MINOR,
         VERSION_PATCH,
@@ -310,7 +310,7 @@ pub fn healthCheck() !bool {
 
 // Benchmark helper
 pub fn runBenchmark() !void {
-    std.log.info("Running Zawra Networking Stack benchmark...", .{});
+    std.log.info("Running z-net benchmark...", .{});
     
     // DNS resolution benchmark
     std.log.info("Testing DNS resolution...", .{});
@@ -329,7 +329,7 @@ pub fn runBenchmark() !void {
 
 // Example usage demonstration
 pub fn example() !void {
-    std.log.info("=== Zawra Networking Stack Example ===", .{});
+    std.log.info("=== z-net Example ===", .{});
     
     // Initialize
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -379,7 +379,7 @@ pub fn example() !void {
 
 // Test suite runner
 pub fn runTests() !void {
-    std.log.info("Running Zawra Networking Stack tests...", .{});
+    std.log.info("Running z-net tests...", .{});
     
     // Health check
     const healthy = try healthCheck();
@@ -429,7 +429,7 @@ pub fn validateConfig(config: anytype) !void {
 }
 
 // Error types
-pub const ZawraError = error{
+pub const ZNetError = error{
     HealthCheckFailed,
     InvalidMaxConnections,
     InvalidTimeout,
@@ -441,7 +441,7 @@ pub const ZawraError = error{
 
 // Utility functions
 pub fn formatVersion(buffer: []u8) ![]u8 {
-    return std.fmt.bufPrint(buffer, "Zawra Networking Stack v{}.{}.{}", .{
+    return std.fmt.bufPrint(buffer, "z-net v{}.{}.{}", .{
         VERSION_MAJOR,
         VERSION_MINOR, 
         VERSION_PATCH,

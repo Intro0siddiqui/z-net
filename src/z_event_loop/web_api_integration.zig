@@ -1,7 +1,7 @@
 //! z_event_loop - Web API Integration Layer
 //! 
 //! Provides specific integration between Web APIs (Fetch, WebSocket, XMLHttpRequest)
-//! and the Zawra event loop system. Handles async operations, promise resolution,
+//! and the z-net event loop system. Handles async operations, promise resolution,
 //! and event routing.
 
 const std = @import("std");
@@ -133,7 +133,7 @@ pub const FetchIntegration = struct {
     
     /// Simulate fetch execution (would integrate with actual network layer)
     fn simulateFetchExecution(inout self: *FetchIntegration, handler: *FetchEventHandler) !void {
-        // This would integrate with the actual Zawra pipeline/network stack
+        // This would integrate with the actual z-net pipeline/network stack
         // For now, simulate async execution
         
         var task = BackgroundTask.init(handler.fetch_id, "fetch-execution", "simulate");

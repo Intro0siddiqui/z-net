@@ -1,7 +1,7 @@
 //! z_event_loop - Main Event Loop Module
 //! 
 //! Unified event loop system for browser compatibility that integrates
-//! Web APIs with Zawra's async networking stack.
+//! Web APIs with z-net's async networking stack.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -363,7 +363,7 @@ pub fn exampleBrowserEventLoop() !void {
     // Example 1: Fetch API
     var fetch_options = FetchOptions.init(allocator, "GET");
     fetch_options.addHeader("Accept", "application/json");
-    fetch_options.addHeader("User-Agent", "Zawra/1.0");
+    fetch_options.addHeader("User-Agent", "z-net/1.0");
     
     const fetch_id = try browser_event_loop.fetch("https://api.example.com/data", fetch_options);
     std.log.info("📡 Fetch started with ID: {}", .{fetch_id});

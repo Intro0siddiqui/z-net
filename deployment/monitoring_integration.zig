@@ -631,7 +631,7 @@ pub const MonitoringManager = struct {
             .level = "info",
             .format = "json",
             .retention_days = 30,
-            .index_pattern = "zawra-logs-*",
+            .index_pattern = "z-net-logs-*",
             .pipeline = null,
             .filters = ArrayList([]const u8).init(self.allocator),
         };

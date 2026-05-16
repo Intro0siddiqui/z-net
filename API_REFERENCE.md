@@ -1,8 +1,8 @@
-# Zawra API Reference 📚
+# z-net API Reference 📚
 
-The primary interface for the Zawra Networking Stack is the `Fetch` API, implemented in Zig. This document describes the public classes, structures, and methods available for browser integration.
+The primary interface for z-net is the `Fetch` API, implemented in Zig. This document describes the public classes, structures, and methods available for browser integration.
 
-## 🚀 ZawraFetch Class
+## 🚀 z-net Fetch Class
 
 The main entry point for making network requests.
 
@@ -78,7 +78,7 @@ Provides granular performance metrics.
 
 ## ⚙️ FetchConfig Struct
 
-Global configuration for the `ZawraFetch` instance.
+Global configuration for the `znetFetch` instance.
 
 - `enable_caching: Bool`: Global cache toggle
 - `cache_ttl: Int64`: Default cache time-to-live

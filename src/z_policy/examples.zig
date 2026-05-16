@@ -1,7 +1,7 @@
 //! z_policy - Policy Engine Integration Example
 //! 
 //! Demonstrates how to integrate the Browser Policy Engine
-//! with the Zawra networking stack for browser compatibility.
+//! with the z-net networking stack for browser compatibility.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

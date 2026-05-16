@@ -468,7 +468,7 @@ pub const SecurityAuditor = struct {
     pub fn generateSecurityReport(self: *Self) ![]const u8 {
         var report = std.ArrayList(u8).init(self.allocator);
         
-        try report.appendSlice("=== Zawra Networking Stack Security Report ===\n\n");
+        try report.appendSlice("=== z-net Networking Stack Security Report ===\n\n");
         
         // Security status
         if (self.security_manager) |manager| {

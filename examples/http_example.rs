@@ -5,14 +5,14 @@ use std::time::Duration;
 use anyhow::Result;
 use log::info;
 use tracing_subscriber;
-use zawra_netstack_pipeline::{Pipeline, PipelineConfig, RequestOptions, CacheMode};
+use z-net_netstack_pipeline::{Pipeline, PipelineConfig, RequestOptions, CacheMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    info!("Starting Zawra HTTP Example");
+    info!("Starting z-net HTTP Example");
 
     // Configure pipeline
     let config = PipelineConfig {
@@ -68,9 +68,9 @@ async fn main() -> Result<()> {
     println!("\n=== Example 2: POST with JSON ===");
     let mut headers = std::collections::HashMap::new();
     headers.insert("Content-Type".to_string(), "application/json".to_string());
-    headers.insert("User-Agent".to_string(), "Zawra-Example/1.0".to_string());
+    headers.insert("User-Agent".to_string(), "z-net-Example/1.0".to_string());
 
-    let json_data = r#"{"test": true, "message": "Hello from Zawra!"}"#;
+    let json_data = r#"{"test": true, "message": "Hello from z-net!"}"#;
     let mut post_options = RequestOptions {
         method: "POST".to_string(),
         headers,

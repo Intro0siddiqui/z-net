@@ -36,7 +36,7 @@ pub const TestCoordinator = struct {
 
     /// Run all test suites
     pub fn runAllTestSuites(self: *TestCoordinator) !void {
-        std.debug.print("=== ZAWRA NETWORKING STACK PHASE 2 TESTING SUITE ===\n", .{});
+        std.debug.print("=== Z-NET NETWORKING STACK PHASE 2 TESTING SUITE ===\n", .{});
         std.debug.print("Starting comprehensive testing framework...\n\n", .{});
 
         // Test Suite 1: Protocol Compliance Tests
@@ -233,7 +233,7 @@ pub const TestCoordinator = struct {
         const file = try std.fs.cwd().createFile("test-results-summary.txt", .{});
         defer file.close();
 
-        try file.writeAll("=== ZAWRA NETWORKING STACK PHASE 2 TEST RESULTS ===\n\n");
+        try file.writeAll("=== Z-NET NETWORKING STACK PHASE 2 TEST RESULTS ===\n\n");
 
         for (self.suite_results.items) |result| {
             try file.print("Test Suite: {s}\n", .{result.name});

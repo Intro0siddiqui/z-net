@@ -27,7 +27,7 @@ pub const ProtocolComplianceTests = struct {
         try testing.expectEqualStrings("HTTP/1.1", try extractVersion(request));
 
         // Test 2: Header validation
-        const headers = try parseHeaders("Content-Type: application/json\r\nUser-Agent: Zawra/1.0\r\n\r\n");
+        const headers = try parseHeaders("Content-Type: application/json\r\nUser-Agent: z-net/1.0\r\n\r\n");
         try testing.expectEqual(@as(usize, 2), headers.len);
 
         // Test 3: Chunked transfer encoding (RFC 7230 Section 4.1)

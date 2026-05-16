@@ -12,7 +12,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.log.info("=== Zawra Networking Stack Security Module Demo ===", .{});
+    std.log.info("=== z-net Networking Stack Security Module Demo ===", .{});
 
     // Demo 1: Security Manager Setup
     try demoSecurityManager(allocator);

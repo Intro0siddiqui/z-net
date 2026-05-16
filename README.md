@@ -50,20 +50,20 @@ A next-generation, high-performance networking framework designed for modern bro
 
 ```zig
 const std = @import("std");
-const zawra = @import("zawra_netstack");
+const znet = @import("znet");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    try zawra.init(allocator);
-    defer zawra.deinit();
+    try znet.init(allocator);
+    defer znet.deinit();
     
-    var fetch = try zawra.Fetch.init(allocator);
+    var fetch = try znet.Fetch.init(allocator);
     defer fetch.deinit();
     
-    var options = zawra.FetchOptions.init(allocator);
+    var options = znet.FetchOptions.init(allocator);
     defer options.deinit();
     try options.headers.put("User-Agent", "MyApp/1.0");
     
@@ -119,7 +119,7 @@ pub fn main() !void {
 ```bash
 # Clone repository
 git clone <repository-url>
-cd zawra-netstack
+cd z-net
 
 # Build all modules
 zig build

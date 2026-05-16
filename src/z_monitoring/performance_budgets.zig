@@ -364,30 +364,30 @@ pub const BudgetManager = struct {
         var buffer = std.ArrayList(u8).init(self.allocator);
         const writer = buffer.writer();
 
-        try writer.print("# HELP zawra_performance_budget_violations Number of budget violations\n", .{});
-        try writer.print("# TYPE zawra_performance_budget_violations counter\n", .{});
+        try writer.print("# HELP z-net_performance_budget_violations Number of budget violations\n", .{});
+        try writer.print("# TYPE z-net_performance_budget_violations counter\n", .{});
 
         var budgets_iter = self.budgets.valueIterator();
         while (budgets_iter.next()) |budget| {
-            try writer.print("zawra_performance_budget_violations{{budget=\"{s}\"}} {d}\n", 
+            try writer.print("z-net_performance_budget_violations{{budget=\"{s}\"}} {d}\n", 
                 .{ budget.name, budget.violation_count });
         }
 
-        try writer.print("# HELP zawra_performance_budget_active Whether budget is active\n", .{});
-        try writer.print("# TYPE zawra_performance_budget_active gauge\n", .{});
+        try writer.print("# HELP z-net_performance_budget_active Whether budget is active\n", .{});
+        try writer.print("# TYPE z-net_performance_budget_active gauge\n", .{});
 
         budgets_iter = self.budgets.valueIterator();
         while (budgets_iter.next()) |budget| {
-            try writer.print("zawra_performance_budget_active{{budget=\"{s}\"}} {d}\n", 
+            try writer.print("z-net_performance_budget_active{{budget=\"{s}\"}} {d}\n", 
                 .{ budget.name, if (budget.is_active) 1 else 0 });
         }
 
-        try writer.print("# HELP zawra_performance_budget_threshold Budget threshold value\n", .{});
-        try writer.print("# TYPE zawra_performance_budget_threshold gauge\n", .{});
+        try writer.print("# HELP z-net_performance_budget_threshold Budget threshold value\n", .{});
+        try writer.print("# TYPE z-net_performance_budget_threshold gauge\n", .{});
 
         budgets_iter = self.budgets.valueIterator();
         while (budgets_iter.next()) |budget| {
-            try writer.print("zawra_performance_budget_threshold{{budget=\"{s}\",metric=\"{s}\"}} {d:.6f}\n", 
+            try writer.print("z-net_performance_budget_threshold{{budget=\"{s}\",metric=\"{s}\"}} {d:.6f}\n", 
                 .{ budget.name, @tagName(budget.metric_type), budget.threshold_value });
         }
 

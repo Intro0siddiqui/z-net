@@ -119,7 +119,7 @@ const dashboard_html =
     \\<!DOCTYPE html>
     \\<html>
     \\<head>
-    \\    <title>Zawra Networking Stack Monitor (Zig)</title>
+    \\    <title>z-net Networking Stack Monitor (Zig)</title>
     \\    <style>
     \\        body { font-family: sans-serif; margin: 20px; background-color: #f0f2f5; }
     \\        .header { background: #1a73e8; color: white; padding: 20px; border-radius: 8px; }
@@ -129,7 +129,7 @@ const dashboard_html =
     \\</head>
     \\<body>
     \\    <div class="header">
-    \\        <h1>Zawra Networking Stack Monitor (Zig)</h1>
+    \\        <h1>z-net Networking Stack Monitor (Zig)</h1>
     \\    </div>
     \\    <div class="grid">
     \\        <div class="card">

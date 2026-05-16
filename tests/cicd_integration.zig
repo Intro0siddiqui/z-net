@@ -266,7 +266,7 @@ pub const CICDIntegrationTests = struct {
     fn validateGitHubWorkflowFile(self: *CICDIntegrationTests) !void {
         // Test workflow file syntax and structure
         const workflow_content =
-            \\name: Zawra Networking Stack Tests
+            \\name: z-net Networking Stack Tests
             \\on:
             \\  push:
             \\    branches: [ main, develop ]
@@ -1016,7 +1016,7 @@ pub const CICDIntegrationTests = struct {
 
     fn exportGitHubActionsTemplate(self: *CICDIntegrationTests) !void {
         const template =
-            \\name: Zawra Networking Stack Tests
+            \\name: z-net Networking Stack Tests
             \\on:
             \\  push:
             \\    branches: [ main, develop ]

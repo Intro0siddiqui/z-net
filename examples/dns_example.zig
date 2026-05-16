@@ -10,7 +10,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.log.info("Starting Zawra DNS Example", .{});
+    std.log.info("Starting z-net DNS Example", .{});
 
     // Create DNS resolver
     var dns_cache = dns.DnsCache.init(allocator);

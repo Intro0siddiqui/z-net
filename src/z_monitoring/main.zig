@@ -8,7 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("Starting Zawra Monitor...\n", .{});
+    std.debug.print("Starting z-net Monitor...\n", .{});
 
     // Initialize components
     var db_server = dashboard.DashboardServer.init(allocator, 8080);
