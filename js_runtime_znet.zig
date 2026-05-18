@@ -1,43 +1,37 @@
 const std = @import("std");
-const bridge = @import("src/z_network_bridge.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    var args_it = init.minimal.args.iterate();
+    _ = args_it.next(); // exe
+    _ = args_it.next(); // script
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    var iterations: usize = 50000;
-    if (args.len >= 3) {
-        iterations = try std.fmt.parseInt(usize, args[2], 10);
+    var iterations: usize = 10000;
+    if (args_it.next()) |arg| {
+        iterations = try std.fmt.parseInt(usize, arg, 10);
     }
 
-    var engine = bridge.NetworkEngine.init();
-    defer engine.deinit();
-
+    const io = init.io;
     const host = "127.0.0.1";
     const port = 8080;
-    const request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    const request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
 
-    var conn = try engine.connect(host, port);
-    defer conn.close();
+    const addr = try std.Io.net.IpAddress.parseIp4(host, port);
+    var stream = try std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    defer stream.close(io);
 
-    var buffer: [4096]u8 = undefined;
-    for (0..iterations) |i| {
-        if (i % 1000 == 0) std.debug.print("Progress: {d}/{d}\n", .{ i, iterations });
-        _ = try conn.write(request);
+    var buffer: [8192]u8 = undefined;
+    for (0..iterations) |_| {
+        var messages: [1]std.Io.net.OutgoingMessage = .{.{
+            .address = &addr,
+            .data_ptr = request.ptr,
+            .data_len = request.len,
+        }};
+        _ = io.vtable.netSend(io.userdata, stream.socket.handle, &messages, .{}) ;
 
         var received: usize = 0;
         while (received < 1100) {
-            const n = conn.read(&buffer) catch |err| {
-                if (err == error.WouldBlock) {
-                    _ = try bridge.poll(engine.handle, 1000);
-                    continue;
-                }
-                break;
-            };
+            var data: [1][]u8 = .{&buffer};
+            const n = try io.vtable.netRead(io.userdata, stream.socket.handle, &data);
             if (n == 0) break;
             received += n;
         }
