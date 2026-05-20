@@ -116,16 +116,16 @@ pub const StorageItem = struct {
 
 pub const OriginStorage = struct {
     origin: Origin,
-    local_storage: AutoHashMap([]const u8, StorageItem),
-    session_storage: AutoHashMap([]const u8, StorageItem),
+    local_storage: StringHashMap(StorageItem),
+    session_storage: StringHashMap(StorageItem),
     quota_local: StorageQuota,
     quota_session: StorageQuota,
     
     pub fn init(allocator: Allocator, origin: Origin) OriginStorage {
         return OriginStorage{
             .origin = origin,
-            .local_storage = AutoHashMap([]const u8, StorageItem).init(allocator),
-            .session_storage = AutoHashMap([]const u8, StorageItem).init(allocator),
+            .local_storage = StringHashMap(StorageItem).init(allocator),
+            .session_storage = StringHashMap(StorageItem).init(allocator),
             .quota_local = StorageQuota.init(.LOCAL_STORAGE, 10 * 1024 * 1024), // 10MB default
             .quota_session = StorageQuota.init(.SESSION_STORAGE, 5 * 1024 * 1024), // 5MB default
         };
@@ -160,13 +160,13 @@ pub const OriginStorage = struct {
 pub const CookiePartition = struct {
     top_level_site: []const u8,
     origin: []const u8,
-    cookies: AutoHashMap([]const u8, Cookie),
+    cookies: StringHashMap(Cookie),
 
     pub fn init(allocator: Allocator, top_level_site: []const u8, origin: []const u8) CookiePartition {
         return CookiePartition{
             .top_level_site = top_level_site,
             .origin = origin,
-            .cookies = AutoHashMap([]const u8, Cookie).init(allocator),
+            .cookies = StringHashMap(Cookie).init(allocator),
         };
     }
 };
@@ -272,13 +272,13 @@ pub const SameSitePolicy = enum {
 pub const IndexedDBDatabase = struct {
     name: []const u8,
     version: u64,
-    stores: AutoHashMap([]const u8, IndexedDBObjectStore),
+    stores: StringHashMap(IndexedDBObjectStore),
     
     pub fn init(allocator: Allocator, name: []const u8, version: u64) IndexedDBDatabase {
         return IndexedDBDatabase{
             .name = name,
             .version = version,
-            .stores = AutoHashMap([]const u8, IndexedDBObjectStore).init(allocator),
+            .stores = StringHashMap(IndexedDBObjectStore).init(allocator),
         };
     }
     
@@ -314,16 +314,16 @@ pub const IndexedDBObjectStore = struct {
     name: []const u8,
     key_path: ?[]const u8,
     auto_increment: bool,
-    records: AutoHashMap([]const u8, IndexedDBRecord),
-    indices: AutoHashMap([]const u8, IndexedDBIndex),
+    records: StringHashMap(IndexedDBRecord),
+    indices: StringHashMap(IndexedDBIndex),
     
     pub fn init(allocator: Allocator, name: []const u8, key_path: ?[]const u8, auto_increment: bool) IndexedDBObjectStore {
         return IndexedDBObjectStore{
             .name = name,
             .key_path = key_path,
             .auto_increment = auto_increment,
-            .records = AutoHashMap([]const u8, IndexedDBRecord).init(allocator),
-            .indices = AutoHashMap([]const u8, IndexedDBIndex).init(allocator),
+            .records = StringHashMap(IndexedDBRecord).init(allocator),
+            .indices = StringHashMap(IndexedDBIndex).init(allocator),
         };
     }
     
@@ -456,13 +456,13 @@ pub const CacheAPIEntry = struct {
 pub const CacheAPICache = struct {
     name: []const u8,
     origin: Origin,
-    entries: AutoHashMap([]const u8, CacheAPIEntry),
+    entries: StringHashMap(CacheAPIEntry),
     
     pub fn init(allocator: Allocator, name: []const u8, origin: Origin) CacheAPICache {
         return CacheAPICache{
             .name = name,
             .origin = origin,
-            .entries = AutoHashMap([]const u8, CacheAPIEntry).init(allocator),
+            .entries = StringHashMap(CacheAPIEntry).init(allocator),
         };
     }
     
@@ -512,19 +512,19 @@ pub const StorageError = error{
 /// Main Storage Bridge Manager
 pub const StorageBridge = struct {
     allocator: Allocator,
-    origin_storages: AutoHashMap([]const u8, OriginStorage),
-    cookie_jar: AutoHashMap([]const u8, CookiePartition),
-    indexed_db_databases: AutoHashMap([]const u8, IndexedDBDatabase),
-    cache_api_caches: AutoHashMap([]const u8, CacheAPICache),
+    origin_storages: StringHashMap(OriginStorage),
+    cookie_jar: StringHashMap(CookiePartition),
+    indexed_db_databases: StringHashMap(IndexedDBDatabase),
+    cache_api_caches: StringHashMap(CacheAPICache),
     global_quota: StorageQuota,
     
     pub fn init(allocator: Allocator) StorageBridge {
         return StorageBridge{
             .allocator = allocator,
-            .origin_storages = AutoHashMap([]const u8, OriginStorage).init(allocator),
-            .cookie_jar = AutoHashMap([]const u8, CookiePartition).init(allocator),
-            .indexed_db_databases = AutoHashMap([]const u8, IndexedDBDatabase).init(allocator),
-            .cache_api_caches = AutoHashMap([]const u8, CacheAPICache).init(allocator),
+            .origin_storages = StringHashMap(OriginStorage).init(allocator),
+            .cookie_jar = StringHashMap(CookiePartition).init(allocator),
+            .indexed_db_databases = StringHashMap(IndexedDBDatabase).init(allocator),
+            .cache_api_caches = StringHashMap(CacheAPICache).init(allocator),
             .global_quota = StorageQuota.init(.LOCAL_STORAGE, 50 * 1024 * 1024), // 50MB global quota
         };
     }
@@ -578,8 +578,10 @@ pub const StorageBridge = struct {
         
         // Create new origin storage
         const new_storage = OriginStorage.init(self.allocator, origin);
-        try self.origin_storages.put(origin_key, new_storage);
-        return self.origin_storages.getPtr(origin_key).?;
+        const duped_key = try self.allocator.dupe(u8, origin_key);
+        errdefer self.allocator.free(duped_key);
+        try self.origin_storages.put(duped_key, new_storage);
+        return self.origin_storages.getPtr(duped_key).?;
     }
     
     /// LocalStorage API

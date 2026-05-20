@@ -174,7 +174,7 @@ impl NetEngine {
                 if conn.is_paused {
                     if let Some(&ring_ptr) = self.body_rings.get(&ring_id) {
                         let ring = unsafe { &*ring_ptr };
-                        let available_read = (ring.head.load(Ordering::Acquire) - ring.tail.load(Ordering::Acquire)) as usize;
+                        let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
                         if available_read < (ring.capacity * 50 / 100) {
                             // Resume polling
                             let _ = self.poll.registry().register(
@@ -340,7 +340,7 @@ pub extern "C" fn net_read(
 
             let head = ring.head.load(Ordering::Acquire);
             let tail = ring.tail.load(Ordering::Acquire);
-            if head - tail >= ring.capacity as u64 {
+            if head.wrapping_sub(tail) >= ring.capacity as u64 {
                 return NetError::WouldBlock as i32;
             }
             let head_idx = (head % ring.capacity as u64) as usize;
@@ -367,7 +367,7 @@ pub extern "C" fn net_read(
                     }
 
                     // Backpressure: 95% High Watermark
-                    let available_read = (ring.head.load(Ordering::Acquire) - ring.tail.load(Ordering::Acquire)) as usize;
+                    let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
                     if available_read > (ring.capacity * 95 / 100) {
                         let _ = engine.poll.registry().deregister(&mut connection.stream);
                         connection.is_paused = true;

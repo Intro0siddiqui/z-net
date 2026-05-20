@@ -464,7 +464,7 @@ test "cors handler init" {
     
     // Test basic initialization
     const origin = "https://example.com";
-    const options = CORSOptions.init(allocator);
+    var options = CORSOptions.init(allocator);
     defer options.deinit();
     
     options.origin = origin;
