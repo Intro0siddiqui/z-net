@@ -522,7 +522,7 @@ pub const StorageBridge = struct {
         return StorageBridge{
             .allocator = allocator,
             .origin_storages = AutoHashMap([]const u8, OriginStorage).init(allocator),
-            .cookie_jar = AutoHashMap([]const u8, Cookie).init(allocator),
+            .cookie_jar = AutoHashMap([]const u8, CookiePartition).init(allocator),
             .indexed_db_databases = AutoHashMap([]const u8, IndexedDBDatabase).init(allocator),
             .cache_api_caches = AutoHashMap([]const u8, CacheAPICache).init(allocator),
             .global_quota = StorageQuota.init(.LOCAL_STORAGE, 50 * 1024 * 1024), // 50MB global quota
@@ -531,31 +531,34 @@ pub const StorageBridge = struct {
     
     pub fn deinit(self: *StorageBridge) void {
         // Clean up origin storages
-        var origin_iter = self.origin_storages.valueIterator();
-        while (origin_iter.next()) |origin_storage| {
-            origin_storage.deinit();
+        var origin_iter = self.origin_storages.iterator();
+        while (origin_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
         }
         self.origin_storages.deinit();
         
         // Clean up cookies
-        var cookie_iter = self.cookie_jar.valueIterator();
-        while (cookie_iter.next()) |cookie| {
-            // Cookies are stack allocated, no deinit needed
-            _ = cookie;
+        var cookie_jar_iter = self.cookie_jar.iterator();
+        while (cookie_jar_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.cookies.deinit();
         }
         self.cookie_jar.deinit();
         
         // Clean up IndexedDB databases
-        var db_iter = self.indexed_db_databases.valueIterator();
-        while (db_iter.next()) |database| {
-            database.deinit();
+        var db_iter = self.indexed_db_databases.iterator();
+        while (db_iter.next()) |entry| {
+            // Keys are names provided by caller, might need freeing if duped?
+            // Assuming for now they aren't duped unless we see it.
+            entry.value_ptr.deinit();
         }
         self.indexed_db_databases.deinit();
         
         // Clean up Cache API caches
-        var cache_iter = self.cache_api_caches.valueIterator();
-        while (cache_iter.next()) |cache| {
-            cache.deinit();
+        var cache_iter = self.cache_api_caches.iterator();
+        while (cache_iter.next()) |entry| {
+            entry.value_ptr.deinit();
         }
         self.cache_api_caches.deinit();
     }
@@ -574,11 +577,9 @@ pub const StorageBridge = struct {
         }
         
         // Create new origin storage
-        var new_storage = try self.allocator.create(OriginStorage);
-        new_storage.* = OriginStorage.init(self.allocator, origin);
-        
-        try self.origin_storages.put(origin_key, new_storage.*);
-        return new_storage;
+        const new_storage = OriginStorage.init(self.allocator, origin);
+        try self.origin_storages.put(origin_key, new_storage);
+        return self.origin_storages.getPtr(origin_key).?;
     }
     
     /// LocalStorage API
@@ -722,8 +723,8 @@ pub const StorageBridge = struct {
     }
     
     pub fn getCookie(self: *StorageBridge, name: []const u8, top_level_site: []const u8, origin: []const u8) ?Cookie {
-        var partition_key_buf: [512]u8 = undefined;
-        const partition_key = std.fmt.bufPrint(&partition_key_buf, "{s}|{s}", .{ top_level_site, origin }) catch return null;
+        const partition_key = getPartitionKey(self.allocator, top_level_site, origin) catch return null;
+        defer self.allocator.free(partition_key);
 
         const partition = self.cookie_jar.get(partition_key) orelse return null;
         const cookie = partition.cookies.get(name) orelse return null;
@@ -739,8 +740,8 @@ pub const StorageBridge = struct {
     pub fn getCookiesForUrl(self: *StorageBridge, url: []const u8, top_level_site: []const u8, origin_req: []const u8) ArrayList(Cookie) {
         var matching_cookies = ArrayList(Cookie).init(self.allocator);
         
-        var partition_key_buf: [512]u8 = undefined;
-        const partition_key = std.fmt.bufPrint(&partition_key_buf, "{s}|{s}", .{ top_level_site, origin_req }) catch return matching_cookies;
+        const partition_key = getPartitionKey(self.allocator, top_level_site, origin_req) catch return matching_cookies;
+        defer self.allocator.free(partition_key);
 
         if (self.cookie_jar.get(partition_key)) |partition| {
             var cookie_iter = partition.cookies.valueIterator();
@@ -755,8 +756,8 @@ pub const StorageBridge = struct {
     }
     
     pub fn deleteCookie(self: *StorageBridge, name: []const u8, top_level_site: []const u8, origin: []const u8) void {
-        var partition_key_buf: [512]u8 = undefined;
-        const partition_key = std.fmt.bufPrint(&partition_key_buf, "{s}|{s}", .{ top_level_site, origin }) catch return;
+        const partition_key = getPartitionKey(self.allocator, top_level_site, origin) catch return;
+        defer self.allocator.free(partition_key);
 
         if (self.cookie_jar.getPtr(partition_key)) |partition| {
             _ = partition.cookies.remove(name);
@@ -773,11 +774,9 @@ pub const StorageBridge = struct {
         }
         
         // Create new database
-        var database = try self.allocator.create(IndexedDBDatabase);
-        database.* = IndexedDBDatabase.init(self.allocator, name, version);
-        
-        try self.indexed_db_databases.put(name, database.*);
-        return database;
+        const database = IndexedDBDatabase.init(self.allocator, name, version);
+        try self.indexed_db_databases.put(name, database);
+        return self.indexed_db_databases.getPtr(name).?;
     }
     
     pub fn deleteIndexedDB(self: *StorageBridge, name: []const u8) void {
@@ -793,11 +792,9 @@ pub const StorageBridge = struct {
             return existing;
         }
         
-        var cache = try self.allocator.create(CacheAPICache);
-        cache.* = CacheAPICache.init(self.allocator, name, origin);
-        
-        try self.cache_api_caches.put(name, cache.*);
-        return cache;
+        const cache = CacheAPICache.init(self.allocator, name, origin);
+        try self.cache_api_caches.put(name, cache);
+        return self.cache_api_caches.getPtr(name).?;
     }
     
     pub fn cacheDelete(self: *StorageBridge, name: []const u8) void {
@@ -890,7 +887,11 @@ pub const StorageBridge = struct {
             total_session_storage_items += origin_storage.session_storage.count();
         }
         
-        total_cookies = self.cookie_jar.count();
+        var cookie_jar_val_iter = self.cookie_jar.valueIterator();
+        while (cookie_jar_val_iter.next()) |partition| {
+            total_cookies += partition.cookies.count();
+        }
+
         total_indexed_db_databases = self.indexed_db_databases.count();
         total_cache_caches = self.cache_api_caches.count();
         
