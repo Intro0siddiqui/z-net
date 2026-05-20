@@ -60,7 +60,7 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Initialize the browser event loop
-    pub fn initialize(inout self: *BrowserEventLoop) !void {
+    pub fn initialize(self: *BrowserEventLoop) !void {
         if (self.is_initialized) {
             return error.AlreadyInitialized;
         }
@@ -78,7 +78,7 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Start the browser event loop
-    pub fn start(inout self: *BrowserEventLoop) !void {
+    pub fn start(self: *BrowserEventLoop) !void {
         if (!self.is_initialized) {
             try self.initialize();
         }
@@ -87,14 +87,14 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Stop the browser event loop
-    pub fn stop(inout self: *BrowserEventLoop) void {
+    pub fn stop(self: *BrowserEventLoop) void {
         self.event_loop_manager.stop();
         self.is_initialized = false;
         std.log.info("🛑 Browser Event Loop stopped", .{});
     }
     
     /// Process a single event loop cycle
-    pub fn processCycle(inout self: *BrowserEventLoop) !void {
+    pub fn processCycle(self: *BrowserEventLoop) !void {
         if (!self.is_initialized) {
             return error.NotInitialized;
         }
@@ -110,7 +110,7 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Fetch API integration
-    pub fn fetch(inout self: *BrowserEventLoop, url: []const u8, options: FetchOptions) !u64 {
+    pub fn fetch(self: *BrowserEventLoop, url: []const u8, options: FetchOptions) !u64 {
         if (!self.is_initialized) {
             return error.NotInitialized;
         }
@@ -134,12 +134,12 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Cancel fetch request
-    pub fn cancelFetch(inout self: *BrowserEventLoop, fetch_id: u64) !void {
+    pub fn cancelFetch(self: *BrowserEventLoop, fetch_id: u64) !void {
         return try self.fetch_integration.cancelFetch(fetch_id);
     }
     
     /// WebSocket API integration
-    pub fn connectWebSocket(inout self: *BrowserEventLoop, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
+    pub fn connectWebSocket(self: *BrowserEventLoop, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
         if (!self.is_initialized) {
             return error.NotInitialized;
         }
@@ -148,17 +148,17 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Send WebSocket message
-    pub fn sendWebSocketMessage(inout self: *BrowserEventLoop, connection_id: u64, message: []const u8) !void {
+    pub fn sendWebSocketMessage(self: *BrowserEventLoop, connection_id: u64, message: []const u8) !void {
         return try self.websocket_integration.sendWebSocketMessage(connection_id, message);
     }
     
     /// Close WebSocket connection
-    pub fn closeWebSocket(inout self: *BrowserEventLoop, connection_id: u64, code: u16, reason: []const u8) !void {
+    pub fn closeWebSocket(self: *BrowserEventLoop, connection_id: u64, code: u16, reason: []const u8) !void {
         return try self.websocket_integration.closeWebSocket(connection_id, code, reason);
     }
     
     /// XMLHttpRequest API integration
-    pub fn createXMLHttpRequest(inout self: *BrowserEventLoop, url: []const u8, method: []const u8, async: bool) !u64 {
+    pub fn createXMLHttpRequest(self: *BrowserEventLoop, url: []const u8, method: []const u8, async: bool) !u64 {
         if (!self.is_initialized) {
             return error.NotInitialized;
         }
@@ -167,57 +167,57 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Set XMLHttpRequest header
-    pub fn setXMLHttpRequestHeader(inout self: *BrowserEventLoop, request_id: u64, name: []const u8, value: []const u8) !void {
+    pub fn setXMLHttpRequestHeader(self: *BrowserEventLoop, request_id: u64, name: []const u8, value: []const u8) !void {
         return try self.xhr_integration.setRequestHeader(request_id, name, value);
     }
     
     /// Send XMLHttpRequest body
-    pub fn sendXMLHttpRequestBody(inout self: *BrowserEventLoop, request_id: u64, body: []const u8) !void {
+    pub fn sendXMLHttpRequestBody(self: *BrowserEventLoop, request_id: u64, body: []const u8) !void {
         return try self.xhr_integration.sendRequestBody(request_id, body);
     }
     
     /// Abort XMLHttpRequest
-    pub fn abortXMLHttpRequest(inout self: *BrowserEventLoop, request_id: u64) !void {
+    pub fn abortXMLHttpRequest(self: *BrowserEventLoop, request_id: u64) !void {
         return try self.xhr_integration.abortRequest(request_id);
     }
     
     /// Promise API integration
-    pub fn createPromise(inout self: *BrowserEventLoop) u64 {
+    pub fn createPromise(self: *BrowserEventLoop) u64 {
         return self.promise_integration.createPromise();
     }
     
     /// Resolve promise
-    pub fn resolvePromise(inout self: *BrowserEventLoop, promise_id: u64, data: ?[]const u8) !void {
+    pub fn resolvePromise(self: *BrowserEventLoop, promise_id: u64, data: ?[]const u8) !void {
         return try self.promise_integration.resolvePromise(promise_id, data);
     }
     
     /// Reject promise
-    pub fn rejectPromise(inout self: *BrowserEventLoop, promise_id: u64, error: []const u8) !void {
+    pub fn rejectPromise(self: *BrowserEventLoop, promise_id: u64, error: []const u8) !void {
         return try self.promise_integration.rejectPromise(promise_id, error);
     }
     
     /// Background sync integration
-    pub fn scheduleBackgroundSync(inout self: *BrowserEventLoop, task_name: []const u8, data: []const u8, delay_ms: u64) !u64 {
+    pub fn scheduleBackgroundSync(self: *BrowserEventLoop, task_name: []const u8, data: []const u8, delay_ms: u64) !u64 {
         return try self.background_sync.scheduleSync(task_name, data, delay_ms);
     }
     
     /// Cancel background sync
-    pub fn cancelBackgroundSync(inout self: *BrowserEventLoop, sync_id: u64) !void {
+    pub fn cancelBackgroundSync(self: *BrowserEventLoop, sync_id: u64) !void {
         return try self.background_sync.cancelSync(sync_id);
     }
     
     /// Configure CORS for an origin
-    pub fn configureCORS(inout self: *BrowserEventLoop, origin: []const u8, options: CORSOptions) !void {
+    pub fn configureCORS(self: *BrowserEventLoop, origin: []const u8, options: CORSOptions) !void {
         return try self.policy_manager.configureCORS(origin, options);
     }
     
     /// Add CSP policy
-    pub fn addCSPPolicy(inout self: *BrowserEventLoop, origin: []const u8, policy_header: []const u8) !void {
+    pub fn addCSPPolicy(self: *BrowserEventLoop, origin: []const u8, policy_header: []const u8) !void {
         return try self.policy_manager.addCSPPolicy(origin, policy_header);
     }
     
     /// Add whitelist origin
-    pub fn addWhitelistOrigin(inout self: *BrowserEventLoop, origin: []const u8) !void {
+    pub fn addWhitelistOrigin(self: *BrowserEventLoop, origin: []const u8) !void {
         return try self.policy_manager.addWhitelistOrigin(origin);
     }
     
@@ -239,7 +239,7 @@ pub const BrowserEventLoop = struct {
     }
     
     /// Clear all caches
-    pub fn clearCaches(inout self: *BrowserEventLoop) void {
+    pub fn clearCaches(self: *BrowserEventLoop) void {
         self.policy_manager.clearCaches();
         std.log.info("🧹 All caches cleared", .{});
     }
@@ -256,7 +256,7 @@ pub const BrowserEventLoop = struct {
     }
     
     // Private helper functions
-    fn processAPIIntegrations(inout self: *BrowserEventLoop) !void {
+    fn processAPIIntegrations(self: *BrowserEventLoop) !void {
         // Process any pending API operations
         // This is where you'd integrate with the actual network stack
         
@@ -316,11 +316,11 @@ pub const FetchOptions = struct {
         };
     }
     
-    pub fn addHeader(inout self: *FetchOptions, name: []const u8, value: []const u8) void {
+    pub fn addHeader(self: *FetchOptions, name: []const u8, value: []const u8) void {
         self.headers.put(name, value) catch {};
     }
     
-    pub fn setBody(inout self: *FetchOptions, body: []const u8) void {
+    pub fn setBody(self: *FetchOptions, body: []const u8) void {
         self.body = body;
     }
 };
@@ -339,7 +339,7 @@ pub fn createBrowserEventLoop(allocator: Allocator, policy_config: PolicyEngineC
     return event_loop_ptr;
 }
 
-pub fn destroyBrowserEventLoop(inout event_loop: *BrowserEventLoop, allocator: Allocator) void {
+pub fn destroyBrowserEventLoop(event_loop: *BrowserEventLoop, allocator: Allocator) void {
     event_loop.deinit();
     allocator.destroy(event_loop);
 }

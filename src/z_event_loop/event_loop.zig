@@ -67,15 +67,15 @@ pub const WebAPIEvent = struct {
         self.metadata.deinit();
     }
     
-    pub fn setData(inout self: WebAPIEvent, data: []const u8) void {
+    pub fn setData(self: WebAPIEvent, data: []const u8) void {
         self.data = data;
     }
     
-    pub fn setPriority(inout self: WebAPIEvent, priority: EventPriority) void {
+    pub fn setPriority(self: WebAPIEvent, priority: EventPriority) void {
         self.priority = priority;
     }
     
-    pub fn addMetadata(inout self: WebAPIEvent, key: []const u8, value: []const u8) void {
+    pub fn addMetadata(self: WebAPIEvent, key: []const u8, value: []const u8) void {
         self.metadata.put(key, value) catch {};
     }
 };
@@ -93,11 +93,11 @@ pub const PromiseResolver = struct {
         };
     }
     
-    pub fn setResolveCallback(inout self: *PromiseResolver, callback: *const fn (?[]const u8) void) void {
+    pub fn setResolveCallback(self: *PromiseResolver, callback: *const fn (?[]const u8) void) void {
         self.resolve_callback = callback;
     }
     
-    pub fn setRejectCallback(inout self: *PromiseResolver, callback: *const fn ([]const u8) void) void {
+    pub fn setRejectCallback(self: *PromiseResolver, callback: *const fn ([]const u8) void) void {
         self.reject_callback = callback;
     }
     
@@ -139,7 +139,7 @@ pub const TaskQueue = struct {
         self.tasks.deinit();
     }
     
-    pub fn enqueue(inout self: *TaskQueue, resolver: PromiseResolver) !void {
+    pub fn enqueue(self: *TaskQueue, resolver: PromiseResolver) !void {
         if (self.current_size >= self.max_size) {
             return error.QueueFull;
         }
@@ -148,7 +148,7 @@ pub const TaskQueue = struct {
         self.current_size += 1;
     }
     
-    pub fn dequeue(inout self: *TaskQueue) ?PromiseResolver {
+    pub fn dequeue(self: *TaskQueue) ?PromiseResolver {
         if (self.tasks.items.len == 0) {
             return null;
         }
@@ -158,7 +158,7 @@ pub const TaskQueue = struct {
         return resolver;
     }
     
-    pub fn peek(inout self: *TaskQueue) ?*PromiseResolver {
+    pub fn peek(self: *TaskQueue) ?*PromiseResolver {
         if (self.tasks.items.len == 0) {
             return null;
         }
@@ -188,13 +188,13 @@ pub const BackgroundTask = struct {
         };
     }
     
-    pub fn setInterval(inout self: *BackgroundTask, interval_ms: u64, recurring: bool) void {
+    pub fn setInterval(self: *BackgroundTask, interval_ms: u64, recurring: bool) void {
         self.interval = interval_ms;
         self.recurring = recurring;
         self.scheduled_time = getCurrentTimestamp() + interval_ms;
     }
     
-    pub fn setCallback(inout self: *BackgroundTask, callback: *const fn ([]const u8) void) void {
+    pub fn setCallback(self: *BackgroundTask, callback: *const fn ([]const u8) void) void {
         self.callback = callback;
     }
     
@@ -202,7 +202,7 @@ pub const BackgroundTask = struct {
         return getCurrentTimestamp() >= self.scheduled_time;
     }
     
-    pub fn execute(inout self: *BackgroundTask) void {
+    pub fn execute(self: *BackgroundTask) void {
         if (self.callback) |callback| {
             callback(self.data);
         }
@@ -233,11 +233,11 @@ pub const WebSocketEventHandler = struct {
         self.message_queue.deinit();
     }
     
-    pub fn setEventCallback(inout self: *WebSocketEventHandler, event_type: EventType, callback: *const fn (WebAPIEvent) void) void {
+    pub fn setEventCallback(self: *WebSocketEventHandler, event_type: EventType, callback: *const fn (WebAPIEvent) void) void {
         self.event_callbacks.put(event_type, callback) catch {};
     }
     
-    pub fn handleOpen(inout self: *WebSocketEventHandler) void {
+    pub fn handleOpen(self: *WebSocketEventHandler) void {
         self.is_open = true;
         var event = WebAPIEvent.init(std.heap.c_allocator, .OPEN, self.connection_id);
         event.setData("WebSocket connection opened");
@@ -249,7 +249,7 @@ pub const WebSocketEventHandler = struct {
         event.deinit();
     }
     
-    pub fn handleClose(inout self: *WebSocketEventHandler, code: u16, reason: []const u8) void {
+    pub fn handleClose(self: *WebSocketEventHandler, code: u16, reason: []const u8) void {
         self.is_open = false;
         var event = WebAPIEvent.init(std.heap.c_allocator, .CLOSE, self.connection_id);
         
@@ -265,7 +265,7 @@ pub const WebSocketEventHandler = struct {
         event.deinit();
     }
     
-    pub fn handleMessage(inout self: *WebSocketEventHandler, message: []const u8) void {
+    pub fn handleMessage(self: *WebSocketEventHandler, message: []const u8) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .MESSAGE, self.connection_id);
         event.setData(message);
         
@@ -279,7 +279,7 @@ pub const WebSocketEventHandler = struct {
         event.deinit();
     }
     
-    pub fn handleError(inout self: *WebSocketEventHandler, error_message: []const u8) void {
+    pub fn handleError(self: *WebSocketEventHandler, error_message: []const u8) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .ERROR, self.connection_id);
         event.setData(error_message);
         event.setPriority(.CRITICAL);
@@ -316,28 +316,28 @@ pub const XMLHttpRequestEventHandler = struct {
         self.callbacks.deinit();
     }
     
-    pub fn setReadyState(inout self: *XMLHttpRequestEventHandler, ready_state: ReadyState) void {
+    pub fn setReadyState(self: *XMLHttpRequestEventHandler, ready_state: ReadyState) void {
         self.ready_state = ready_state;
         self.emitReadyStateChange();
     }
     
-    pub fn setStatus(inout self: *XMLHttpRequestEventHandler, status_code: u16) void {
+    pub fn setStatus(self: *XMLHttpRequestEventHandler, status_code: u16) void {
         self.status_code = status_code;
     }
     
-    pub fn setResponseData(inout self: *XMLHttpRequestEventHandler, data: []const u8) void {
+    pub fn setResponseData(self: *XMLHttpRequestEventHandler, data: []const u8) void {
         self.response_data = data;
     }
     
-    pub fn addHeader(inout self: *XMLHttpRequestEventHandler, name: []const u8, value: []const u8) void {
+    pub fn addHeader(self: *XMLHttpRequestEventHandler, name: []const u8, value: []const u8) void {
         self.headers.put(name, value) catch {};
     }
     
-    pub fn setEventCallback(inout self: *XMLHttpRequestEventHandler, event_type: EventType, callback: *const fn (WebAPIEvent) void) void {
+    pub fn setEventCallback(self: *XMLHttpRequestEventHandler, event_type: EventType, callback: *const fn (WebAPIEvent) void) void {
         self.callbacks.put(event_type, callback) catch {};
     }
     
-    fn emitReadyStateChange(inout self: *XMLHttpRequestEventHandler) void {
+    fn emitReadyStateChange(self: *XMLHttpRequestEventHandler) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .READY_STATE_CHANGE, self.request_id);
         event.setData(@tagName(self.ready_state));
         event.addMetadata("readyState", @tagName(self.ready_state));
@@ -350,7 +350,7 @@ pub const XMLHttpRequestEventHandler = struct {
         event.deinit();
     }
     
-    pub fn emitLoad(inout self: *XMLHttpRequestEventHandler) void {
+    pub fn emitLoad(self: *XMLHttpRequestEventHandler) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .LOAD, self.request_id);
         event.setData(self.response_data);
         
@@ -361,7 +361,7 @@ pub const XMLHttpRequestEventHandler = struct {
         event.deinit();
     }
     
-    pub fn emitError(inout self: *XMLHttpRequestEventHandler, error_message: []const u8) void {
+    pub fn emitError(self: *XMLHttpRequestEventHandler, error_message: []const u8) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .ERROR, self.request_id);
         event.setData(error_message);
         event.setPriority(.HIGH);
@@ -421,12 +421,12 @@ pub const FetchEventHandler = struct {
         self.callbacks.deinit();
     }
     
-    pub fn setRequestBody(inout self: *FetchEventHandler, body: []const u8) void {
+    pub fn setRequestBody(self: *FetchEventHandler, body: []const u8) void {
         self.body = body;
         self.headers.put("Content-Length", std.fmt.allocPrint(std.heap.c_allocator, "{}", .{body.len}) catch "") catch {};
     }
     
-    pub fn setResponse(inout self: *FetchEventHandler, status_code: u16, status_text: []const u8, response_data: []const u8, response_headers: StringHashMap([]const u8)) void {
+    pub fn setResponse(self: *FetchEventHandler, status_code: u16, status_text: []const u8, response_data: []const u8, response_headers: StringHashMap([]const u8)) void {
         self.status_code = status_code;
         self.status_text = status_text;
         self.response_data = response_data;
@@ -442,11 +442,11 @@ pub const FetchEventHandler = struct {
         }
     }
     
-    pub fn setEventCallback(inout self: *FetchEventHandler, event_type: EventType, callback: *const fn (WebAPIEvent) void) void {
+    pub fn setEventCallback(self: *FetchEventHandler, event_type: EventType, callback: *const fn (WebAPIEvent) void) void {
         self.callbacks.put(event_type, callback) catch {};
     }
     
-    pub fn emitProgress(inout self: *FetchEventHandler, loaded: u64, total: u64) void {
+    pub fn emitProgress(self: *FetchEventHandler, loaded: u64, total: u64) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .PROGRESS, self.fetch_id);
         
         const progress_data = std.fmt.allocPrint(std.heap.c_allocator, "loaded={},total={}", .{ loaded, total }) catch "";
@@ -461,7 +461,7 @@ pub const FetchEventHandler = struct {
         event.deinit();
     }
     
-    pub fn emitLoad(inout self: *FetchEventHandler) void {
+    pub fn emitLoad(self: *FetchEventHandler) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .LOAD, self.fetch_id);
         
         if (self.response_data) |data| {
@@ -479,7 +479,7 @@ pub const FetchEventHandler = struct {
         event.deinit();
     }
     
-    pub fn emitError(inout self: *FetchEventHandler, error_message: []const u8) void {
+    pub fn emitError(self: *FetchEventHandler, error_message: []const u8) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .ERROR, self.fetch_id);
         event.setData(error_message);
         event.setPriority(.HIGH);
@@ -491,7 +491,7 @@ pub const FetchEventHandler = struct {
         event.deinit();
     }
     
-    pub fn emitAbort(inout self: *FetchEventHandler) void {
+    pub fn emitAbort(self: *FetchEventHandler) void {
         var event = WebAPIEvent.init(std.heap.c_allocator, .ABORT, self.fetch_id);
         event.setData("Request aborted");
         
@@ -536,7 +536,7 @@ pub const EventLoopManager = struct {
     }
     
     /// Start the event loop
-    pub fn start(inout self: *EventLoopManager) !void {
+    pub fn start(self: *EventLoopManager) !void {
         if (self.is_running) {
             return error.AlreadyRunning;
         }
@@ -549,13 +549,13 @@ pub const EventLoopManager = struct {
     }
     
     /// Stop the event loop
-    pub fn stop(inout self: *EventLoopManager) void {
+    pub fn stop(self: *EventLoopManager) void {
         self.is_running = false;
         std.log.info("🛑 Event Loop Manager stopped", .{});
     }
     
     /// Create a new WebSocket event handler
-    pub fn createWebSocketHandler(inout self: *EventLoopManager) !*WebSocketEventHandler {
+    pub fn createWebSocketHandler(self: *EventLoopManager) !*WebSocketEventHandler {
         const handler = try self.allocator.create(WebSocketEventHandler);
         const source_id = self.allocateSourceId();
         
@@ -569,7 +569,7 @@ pub const EventLoopManager = struct {
     }
     
     /// Create a new XMLHttpRequest event handler
-    pub fn createXMLHttpRequestHandler(inout self: *EventLoopManager) !*XMLHttpRequestEventHandler {
+    pub fn createXMLHttpRequestHandler(self: *EventLoopManager) !*XMLHttpRequestEventHandler {
         const handler = try self.allocator.create(XMLHttpRequestEventHandler);
         const source_id = self.allocateSourceId();
         
@@ -582,7 +582,7 @@ pub const EventLoopManager = struct {
     }
     
     /// Create a new Fetch event handler
-    pub fn createFetchHandler(inout self: *EventLoopManager, url: []const u8, method: []const u8) !*FetchEventHandler {
+    pub fn createFetchHandler(self: *EventLoopManager, url: []const u8, method: []const u8) !*FetchEventHandler {
         const handler = try self.allocator.create(FetchEventHandler);
         const source_id = self.allocateSourceId();
         
@@ -595,19 +595,19 @@ pub const EventLoopManager = struct {
     }
     
     /// Schedule a background task
-    pub fn scheduleBackgroundTask(inout self: *EventLoopManager, task: BackgroundTask) !void {
+    pub fn scheduleBackgroundTask(self: *EventLoopManager, task: BackgroundTask) !void {
         try self.background_tasks.put(task.task_id, task);
         std.log.info("📅 Background task scheduled: {} (ID: {})", .{ task.task_type, task.task_id });
     }
     
     /// Remove a background task
-    pub fn cancelBackgroundTask(inout self: *EventLoopManager, task_id: u64) void {
+    pub fn cancelBackgroundTask(self: *EventLoopManager, task_id: u64) void {
         _ = self.background_tasks.remove(task_id);
         std.log.info("❌ Background task cancelled: {}", .{task_id});
     }
     
     /// Process task queue
-    pub fn processTaskQueue(inout self: *EventLoopManager) !void {
+    pub fn processTaskQueue(self: *EventLoopManager) !void {
         var processed_count: usize = 0;
         const max_process_per_cycle = 100; // Prevent blocking the loop
         
@@ -627,7 +627,7 @@ pub const EventLoopManager = struct {
     }
     
     /// Process background tasks
-    fn processBackgroundTasks(inout self: *EventLoopManager) !void {
+    fn processBackgroundTasks(self: *EventLoopManager) !void {
         var task_iter = self.background_tasks.valueIterator();
         var to_reschedule = ArrayList(BackgroundTask).init(self.allocator);
         defer to_reschedule.deinit();
@@ -671,7 +671,7 @@ pub const EventLoopManager = struct {
     }
     
     /// Allocate a new source ID
-    fn allocateSourceId(inout self: *EventLoopManager) u64 {
+    fn allocateSourceId(self: *EventLoopManager) u64 {
         const id = self.next_source_id;
         self.next_source_id += 1;
         return id;

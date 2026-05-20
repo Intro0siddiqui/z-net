@@ -96,6 +96,8 @@ pub const DnsResolver = @import("z_dns/dns.zig").DnsResolver;
 pub const DnsCache = @import("z_dns/dns.zig").DnsCache;
 pub const HttpCache = @import("z_cache/cache.zig").HttpCache;
 pub const CookieCache = @import("z_cache/cache.zig").CookieCache;
+pub const BodyRingManager = @import("z_body_ring.zig").BodyRingManager;
+pub const BodyRingRegion = @import("z_body_ring.zig").BodyRingRegion;
 
 // Protocol Implementations
 pub const HttpClient = @import("z_http/http.zig").HttpClient;
@@ -341,10 +343,13 @@ pub fn example() !void {
     
     // Basic DNS resolution example
     std.log.info("\n1. DNS Resolution Example:", .{});
-    var dns_cache = DnsCache.init(allocator);
-    defer dns_cache.deinit();
+    // For demonstration purposes, using undefined as a placeholder for a real std.Io implementation.
+    // In a real browser environment, this would be injected.
+    var io_ctx_placeholder: std.Io = undefined;
+    var dns_cache = DnsCache.init(undefined, allocator, .{}, &io_ctx_placeholder);
+    defer dns_cache.cache.deinit();
     
-    var resolver = DnsResolver.init(allocator, &dns_cache);
+    var resolver = DnsResolver.init(allocator, &io_ctx_placeholder, &dns_cache);
     
     const google_query = .{
         .name = "google.com",

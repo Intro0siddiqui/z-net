@@ -39,11 +39,11 @@ pub const WebSocketHandshakeRequest = struct {
         self.headers.deinit();
     }
     
-    pub fn setHeader(inout self: *WebSocketHandshakeRequest, name: []const u8, value: []const u8) void {
+    pub fn setHeader(self: *WebSocketHandshakeRequest, name: []const u8, value: []const u8) void {
         self.headers.put(name, value) catch {};
     }
     
-    pub fn generateHandshakeRequest(inout self: *WebSocketHandshakeRequest, allocator: Allocator) ![]const u8 {
+    pub fn generateHandshakeRequest(self: *WebSocketHandshakeRequest, allocator: Allocator) ![]const u8 {
         // Set required headers
         self.setHeader("Host", extractHostFromUrl(self.url));
         self.setHeader("Upgrade", "websocket");
@@ -97,11 +97,11 @@ pub const WebSocketHandshakeResponse = struct {
         self.headers.deinit();
     }
     
-    pub fn setHeader(inout self: *WebSocketHandshakeResponse, name: []const u8, value: []const u8) void {
+    pub fn setHeader(self: *WebSocketHandshakeResponse, name: []const u8, value: []const u8) void {
         self.headers.put(name, value) catch {};
     }
     
-    pub fn parseHandshakeResponse(inout self: *WebSocketHandshakeResponse, response_data: []const u8) !void {
+    pub fn parseHandshakeResponse(self: *WebSocketHandshakeResponse, response_data: []const u8) !void {
         var lines = std.mem.split(u8, response_data, "\r\n");
         
         // Parse status line
@@ -187,15 +187,15 @@ pub const WebSocketEvent = struct {
         _ = self;
     }
     
-    pub fn setMessage(inout self: *WebSocketEvent, message: []const u8) void {
+    pub fn setMessage(self: *WebSocketEvent, message: []const u8) void {
         self.data = message;
     }
     
-    pub fn setBinaryData(inout self: *WebSocketEvent, binary_data: []const u8) void {
+    pub fn setBinaryData(self: *WebSocketEvent, binary_data: []const u8) void {
         self.binary_data = binary_data;
     }
     
-    pub fn setCloseInfo(inout self: *WebSocketEvent, code: WebSocketCloseCode, reason: []const u8) void {
+    pub fn setCloseInfo(self: *WebSocketEvent, code: WebSocketCloseCode, reason: []const u8) void {
         self.close_code = code;
         self.reason = reason;
     }
@@ -239,12 +239,12 @@ pub const WebSocketManager = struct {
         self.event_handlers.deinit();
     }
     
-    pub fn setPolicyManager(inout self: *WebSocketManager, policy_manager: *PolicyManager) void {
+    pub fn setPolicyManager(self: *WebSocketManager, policy_manager: *PolicyManager) void {
         self.policy_manager = policy_manager;
     }
     
     /// Connect to WebSocket server
-    pub fn connect(inout self: *WebSocketManager, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
+    pub fn connect(self: *WebSocketManager, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
         // Validate URL
         if (!std.mem.eql(u8, url[0..3], "ws:") and !std.mem.eql(u8, url[0..4], "wss:")) {
             return error.InvalidUrl;
@@ -274,35 +274,35 @@ pub const WebSocketManager = struct {
     }
     
     /// Disconnect WebSocket
-    pub fn disconnect(inout self: *WebSocketManager, connection_id: u64, code: WebSocketCloseCode, reason: []const u8) !void {
+    pub fn disconnect(self: *WebSocketManager, connection_id: u64, code: WebSocketCloseCode, reason: []const u8) !void {
         try self.connection_pool.closeConnection(connection_id, code, reason, self.allocator);
     }
     
     /// Send text message
-    pub fn sendText(inout self: *WebSocketManager, connection_id: u64, message: []const u8) !void {
+    pub fn sendText(self: *WebSocketManager, connection_id: u64, message: []const u8) !void {
         const connection = self.connection_pool.connections.get(connection_id) orelse return error.ConnectionNotFound;
         try connection.sendText(message, self.allocator);
     }
     
     /// Send binary message
-    pub fn sendBinary(inout self: *WebSocketManager, connection_id: u64, binary_data: []const u8) !void {
+    pub fn sendBinary(self: *WebSocketManager, connection_id: u64, binary_data: []const u8) !void {
         const connection = self.connection_pool.connections.get(connection_id) orelse return error.ConnectionNotFound;
         try connection.sendBinary(binary_data, self.allocator);
     }
     
     /// Send ping
-    pub fn sendPing(inout self: *WebSocketManager, connection_id: u64) !void {
+    pub fn sendPing(self: *WebSocketManager, connection_id: u64) !void {
         const connection = self.connection_pool.connections.get(connection_id) orelse return error.ConnectionNotFound;
         try connection.sendPing(self.allocator);
     }
     
     /// Add event listener
-    pub fn addEventListener(inout self: *WebSocketManager, connection_id: u64, callback: *const fn (WebSocketEvent) void) !void {
+    pub fn addEventListener(self: *WebSocketManager, connection_id: u64, callback: *const fn (WebSocketEvent) void) !void {
         try self.event_handlers.put(connection_id, callback);
     }
     
     /// Remove event listener
-    pub fn removeEventListener(inout self: *WebSocketManager, connection_id: u64) void {
+    pub fn removeEventListener(self: *WebSocketManager, connection_id: u64) void {
         _ = self.event_handlers.remove(connection_id);
     }
     
@@ -342,7 +342,7 @@ pub const WebSocketManager = struct {
     }
     
     /// Process incoming data for a connection
-    pub fn processIncomingData(inout self: *WebSocketManager, connection_id: u64, data: []const u8) !void {
+    pub fn processIncomingData(self: *WebSocketManager, connection_id: u64, data: []const u8) !void {
         const connection = self.connection_pool.connections.get(connection_id) orelse return error.ConnectionNotFound;
         
         // Process WebSocket frames
@@ -369,7 +369,7 @@ pub const WebSocketManager = struct {
     }
     
     /// Cleanup inactive connections
-    pub fn cleanup(inout self: *WebSocketManager) void {
+    pub fn cleanup(self: *WebSocketManager) void {
         self.connection_pool.cleanupInactive();
     }
     
@@ -384,7 +384,7 @@ pub const WebSocketManager = struct {
     }
     
     // Private helper functions
-    fn initiateHandshake(inout self: *WebSocketManager, connection: *WebSocketConnection) !void {
+    fn initiateHandshake(self: *WebSocketManager, connection: *WebSocketConnection) !void {
         // Create handshake request
         var handshake_request = WebSocketHandshakeRequest.init(self.allocator, connection.url);
         defer handshake_request.deinit();
@@ -436,7 +436,7 @@ pub const WebSocketManager = struct {
         connection.state = .OPEN;
     }
     
-    fn startConnectionMonitoring(inout self: *WebSocketManager, connection: *WebSocketConnection) !void {
+    fn startConnectionMonitoring(self: *WebSocketManager, connection: *WebSocketConnection) !void {
         // Schedule ping intervals
         if (self.config.ping_interval_seconds > 0) {
             var ping_task = BackgroundTask.init(connection.connection_id, "websocket-ping", "ping");
@@ -453,7 +453,7 @@ pub const WebSocketManager = struct {
         _ = connection_id;
     }
     
-    fn handleCompletedMessage(inout self: *WebSocketManager, connection_id: u64, message: WebSocketMessage) !void {
+    fn handleCompletedMessage(self: *WebSocketManager, connection_id: u64, message: WebSocketMessage) !void {
         // Create and trigger event
         var event = WebSocketEvent.init(self.allocator, 
             if (message.message_type == .TEXT) .MESSAGE else .BINARY_MESSAGE, 

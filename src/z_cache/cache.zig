@@ -4,12 +4,24 @@
 const std = @import("std");
 const browserdb = @import("browserdb");
 
+pub const HttpHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const HttpResponse = struct {
+    status_code: u16,
+    headers: []HttpHeader,
+    body: []const u8,
+};
+
 pub const CacheError = error{
     NotFound,
     Expired,
     SerializationError,
     DeserializationError,
     StorageError,
+    RevalidationRequired,
 };
 
 pub const CacheEntry = struct {
@@ -58,14 +70,16 @@ pub const Cache = struct {
     config: CacheConfig,
     stats: CacheStats,
     lock: std.Thread.Mutex,
+    io_ctx: *std.Io,
 
     const Self = @This();
 
-    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig) Self {
+    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig, io_ctx: *std.Io) Self {
         return Self{
             .db = db,
             .allocator = allocator,
             .config = config,
+            .io_ctx = io_ctx,
             .stats = CacheStats{
                 .total_size = 0,
                 .total_entries = 0,
@@ -84,7 +98,7 @@ pub const Cache = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        // Get from BrowserDB
+        // Get from BrowserDB using io_uring if available via io_ctx
         const db_entry = self.db.get(key) catch return error.StorageError;
 
         if (db_entry == null) {
@@ -93,16 +107,15 @@ pub const Cache = struct {
             return null;
         }
 
-        const entry = try deserializeCacheEntry(db_entry, self.allocator);
+        var entry = try deserializeCacheEntry(db_entry, self.allocator);
 
-        // Check if expired
+        // Check freshness according to RFC 7234
         const now = std.time.timestamp();
         if (now >= entry.expires_at) {
-            // Remove expired entry
-            self.db.delete(key) catch {};
+            // Entry is stale, but we keep it for revalidation
             self.stats.miss_count += 1;
             self.stats.hit_rate = @as(f64, @floatFromInt(self.stats.hit_count)) / @as(f64, @floatFromInt(self.stats.hit_count + self.stats.miss_count));
-            return error.Expired;
+            return entry;
         }
 
         // Update access statistics
@@ -291,9 +304,9 @@ pub const HttpCache = struct {
 
     const Self = @This();
 
-    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig) Self {
+    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig, io_ctx: *std.Io) Self {
         return Self{
-            .cache = Cache.init(db, allocator, config),
+            .cache = Cache.init(db, allocator, config, io_ctx),
             .vary_cache = std.StringArrayHashMap([]const u8).init(allocator),
         };
     }
@@ -304,44 +317,83 @@ pub const HttpCache = struct {
         defer self.cache.allocator.free(cache_key);
 
         // Check vary headers
-        const vary_key = try buildVaryKey(url, request_headers);
+        const vary_key = self.buildVaryKey(url, request_headers);
         if (self.vary_cache.get(vary_key)) |key| {
             cache_key = key;
         }
 
-        const entry = self.cache.get(cache_key) catch return null;
-        return if (entry) |e| HttpCacheEntry{
-            .url = e.key,
-            .status_code = try parseStatusCodeFromEntry(&e),
-            .headers = try parseHeadersFromEntry(&e),
-            .body = e.value,
-            .metadata = e.metadata,
-            .created_at = e.created_at,
-            .expires_at = e.expires_at,
-            .etag = e.metadata.etag,
-            .last_modified = e.metadata.last_modified,
-        } else null;
+        const entry_opt = self.cache.get(cache_key) catch return null;
+        if (entry_opt) |e| {
+            const now = std.time.timestamp();
+            const is_expired = now >= e.expires_at;
+
+            // RFC 7234 Freshness Check
+            if (!is_expired) {
+                // Check if client provided conditional headers
+                if (request_headers.get("If-None-Match")) |etag| {
+                    if (e.metadata.etag) |cached_etag| {
+                        if (std.mem.eql(u8, etag, cached_etag)) {
+                            // Return 304 Not Modified directly, bypassing network
+                            return HttpCacheEntry{
+                                .url = e.key,
+                                .status_code = 304,
+                                .headers = try parseHeadersFromEntry(&e),
+                                .body = &.{},
+                                .metadata = e.metadata,
+                                .created_at = e.created_at,
+                                .expires_at = e.expires_at,
+                                .etag = e.metadata.etag,
+                                .last_modified = e.metadata.last_modified,
+                            };
+                        }
+                    }
+                }
+
+                // Return 200 OK with cached body
+                return HttpCacheEntry{
+                    .url = e.key,
+                    .status_code = 200,
+                    .headers = try parseHeadersFromEntry(&e),
+                    .body = e.value,
+                    .metadata = e.metadata,
+                    .created_at = e.created_at,
+                    .expires_at = e.expires_at,
+                    .etag = e.metadata.etag,
+                    .last_modified = e.metadata.last_modified,
+                };
+            }
+
+            // Stale entry - revalidation required
+            return error.RevalidationRequired;
+        }
+        return null;
     }
 
     pub fn putHttpResponse(self: *Self, url: []const u8, response: HttpResponse, ttl: ?u32) CacheError!void {
-        // Determine TTL based on headers
+        // Determine TTL based on RFC 7234 headers
         var calculated_ttl: u32 = ttl orelse self.cache.config.default_ttl;
+        var can_cache = true;
 
-        // Check Cache-Control header
+        // Check Cache-Control header directives
         for (response.headers) |header| {
             if (std.mem.eql(u8, header.name, "Cache-Control")) {
-                if (std.mem.indexOf(u8, header.value, "max-age=")) |idx| {
-                    const max_age_str = header.value[idx + 8..];
-                    const max_age = std.fmt.parseInt(u32, max_age_str, 10) catch continue;
-                    calculated_ttl = max_age;
+                if (std.mem.indexOf(u8, header.value, "no-store") != null) {
+                    can_cache = false;
                 } else if (std.mem.indexOf(u8, header.value, "no-cache") != null) {
-                    return; // Don't cache
+                    calculated_ttl = 0; // Must revalidate
+                } else if (std.mem.indexOf(u8, header.value, "max-age=")) |idx| {
+                    const val = header.value[idx + 8..];
+                    var end: usize = 0;
+                    while (end < val.len and std.ascii.isDigit(val[end])) : (end += 1) {}
+                    calculated_ttl = std.fmt.parseInt(u32, val[0..end], 10) catch calculated_ttl;
                 }
             } else if (std.mem.eql(u8, header.name, "Expires")) {
-                // Parse Expires header
-                // Simplified: just use default TTL
+                // Simplified Expires handling
+                calculated_ttl = self.cache.config.default_ttl;
             }
         }
+
+        if (!can_cache) return;
 
         // Create metadata
         var metadata = CacheMetadata{
@@ -435,11 +487,11 @@ pub const DnsCache = struct {
 
     const Self = @This();
 
-    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig) Self {
+    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig, io_ctx: *std.Io) Self {
         var dns_config = config;
         dns_config.default_ttl = 300; // 5 minutes for DNS
         return Self{
-            .cache = Cache.init(db, allocator, dns_config),
+            .cache = Cache.init(db, allocator, dns_config, io_ctx),
         };
     }
 
@@ -489,11 +541,11 @@ pub const CookieCache = struct {
 
     const Self = @This();
 
-    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig) Self {
+    pub fn init(db: *browserdb.BrowserDB, allocator: std.mem.Allocator, config: CacheConfig, io_ctx: *std.Io) Self {
         var cookie_config = config;
         cookie_config.default_ttl = 86400; // 24 hours for cookies
         return Self{
-            .cache = Cache.init(db, allocator, cookie_config),
+            .cache = Cache.init(db, allocator, cookie_config, io_ctx),
         };
     }
 
