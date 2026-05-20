@@ -39,7 +39,7 @@ pub const StorageQuota = struct {
         };
     }
     
-    pub fn updateUsage(inout self: *StorageQuota, new_used: u64) void {
+    pub fn updateUsage(self: *StorageQuota, new_used: u64) void {
         self.used_size_bytes = new_used;
         if (self.used_size_bytes > self.max_size_bytes) {
             self.remaining_bytes = 0;
@@ -48,7 +48,7 @@ pub const StorageQuota = struct {
         }
     }
     
-    pub fn canStore(inout self: *StorageQuota, size_bytes: u64) bool {
+    pub fn canStore(self: *StorageQuota, size_bytes: u64) bool {
         return (self.used_size_bytes + size_bytes) <= self.max_size_bytes;
     }
     
@@ -83,7 +83,7 @@ pub const StorageItem = struct {
         self.metadata.deinit();
     }
     
-    pub fn setExpiration(inout self: *StorageItem, expires_in_ms: u64) void {
+    pub fn setExpiration(self: *StorageItem, expires_in_ms: u64) void {
         self.expires_timestamp = getCurrentTimestamp() + expires_in_ms;
     }
     
@@ -94,11 +94,11 @@ pub const StorageItem = struct {
         return false;
     }
     
-    pub fn updateAccess(inout self: *StorageItem) void {
+    pub fn updateAccess(self: *StorageItem) void {
         self.last_accessed_timestamp = getCurrentTimestamp();
     }
     
-    pub fn calculateSize(inout self: *StorageItem) void {
+    pub fn calculateSize(self: *StorageItem) void {
         self.size_bytes = self.key.len + self.value.len;
         
         // Add metadata size
@@ -157,6 +157,20 @@ pub const OriginStorage = struct {
     }
 };
 
+pub const CookiePartition = struct {
+    top_level_site: []const u8,
+    origin: []const u8,
+    cookies: AutoHashMap([]const u8, Cookie),
+
+    pub fn init(allocator: Allocator, top_level_site: []const u8, origin: []const u8) CookiePartition {
+        return CookiePartition{
+            .top_level_site = top_level_site,
+            .origin = origin,
+            .cookies = AutoHashMap([]const u8, Cookie).init(allocator),
+        };
+    }
+};
+
 pub const Cookie = struct {
     name: []const u8,
     value: []const u8,
@@ -167,7 +181,8 @@ pub const Cookie = struct {
     http_only: bool,
     same_site: SameSitePolicy,
     size_bytes: u64,
-    
+    top_level_site: []const u8 = "",
+
     pub fn init(name: []const u8, value: []const u8) Cookie {
         return Cookie{
             .name = name,
@@ -182,29 +197,29 @@ pub const Cookie = struct {
         };
     }
     
-    pub fn setDomain(inout self: *Cookie, domain: []const u8) void {
+    pub fn setDomain(self: *Cookie, domain: []const u8) void {
         self.domain = domain;
         self.calculateSize();
     }
     
-    pub fn setPath(inout self: *Cookie, path: []const u8) void {
+    pub fn setPath(self: *Cookie, path: []const u8) void {
         self.path = path;
         self.calculateSize();
     }
     
-    pub fn setExpiration(inout self: *Cookie, expires_timestamp: u64) void {
+    pub fn setExpiration(self: *Cookie, expires_timestamp: u64) void {
         self.expires = expires_timestamp;
     }
     
-    pub fn setSecure(inout self: *Cookie, secure: bool) void {
+    pub fn setSecure(self: *Cookie, secure: bool) void {
         self.secure = secure;
     }
     
-    pub fn setHttpOnly(inout self: *Cookie, http_only: bool) void {
+    pub fn setHttpOnly(self: *Cookie, http_only: bool) void {
         self.http_only = http_only;
     }
     
-    pub fn setSameSite(inout self: *Cookie, policy: SameSitePolicy) void {
+    pub fn setSameSite(self: *Cookie, policy: SameSitePolicy) void {
         self.same_site = policy;
     }
     
@@ -215,7 +230,7 @@ pub const Cookie = struct {
         return false;
     }
     
-    pub fn matchesUrl(inout self: *Cookie, url: []const u8) bool {
+    pub fn matchesUrl(self: *Cookie, url: []const u8) bool {
         // Basic cookie matching logic
         const url_origin = Origin.parse(url) catch return false;
         
@@ -235,7 +250,7 @@ pub const Cookie = struct {
         return true;
     }
     
-    fn calculateSize(inout self: *Cookie) void {
+    fn calculateSize(self: *Cookie) void {
         var size = self.name.len + self.value.len;
         if (self.domain.len > 0) size += self.domain.len + 7; // "; Domain="
         if (self.path.len > 0) size += self.path.len + 6; // "; Path="
@@ -275,7 +290,7 @@ pub const IndexedDBDatabase = struct {
         self.stores.deinit();
     }
     
-    pub fn createObjectStore(inout self: *IndexedDBDatabase, name: []const u8, key_path: ?[]const u8, auto_increment: bool) !*IndexedDBObjectStore {
+    pub fn createObjectStore(self: *IndexedDBDatabase, name: []const u8, key_path: ?[]const u8, auto_increment: bool) !*IndexedDBObjectStore {
         const store = try self.allocator.create(IndexedDBObjectStore);
         store.* = IndexedDBObjectStore.init(self.allocator, name, key_path, auto_increment);
         
@@ -283,11 +298,11 @@ pub const IndexedDBDatabase = struct {
         return store;
     }
     
-    pub fn getObjectStore(inout self: *IndexedDBDatabase, name: []const u8) ?*IndexedDBObjectStore {
+    pub fn getObjectStore(self: *IndexedDBDatabase, name: []const u8) ?*IndexedDBObjectStore {
         return self.stores.get(name);
     }
     
-    pub fn deleteObjectStore(inout self: *IndexedDBDatabase, name: []const u8) void {
+    pub fn deleteObjectStore(self: *IndexedDBDatabase, name: []const u8) void {
         const removed = self.stores.remove(name);
         if (removed) |store| {
             store.deinit();
@@ -326,7 +341,7 @@ pub const IndexedDBObjectStore = struct {
         self.indices.deinit();
     }
     
-    pub fn put(inout self: *IndexedDBObjectStore, key: []const u8, value: []const u8, metadata: ?StringHashMap([]const u8)) !void {
+    pub fn put(self: *IndexedDBObjectStore, key: []const u8, value: []const u8, metadata: ?StringHashMap([]const u8)) !void {
         var record = IndexedDBRecord.init(key, value);
         if (metadata) |meta| {
             var meta_iter = meta.keyIterator();
@@ -343,11 +358,11 @@ pub const IndexedDBObjectStore = struct {
         return self.records.get(key);
     }
     
-    pub fn delete(inout self: *IndexedDBObjectStore, key: []const u8) void {
+    pub fn delete(self: *IndexedDBObjectStore, key: []const u8) void {
         _ = self.records.remove(key);
     }
     
-    pub fn clear(inout self: *IndexedDBObjectStore) void {
+    pub fn clear(self: *IndexedDBObjectStore) void {
         var record_iter = self.records.valueIterator();
         while (record_iter.next()) |record| {
             record.deinit();
@@ -422,7 +437,7 @@ pub const CacheAPIEntry = struct {
         self.request_headers.deinit();
     }
     
-    pub fn setExpiration(inout self: *CacheAPIEntry, expires_in_ms: u64) void {
+    pub fn setExpiration(self: *CacheAPIEntry, expires_in_ms: u64) void {
         self.expires_timestamp = getCurrentTimestamp() + expires_in_ms;
     }
     
@@ -433,7 +448,7 @@ pub const CacheAPIEntry = struct {
         return false;
     }
     
-    pub fn matchesRequest(inout self: *CacheAPIEntry, url: []const u8) bool {
+    pub fn matchesRequest(self: *CacheAPIEntry, url: []const u8) bool {
         return std.mem.eql(u8, self.request_url, url);
     }
 };
@@ -459,23 +474,23 @@ pub const CacheAPICache = struct {
         self.entries.deinit();
     }
     
-    pub fn put(inout self: *CacheAPICache, request_url: []const u8, response_data: []const u8) !void {
+    pub fn put(self: *CacheAPICache, request_url: []const u8, response_data: []const u8) !void {
         var entry = CacheAPIEntry.init(request_url, response_data);
         try self.entries.put(request_url, entry);
     }
     
-    pub fn match(inout self: *CacheAPICache, request_url: []const u8) ?*CacheAPIEntry {
+    pub fn match(self: *CacheAPICache, request_url: []const u8) ?*CacheAPIEntry {
         return self.entries.get(request_url);
     }
     
-    pub fn delete(inout self: *CacheAPICache, request_url: []const u8) void {
+    pub fn delete(self: *CacheAPICache, request_url: []const u8) void {
         const removed = self.entries.remove(request_url);
         if (removed) |entry| {
             entry.deinit();
         }
     }
     
-    pub fn keys(inout self: *CacheAPICache) ArrayList([]const u8) {
+    pub fn keys(self: *CacheAPICache) ArrayList([]const u8) {
         var keys = ArrayList([]const u8).init(std.heap.c_allocator);
         var key_iter = self.entries.keyIterator();
         while (key_iter.next()) |key| {
@@ -498,7 +513,7 @@ pub const StorageError = error{
 pub const StorageBridge = struct {
     allocator: Allocator,
     origin_storages: AutoHashMap([]const u8, OriginStorage),
-    cookie_jar: AutoHashMap([]const u8, Cookie),
+    cookie_jar: AutoHashMap([]const u8, CookiePartition),
     indexed_db_databases: AutoHashMap([]const u8, IndexedDBDatabase),
     cache_api_caches: AutoHashMap([]const u8, CacheAPICache),
     global_quota: StorageQuota,
@@ -546,7 +561,7 @@ pub const StorageBridge = struct {
     }
     
     /// Get or create origin storage
-    fn getOriginStorage(inout self: *StorageBridge, origin: Origin) !*OriginStorage {
+    fn getOriginStorage(self: *StorageBridge, origin: Origin) !*OriginStorage {
         const origin_key = try std.fmt.allocPrint(self.allocator, "{}://{}:{}", .{
             origin.scheme,
             origin.host,
@@ -567,7 +582,7 @@ pub const StorageBridge = struct {
     }
     
     /// LocalStorage API
-    pub fn localStorageGet(inout self: *StorageBridge, origin: Origin, key: []const u8) ?[]const u8 {
+    pub fn localStorageGet(self: *StorageBridge, origin: Origin, key: []const u8) ?[]const u8 {
         const storage = self.getOriginStorage(origin) catch return null;
         
         const item = storage.local_storage.get(key) orelse return null;
@@ -585,7 +600,7 @@ pub const StorageBridge = struct {
         return item.value;
     }
     
-    pub fn localStorageSet(inout self: *StorageBridge, origin: Origin, key: []const u8, value: []const u8) !void {
+    pub fn localStorageSet(self: *StorageBridge, origin: Origin, key: []const u8, value: []const u8) !void {
         const storage = try self.getOriginStorage(origin);
         
         // Check quota
@@ -601,7 +616,7 @@ pub const StorageBridge = struct {
         storage.quota_local.updateUsage(storage.quota_local.used_size_bytes + item_size);
     }
     
-    pub fn localStorageRemove(inout self: *StorageBridge, origin: Origin, key: []const u8) void {
+    pub fn localStorageRemove(self: *StorageBridge, origin: Origin, key: []const u8) void {
         const storage = self.getOriginStorage(origin) catch return;
         
         const removed = storage.local_storage.remove(key);
@@ -611,7 +626,7 @@ pub const StorageBridge = struct {
         }
     }
     
-    pub fn localStorageClear(inout self: *StorageBridge, origin: Origin) void {
+    pub fn localStorageClear(self: *StorageBridge, origin: Origin) void {
         const storage = self.getOriginStorage(origin) catch return;
         
         var item_iter = storage.local_storage.valueIterator();
@@ -622,7 +637,7 @@ pub const StorageBridge = struct {
         storage.quota_local.updateUsage(0);
     }
     
-    pub fn localStorageKeys(inout self: *StorageBridge, origin: Origin) ArrayList([]const u8) {
+    pub fn localStorageKeys(self: *StorageBridge, origin: Origin) ArrayList([]const u8) {
         const storage = self.getOriginStorage(origin) catch {
             return ArrayList([]const u8).init(self.allocator);
         };
@@ -636,7 +651,7 @@ pub const StorageBridge = struct {
     }
     
     /// SessionStorage API (same interface as localStorage but separate storage)
-    pub fn sessionStorageGet(inout self: *StorageBridge, origin: Origin, key: []const u8) ?[]const u8 {
+    pub fn sessionStorageGet(self: *StorageBridge, origin: Origin, key: []const u8) ?[]const u8 {
         const storage = self.getOriginStorage(origin) catch return null;
         
         const item = storage.session_storage.get(key) orelse return null;
@@ -649,7 +664,7 @@ pub const StorageBridge = struct {
         return item.value;
     }
     
-    pub fn sessionStorageSet(inout self: *StorageBridge, origin: Origin, key: []const u8, value: []const u8) !void {
+    pub fn sessionStorageSet(self: *StorageBridge, origin: Origin, key: []const u8, value: []const u8) !void {
         const storage = try self.getOriginStorage(origin);
         
         const item_size = key.len + value.len;
@@ -664,7 +679,7 @@ pub const StorageBridge = struct {
         storage.quota_session.updateUsage(storage.quota_session.used_size_bytes + item_size);
     }
     
-    pub fn sessionStorageRemove(inout self: *StorageBridge, origin: Origin, key: []const u8) void {
+    pub fn sessionStorageRemove(self: *StorageBridge, origin: Origin, key: []const u8) void {
         const storage = self.getOriginStorage(origin) catch return;
         
         const removed = storage.session_storage.remove(key);
@@ -674,7 +689,7 @@ pub const StorageBridge = struct {
         }
     }
     
-    pub fn sessionStorageClear(inout self: *StorageBridge, origin: Origin) void {
+    pub fn sessionStorageClear(self: *StorageBridge, origin: Origin) void {
         const storage = self.getOriginStorage(origin) catch return;
         
         var item_iter = storage.session_storage.valueIterator();
@@ -686,43 +701,70 @@ pub const StorageBridge = struct {
     }
     
     /// Cookie Management
-    pub fn setCookie(inout self: *StorageBridge, cookie: Cookie) !void {
+    fn getPartitionKey(allocator: Allocator, top_level_site: []const u8, origin: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "{s}|{s}", .{ top_level_site, origin });
+    }
+
+    /// Cookie Management
+    pub fn setCookie(self: *StorageBridge, cookie: Cookie, top_level_site: []const u8, origin: []const u8) !void {
         // Clean up expired cookies
         self.cleanupExpiredCookies();
         
-        try self.cookie_jar.put(cookie.name, cookie);
+        const partition_key = try getPartitionKey(self.allocator, top_level_site, origin);
+        defer self.allocator.free(partition_key);
+
+        if (!self.cookie_jar.contains(partition_key)) {
+            try self.cookie_jar.put(try self.allocator.dupe(u8, partition_key), CookiePartition.init(self.allocator, top_level_site, origin));
+        }
+
+        var partition = self.cookie_jar.getPtr(partition_key).?;
+        try partition.cookies.put(cookie.name, cookie);
     }
     
-    pub fn getCookie(self: *StorageBridge, name: []const u8) ?Cookie {
-        const cookie = self.cookie_jar.get(name) orelse return null;
+    pub fn getCookie(self: *StorageBridge, name: []const u8, top_level_site: []const u8, origin: []const u8) ?Cookie {
+        var partition_key_buf: [512]u8 = undefined;
+        const partition_key = std.fmt.bufPrint(&partition_key_buf, "{s}|{s}", .{ top_level_site, origin }) catch return null;
+
+        const partition = self.cookie_jar.get(partition_key) orelse return null;
+        const cookie = partition.cookies.get(name) orelse return null;
         
         if (cookie.isExpired()) {
-            _ = self.cookie_jar.remove(name);
+            _ = partition.cookies.remove(name);
             return null;
         }
         
         return cookie.*;
     }
     
-    pub fn getCookiesForUrl(self: *StorageBridge, url: []const u8) ArrayList(Cookie) {
+    pub fn getCookiesForUrl(self: *StorageBridge, url: []const u8, top_level_site: []const u8, origin_req: []const u8) ArrayList(Cookie) {
         var matching_cookies = ArrayList(Cookie).init(self.allocator);
         
-        var cookie_iter = self.cookie_jar.valueIterator();
-        while (cookie_iter.next()) |cookie| {
-            if (!cookie.isExpired() and cookie.matchesUrl(url)) {
-                matching_cookies.append(cookie.*) catch {};
+        var partition_key_buf: [512]u8 = undefined;
+        const partition_key = std.fmt.bufPrint(&partition_key_buf, "{s}|{s}", .{ top_level_site, origin_req }) catch return matching_cookies;
+
+        if (self.cookie_jar.get(partition_key)) |partition| {
+            var cookie_iter = partition.cookies.valueIterator();
+            while (cookie_iter.next()) |cookie| {
+                if (!cookie.isExpired() and cookie.matchesUrl(url)) {
+                    matching_cookies.append(cookie.*) catch {};
+                }
             }
         }
         
         return matching_cookies;
     }
     
-    pub fn deleteCookie(inout self: *StorageBridge, name: []const u8) void {
-        _ = self.cookie_jar.remove(name);
+    pub fn deleteCookie(self: *StorageBridge, name: []const u8, top_level_site: []const u8, origin: []const u8) void {
+        var partition_key_buf: [512]u8 = undefined;
+        const partition_key = std.fmt.bufPrint(&partition_key_buf, "{s}|{s}", .{ top_level_site, origin }) catch return;
+
+        if (self.cookie_jar.getPtr(partition_key)) |partition| {
+            _ = partition.cookies.remove(name);
+        }
     }
     
     /// IndexedDB Management
-    pub fn openIndexedDB(inout self: *StorageBridge, name: []const u8, version: u64) !*IndexedDBDatabase {
+    pub fn openIndexedDB(self: *StorageBridge, name: []const u8, version: u64) !*IndexedDBDatabase {
         // Clean up expired databases (simplified - would check version changes)
         if (self.indexed_db_databases.get(name)) |existing| {
             if (existing.version == version) {
@@ -738,7 +780,7 @@ pub const StorageBridge = struct {
         return database;
     }
     
-    pub fn deleteIndexedDB(inout self: *StorageBridge, name: []const u8) void {
+    pub fn deleteIndexedDB(self: *StorageBridge, name: []const u8) void {
         const removed = self.indexed_db_databases.remove(name);
         if (removed) |database| {
             database.deinit();
@@ -746,7 +788,7 @@ pub const StorageBridge = struct {
     }
     
     /// Cache API Management
-    pub fn cacheOpen(inout self: *StorageBridge, name: []const u8, origin: Origin) !*CacheAPICache {
+    pub fn cacheOpen(self: *StorageBridge, name: []const u8, origin: Origin) !*CacheAPICache {
         if (self.cache_api_caches.get(name)) |existing| {
             return existing;
         }
@@ -758,7 +800,7 @@ pub const StorageBridge = struct {
         return cache;
     }
     
-    pub fn cacheDelete(inout self: *StorageBridge, name: []const u8) void {
+    pub fn cacheDelete(self: *StorageBridge, name: []const u8) void {
         const removed = self.cache_api_caches.remove(name);
         if (removed) |cache| {
             cache.deinit();
@@ -766,24 +808,27 @@ pub const StorageBridge = struct {
     }
     
     /// Cleanup functions
-    fn cleanupExpiredCookies(inout self: *StorageBridge) void {
-        var to_remove = ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
-        
-        var cookie_iter = self.cookie_jar.keyIterator();
-        while (cookie_iter.next()) |cookie_name| {
-            const cookie = self.cookie_jar.get(cookie_name.*).?;
-            if (cookie.isExpired()) {
-                to_remove.append(cookie_name.*) catch {};
+    fn cleanupExpiredCookies(self: *StorageBridge) void {
+        var partition_iter = self.cookie_jar.valueIterator();
+        while (partition_iter.next()) |partition| {
+            var to_remove = ArrayList([]const u8).init(self.allocator);
+            defer to_remove.deinit();
+
+            var cookie_iter = partition.cookies.keyIterator();
+            while (cookie_iter.next()) |cookie_name| {
+                const cookie = partition.cookies.get(cookie_name.*).?;
+                if (cookie.isExpired()) {
+                    to_remove.append(cookie_name.*) catch {};
+                }
             }
-        }
-        
-        for (to_remove.items) |name| {
-            _ = self.cookie_jar.remove(name);
+
+            for (to_remove.items) |name| {
+                _ = partition.cookies.remove(name);
+            }
         }
     }
     
-    pub fn cleanupExpiredData(inout self: *StorageBridge) void {
+    pub fn cleanupExpiredData(self: *StorageBridge) void {
         // Clean up expired cookies
         self.cleanupExpiredCookies();
         
@@ -954,25 +999,25 @@ test "cookie management" {
     cookie.setExpiration(getCurrentTimestamp() + 3600); // 1 hour from now
     cookie.setSecure(true);
     
-    try storage_bridge.setCookie(cookie);
+    try storage_bridge.setCookie(cookie, "example.com", "https://example.com");
     
     // Get cookie
-    const retrieved_cookie = storage_bridge.getCookie("test-cookie");
+    const retrieved_cookie = storage_bridge.getCookie("test-cookie", "example.com", "https://example.com");
     try std.testing.expect(retrieved_cookie != null);
     try std.testing.expect(std.mem.eql(u8, "cookie-value", retrieved_cookie.?.value));
     try std.testing.expect(retrieved_cookie.?.secure);
     try std.testing.expect(std.mem.eql(u8, "/", retrieved_cookie.?.path));
     
     // Get cookies for URL
-    const cookies_for_url = storage_bridge.getCookiesForUrl("https://example.com/page");
+    const cookies_for_url = storage_bridge.getCookiesForUrl("https://example.com/page", "example.com", "https://example.com");
     defer cookies_for_url.deinit();
     try std.testing.expectEqual(@as(usize, 1), cookies_for_url.items.len);
     try std.testing.expect(std.mem.eql(u8, "test-cookie", cookies_for_url.items[0].name));
     
     // Delete cookie
-    storage_bridge.deleteCookie("test-cookie");
+    storage_bridge.deleteCookie("test-cookie", "example.com", "https://example.com");
     
     // Verify deletion
-    const deleted_cookie = storage_bridge.getCookie("test-cookie");
+    const deleted_cookie = storage_bridge.getCookie("test-cookie", "example.com", "https://example.com");
     try std.testing.expect(deleted_cookie == null);
 }

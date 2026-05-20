@@ -7,9 +7,10 @@ use std::ffi::{c_char, c_void, c_uchar};
 use std::ptr::null_mut;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::collections::HashMap;
-use std::io::{Read, Write, ErrorKind};
+use std::io::{Read, Write, ErrorKind, IoSliceMut};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
@@ -81,6 +82,18 @@ pub enum ConnState {
 /// Maximum buffer size (16KB stack buffer)
 pub const MAX_BUFFER_SIZE: usize = 16384;
 
+#[repr(C)]
+pub struct BodyRingDescriptor {
+    pub buffer_ptr: *mut u8,
+    pub capacity: usize,
+    pub _pad1: [u8; 64],
+    pub head: AtomicU64,
+    pub _pad2: [u8; 64],
+    pub tail: AtomicU64,
+    pub _pad3: [u8; 64],
+    pub is_closed: AtomicBool,
+}
+
 // ============================================================
 // State Machines
 // ============================================================
@@ -90,6 +103,7 @@ struct Connection {
     stream: TcpStream,
     #[allow(dead_code)]
     state: ConnState,
+    is_paused: bool,
     read_buf: [u8; MAX_BUFFER_SIZE],
     #[allow(dead_code)]
     write_buf: [u8; MAX_BUFFER_SIZE],
@@ -104,6 +118,7 @@ impl Connection {
         Self {
             stream,
             state: ConnState::Connecting,
+            is_paused: false,
             read_buf: [0u8; MAX_BUFFER_SIZE],
             write_buf: [0u8; MAX_BUFFER_SIZE],
             host,
@@ -120,6 +135,8 @@ pub struct NetEngine {
     connections: HashMap<usize, Connection>,
     next_conn_id: usize,
     tls_config: Arc<ClientConfig>,
+    body_rings: HashMap<u64, *mut BodyRingDescriptor>,
+    conn_body_rings: HashMap<usize, u64>,
 }
 
 impl NetEngine {
@@ -145,10 +162,33 @@ impl NetEngine {
             connections: HashMap::new(),
             next_conn_id: 1,
             tls_config: Arc::new(config),
+            body_rings: HashMap::new(),
+            conn_body_rings: HashMap::new(),
         })
     }
     
     fn poll(&mut self, timeout_ms: i32) -> i32 {
+        // 1. Check for paused connections that can be resumed (Low Watermark: 50%)
+        for (conn_id, &ring_id) in self.conn_body_rings.iter() {
+            if let Some(conn) = self.connections.get_mut(conn_id) {
+                if conn.is_paused {
+                    if let Some(&ring_ptr) = self.body_rings.get(&ring_id) {
+                        let ring = unsafe { &*ring_ptr };
+                        let available_read = (ring.head.load(Ordering::Acquire) - ring.tail.load(Ordering::Acquire)) as usize;
+                        if available_read < (ring.capacity * 50 / 100) {
+                            // Resume polling
+                            let _ = self.poll.registry().register(
+                                &mut conn.stream,
+                                Token(*conn_id),
+                                Interest::READABLE | Interest::WRITABLE
+                            );
+                            conn.is_paused = false;
+                        }
+                    }
+                }
+            }
+        }
+
         let timeout = if timeout_ms >= 0 {
             Some(std::time::Duration::from_millis(timeout_ms as u64))
         } else {
@@ -288,6 +328,47 @@ pub extern "C" fn net_read(
     
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     let conn_id = conn_handle as usize;
+
+    // 1. Check if we have a bound BodyRing for zero-copy Pull
+    if let Some(&ring_id) = engine.conn_body_rings.get(&conn_id) {
+        if let Some(&ring_ptr) = engine.body_rings.get(&ring_id) {
+            let ring = unsafe { &*ring_ptr };
+            let connection = engine.connections.get_mut(&conn_id).unwrap();
+
+            let head = ring.head.load(Ordering::Acquire);
+            let tail = ring.tail.load(Ordering::Acquire);
+            let head_idx = (head % ring.capacity as u64) as usize;
+            let tail_idx = (tail % ring.capacity as u64) as usize;
+
+            let mut bufs = [IoSliceMut::new(&mut []); 2];
+            let n_bufs = if head_idx >= tail_idx {
+                bufs[0] = IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ring.buffer_ptr.add(head_idx), ring.capacity - head_idx) });
+                bufs[1] = IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ring.buffer_ptr, tail_idx) });
+                2
+            } else {
+                bufs[0] = IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ring.buffer_ptr.add(head_idx), tail_idx - head_idx) });
+                1
+            };
+
+            match connection.stream.read_vectored(&mut bufs[..n_bufs]) {
+                Ok(0) => return NetError::NotConnected as i32,
+                Ok(n) => {
+                    ring.head.fetch_add(n as u64, Ordering::Release);
+                    unsafe { *bytes_read = n; }
+
+                    // Backpressure: 95% High Watermark
+                    let available_read = (ring.head.load(Ordering::Acquire) - ring.tail.load(Ordering::Acquire)) as usize;
+                    if available_read > (ring.capacity * 95 / 100) {
+                        let _ = engine.poll.registry().deregister(&mut connection.stream);
+                        connection.is_paused = true;
+                    }
+                    return NetError::None as i32;
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return NetError::WouldBlock as i32,
+                Err(_) => return NetError::IoError as i32,
+            }
+        }
+    }
     
     let connection = match engine.connections.get_mut(&conn_id) {
         Some(c) => c,
@@ -434,6 +515,45 @@ pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOp
 pub extern "C" fn net_http3_connect(_engine: NetEngineHandle, _host: *const c_char, _port: u16) -> ConnHandle {
     // Scaffolding implementation
     null_mut()
+}
+
+#[no_mangle]
+pub extern "C" fn net_body_ring_register(
+    engine_handle: NetEngineHandle,
+    id: u64,
+    ptr: *mut BodyRingDescriptor,
+) -> i32 {
+    if engine_handle.is_null() {
+        return NetError::InvalidHandle as i32;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    engine.body_rings.insert(id, ptr);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn net_body_ring_unregister(engine_handle: NetEngineHandle, id: u64) -> i32 {
+    if engine_handle.is_null() {
+        return NetError::InvalidHandle as i32;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    engine.body_rings.remove(&id);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn net_conn_bind_body_ring(
+    engine_handle: NetEngineHandle,
+    conn_handle: ConnectionHandle,
+    id: u64,
+) -> i32 {
+    if engine_handle.is_null() || conn_handle.is_null() {
+        return NetError::InvalidHandle as i32;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let conn_id = conn_handle as usize;
+    engine.conn_body_rings.insert(conn_id, id);
+    0
 }
 
 #[no_mangle]

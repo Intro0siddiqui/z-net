@@ -40,12 +40,12 @@ pub const FetchIntegration = struct {
         self.active_fetches.deinit();
     }
     
-    pub fn setPolicyManager(inout self: *FetchIntegration, policy_manager: *PolicyManager) void {
+    pub fn setPolicyManager(self: *FetchIntegration, policy_manager: *PolicyManager) void {
         self.policy_manager = policy_manager;
     }
     
     /// Execute a fetch request with event loop integration
-    pub fn executeFetch(inout self: *FetchIntegration, url: []const u8, method: []const u8, headers: StringHashMap([]const u8), body: ?[]const u8) !u64 {
+    pub fn executeFetch(self: *FetchIntegration, url: []const u8, method: []const u8, headers: StringHashMap([]const u8), body: ?[]const u8) !u64 {
         // Validate request with policy engine
         if (self.policy_manager) |policy_mgr| {
             const page_origin = try Origin.parse("https://browser-page.com"); // Would come from actual page
@@ -102,7 +102,7 @@ pub const FetchIntegration = struct {
     }
     
     /// Cancel a fetch request
-    pub fn cancelFetch(inout self: *FetchIntegration, fetch_id: u64) !void {
+    pub fn cancelFetch(self: *FetchIntegration, fetch_id: u64) !void {
         const handler = self.active_fetches.get(fetch_id) orelse return error.FetchNotFound;
         
         handler.emitAbort();
@@ -132,7 +132,7 @@ pub const FetchIntegration = struct {
     }
     
     /// Simulate fetch execution (would integrate with actual network layer)
-    fn simulateFetchExecution(inout self: *FetchIntegration, handler: *FetchEventHandler) !void {
+    fn simulateFetchExecution(self: *FetchIntegration, handler: *FetchEventHandler) !void {
         // This would integrate with the actual z-net pipeline/network stack
         // For now, simulate async execution
         
@@ -177,12 +177,12 @@ pub const WebSocketIntegration = struct {
         self.active_connections.deinit();
     }
     
-    pub fn setPolicyManager(inout self: *WebSocketIntegration, policy_manager: *PolicyManager) void {
+    pub fn setPolicyManager(self: *WebSocketIntegration, policy_manager: *PolicyManager) void {
         self.policy_manager = policy_manager;
     }
     
     /// Connect to WebSocket
-    pub fn connectWebSocket(inout self: *WebSocketIntegration, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
+    pub fn connectWebSocket(self: *WebSocketIntegration, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
         // Validate WebSocket URL with policy engine
         if (self.policy_manager) |policy_mgr| {
             const page_origin = try Origin.parse("https://browser-page.com"); // Would come from actual page
@@ -214,7 +214,7 @@ pub const WebSocketIntegration = struct {
     }
     
     /// Send WebSocket message
-    pub fn sendWebSocketMessage(inout self: *WebSocketIntegration, connection_id: u64, message: []const u8) !void {
+    pub fn sendWebSocketMessage(self: *WebSocketIntegration, connection_id: u64, message: []const u8) !void {
         const handler = self.active_connections.get(connection_id) orelse return error.ConnectionNotFound;
         
         if (!handler.is_open) {
@@ -226,7 +226,7 @@ pub const WebSocketIntegration = struct {
     }
     
     /// Close WebSocket connection
-    pub fn closeWebSocket(inout self: *WebSocketIntegration, connection_id: u64, code: u16, reason: []const u8) !void {
+    pub fn closeWebSocket(self: *WebSocketIntegration, connection_id: u64, code: u16, reason: []const u8) !void {
         const handler = self.active_connections.get(connection_id) orelse return error.ConnectionNotFound;
         
         handler.handleClose(code, reason);
@@ -256,7 +256,7 @@ pub const WebSocketIntegration = struct {
     }
     
     /// Simulate WebSocket connection
-    fn simulateWebSocketConnection(inout self: *WebSocketIntegration, handler: *WebSocketEventHandler) !void {
+    fn simulateWebSocketConnection(self: *WebSocketIntegration, handler: *WebSocketEventHandler) !void {
         var task = BackgroundTask.init(handler.connection_id, "ws-connect", "simulate");
         task.setCallback(&self.simulatedWebSocketCallback);
         task.setInterval(200, false); // Execute after 200ms
@@ -298,12 +298,12 @@ pub const XMLHttpRequestIntegration = struct {
         self.active_requests.deinit();
     }
     
-    pub fn setPolicyManager(inout self: *XMLHttpRequestIntegration, policy_manager: *PolicyManager) void {
+    pub fn setPolicyManager(self: *XMLHttpRequestIntegration, policy_manager: *PolicyManager) void {
         self.policy_manager = policy_manager;
     }
     
     /// Execute XMLHttpRequest
-    pub fn executeXMLHttpRequest(inout self: *XMLHttpRequestIntegration, url: []const u8, method: []const u8, async: bool) !u64 {
+    pub fn executeXMLHttpRequest(self: *XMLHttpRequestIntegration, url: []const u8, method: []const u8, async: bool) !u64 {
         // Validate request with policy engine
         if (self.policy_manager) |policy_mgr| {
             const page_origin = try Origin.parse("https://browser-page.com"); // Would come from actual page
@@ -338,19 +338,19 @@ pub const XMLHttpRequestIntegration = struct {
     }
     
     /// Set request headers
-    pub fn setRequestHeader(inout self: *XMLHttpRequestIntegration, request_id: u64, name: []const u8, value: []const u8) !void {
+    pub fn setRequestHeader(self: *XMLHttpRequestIntegration, request_id: u64, name: []const u8, value: []const u8) !void {
         const handler = self.active_requests.get(request_id) orelse return error.RequestNotFound;
         handler.addHeader(name, value);
     }
     
     /// Send request body
-    pub fn sendRequestBody(inout self: *XMLHttpRequestIntegration, request_id: u64, body: []const u8) !void {
+    pub fn sendRequestBody(self: *XMLHttpRequestIntegration, request_id: u64, body: []const u8) !void {
         const handler = self.active_requests.get(request_id) orelse return error.RequestNotFound;
         handler.setResponseData(body); // For simulation
     }
     
     /// Abort request
-    pub fn abortRequest(inout self: *XMLHttpRequestIntegration, request_id: u64) !void {
+    pub fn abortRequest(self: *XMLHttpRequestIntegration, request_id: u64) !void {
         const handler = self.active_requests.get(request_id) orelse return error.RequestNotFound;
         
         handler.emitAbort();
@@ -380,7 +380,7 @@ pub const XMLHttpRequestIntegration = struct {
     }
     
     /// Simulate XMLHttpRequest execution
-    fn simulateXMLHttpRequest(inout self: *XMLHttpRequestIntegration, handler: *XMLHttpRequestEventHandler) !void {
+    fn simulateXMLHttpRequest(self: *XMLHttpRequestIntegration, handler: *XMLHttpRequestEventHandler) !void {
         var task = BackgroundTask.init(handler.request_id, "xhr-execute", "simulate");
         task.setCallback(&self.simulatedXMLHttpRequestCallback);
         task.setInterval(150, false); // Execute after 150ms
@@ -417,7 +417,7 @@ pub const PromiseIntegration = struct {
     }
     
     /// Create a new promise
-    pub fn createPromise(inout self: *PromiseIntegration) u64 {
+    pub fn createPromise(self: *PromiseIntegration) u64 {
         const promise_id = self.promise_id_counter;
         self.promise_id_counter += 1;
         
@@ -428,14 +428,14 @@ pub const PromiseIntegration = struct {
     }
     
     /// Resolve a promise
-    pub fn resolvePromise(inout self: *PromiseIntegration, promise_id: u64, data: ?[]const u8) !void {
+    pub fn resolvePromise(self: *PromiseIntegration, promise_id: u64, data: ?[]const u8) !void {
         const resolver = self.pending_promises.get(promise_id) orelse return error.PromiseNotFound;
         resolver.resolve(data);
         _ = self.pending_promises.remove(promise_id);
     }
     
     /// Reject a promise
-    pub fn rejectPromise(inout self: *PromiseIntegration, promise_id: u64, error: []const u8) !void {
+    pub fn rejectPromise(self: *PromiseIntegration, promise_id: u64, error: []const u8) !void {
         const resolver = self.pending_promises.get(promise_id) orelse return error.PromiseNotFound;
         resolver.reject(error);
         _ = self.pending_promises.remove(promise_id);
@@ -467,7 +467,7 @@ pub const BackgroundSyncIntegration = struct {
     }
     
     /// Schedule background sync
-    pub fn scheduleSync(inout self: *BackgroundSyncIntegration, task_name: []const u8, data: []const u8, delay_ms: u64) !u64 {
+    pub fn scheduleSync(self: *BackgroundSyncIntegration, task_name: []const u8, data: []const u8, delay_ms: u64) !u64 {
         const sync_id = self.sync_id_counter;
         self.sync_id_counter += 1;
         
@@ -481,7 +481,7 @@ pub const BackgroundSyncIntegration = struct {
     }
     
     /// Cancel background sync
-    pub fn cancelSync(inout self: *BackgroundSyncIntegration, sync_id: u64) !void {
+    pub fn cancelSync(self: *BackgroundSyncIntegration, sync_id: u64) !void {
         self.event_loop.cancelBackgroundTask(sync_id);
         _ = self.sync_tasks.remove(sync_id);
     }

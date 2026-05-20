@@ -56,11 +56,11 @@ pub const StorageEvent = struct {
         _ = self;
     }
     
-    pub fn setOldValue(inout self: *StorageEvent, old_value: []const u8) void {
+    pub fn setOldValue(self: *StorageEvent, old_value: []const u8) void {
         self.old_value = old_value;
     }
     
-    pub fn setNewValue(inout self: *StorageEvent, new_value: []const u8) void {
+    pub fn setNewValue(self: *StorageEvent, new_value: []const u8) void {
         self.new_value = new_value;
     }
 };
@@ -177,11 +177,11 @@ pub const OriginQuotaInfo = struct {
         _ = self;
     }
     
-    pub fn canStore(inout self: *OriginQuotaInfo, size_bytes: u64) bool {
+    pub fn canStore(self: *OriginQuotaInfo, size_bytes: u64) bool {
         return self.quota.canStore(size_bytes);
     }
     
-    pub fn updateUsage(inout self: *OriginQuotaInfo, new_used: u64) void {
+    pub fn updateUsage(self: *OriginQuotaInfo, new_used: u64) void {
         self.quota.updateUsage(new_used);
     }
 };
@@ -225,7 +225,7 @@ pub const BrowserStorage = struct {
     }
     
     /// Get LocalStorage for specific origin
-    pub fn getLocalStorage(inout self: *BrowserStorage, origin: Origin) !*LocalStorageAPI {
+    pub fn getLocalStorage(self: *BrowserStorage, origin: Origin) !*LocalStorageAPI {
         const origin_key = try self.getOriginKey(origin);
         
         // Create or update origin storage context
@@ -238,27 +238,27 @@ pub const BrowserStorage = struct {
     }
     
     /// Get SessionStorage for specific origin
-    pub fn getSessionStorage(inout self: *BrowserStorage, origin: Origin) !*SessionStorageAPI {
+    pub fn getSessionStorage(self: *BrowserStorage, origin: Origin) !*SessionStorageAPI {
         return self.storage_manager.getSessionStorage(origin);
     }
     
     /// Get Cookie API (global)
-    pub fn getCookieAPI(inout self: *BrowserStorage) *CookieAPI {
+    pub fn getCookieAPI(self: *BrowserStorage) *CookieAPI {
         return self.storage_manager.getCookieAPI();
     }
     
     /// Get IndexedDB API (global)
-    pub fn getIndexedDBAPI(inout self: *BrowserStorage) *IndexedDBAPI {
+    pub fn getIndexedDBAPI(self: *BrowserStorage) *IndexedDBAPI {
         return self.storage_manager.getIndexedDBAPI();
     }
     
     /// Get Cache API for specific origin
-    pub fn getCacheAPI(inout self: *BrowserStorage, origin: Origin) !*CacheAPI {
+    pub fn getCacheAPI(self: *BrowserStorage, origin: Origin) !*CacheAPI {
         return self.storage_manager.getCacheAPI(origin);
     }
     
     /// Check storage availability for an origin
-    pub fn isStorageAvailable(inout self: *BrowserStorage, origin: Origin, storage_type: StorageType) !bool {
+    pub fn isStorageAvailable(self: *BrowserStorage, origin: Origin, storage_type: StorageType) !bool {
         const origin_key = try self.getOriginKey(origin);
         
         switch (storage_type) {
@@ -286,7 +286,7 @@ pub const BrowserStorage = struct {
     }
     
     /// Estimate storage usage for an origin
-    pub fn estimateStorageUsage(inout self: *BrowserStorage, origin: Origin) !StorageEstimate {
+    pub fn estimateStorageUsage(self: *BrowserStorage, origin: Origin) !StorageEstimate {
         const origin_key = try self.getOriginKey(origin);
         
         var total_bytes: u64 = 0;
@@ -348,17 +348,17 @@ pub const BrowserStorage = struct {
     }
     
     /// Add storage event listener
-    pub fn addEventListener(inout self: *BrowserStorage, handler_id: u64, callback: *const fn (StorageEvent) void) !void {
+    pub fn addEventListener(self: *BrowserStorage, handler_id: u64, callback: *const fn (StorageEvent) void) !void {
         try self.event_handlers.put(handler_id, callback);
     }
     
     /// Remove storage event listener
-    pub fn removeEventListener(inout self: *BrowserStorage, handler_id: u64) void {
+    pub fn removeEventListener(self: *BrowserStorage, handler_id: u64) void {
         _ = self.event_handlers.remove(handler_id);
     }
     
     /// Trigger storage event
-    fn triggerStorageEvent(inout self: *BrowserStorage, event: StorageEvent) void {
+    fn triggerStorageEvent(self: *BrowserStorage, event: StorageEvent) void {
         if (!self.config.enable_storage_events) return;
         
         var handler_iter = self.event_handlers.valueIterator();
@@ -368,7 +368,7 @@ pub const BrowserStorage = struct {
     }
     
     /// Clear storage for an origin
-    pub fn clearOrigin(inout self: *BrowserStorage, origin: Origin) !void {
+    pub fn clearOrigin(self: *BrowserStorage, origin: Origin) !void {
         // Trigger clear event
         var event = StorageEvent.init(self.allocator, .CLEAR, origin, .LOCAL_STORAGE, "");
         event.setNewValue(""); // Empty indicates clear all
@@ -379,13 +379,13 @@ pub const BrowserStorage = struct {
     }
     
     /// Get storage quota for an origin
-    pub fn getQuotaForOrigin(inout self: *BrowserStorage, origin: Origin, storage_type: StorageType) !QuotaStatus {
+    pub fn getQuotaForOrigin(self: *BrowserStorage, origin: Origin, storage_type: StorageType) !QuotaStatus {
         const origin_key = try self.getOriginKey(origin);
         return self.quota_manager.getQuotaStatus(storage_type, origin_key);
     }
     
     /// Request persistent storage for an origin
-    pub fn requestPersistentStorage(inout self: *BrowserStorage, origin: Origin, estimated_bytes: u64) !bool {
+    pub fn requestPersistentStorage(self: *BrowserStorage, origin: Origin, estimated_bytes: u64) !bool {
         // Simplified implementation - would check actual storage usage and quota
         _ = estimated_bytes;
         _ = origin;
@@ -393,13 +393,13 @@ pub const BrowserStorage = struct {
     }
     
     /// Check if origin has persistent storage
-    pub fn hasPersistentStorage(inout self: *BrowserStorage, origin: Origin) !bool {
+    pub fn hasPersistentStorage(self: *BrowserStorage, origin: Origin) !bool {
         _ = origin;
         return true; // Simplified - would check persistence grants
     }
     
     /// Cleanup expired and old data
-    pub fn cleanup(inout self: *BrowserStorage) void {
+    pub fn cleanup(self: *BrowserStorage) void {
         self.storage_manager.cleanupExpired();
         
         // Cleanup origin storage contexts
@@ -444,7 +444,7 @@ pub const BrowserStorage = struct {
     }
     
     /// Export all storage data for backup
-    pub fn exportAllStorage(inout self: *BrowserStorage, allocator: Allocator) !AllStorageExport {
+    pub fn exportAllStorage(self: *BrowserStorage, allocator: Allocator) !AllStorageExport {
         var export = AllStorageExport.init(allocator);
         
         // Export all origins
@@ -459,7 +459,7 @@ pub const BrowserStorage = struct {
     }
     
     /// Import storage data from backup
-    pub fn importAllStorage(inout self: *BrowserStorage, export: *AllStorageExport) !void {
+    pub fn importAllStorage(self: *BrowserStorage, export: *AllStorageExport) !void {
         for (export.origins.items) |origin_export| {
             const origin = try Origin.parse(origin_export.origin_key);
             try self.storage_manager.importOriginData(origin, &origin_export.export_data);
@@ -467,7 +467,7 @@ pub const BrowserStorage = struct {
     }
     
     // Private helper functions
-    fn getOriginKey(inout self: *BrowserStorage, origin: Origin) ![]const u8 {
+    fn getOriginKey(self: *BrowserStorage, origin: Origin) ![]const u8 {
         return std.fmt.allocPrint(self.allocator, "{}://{}:{}", .{
             origin.scheme,
             origin.host,
@@ -501,7 +501,7 @@ pub const OriginStorageContext = struct {
         self.origin_key = "";
     }
     
-    pub fn updateAccess(inout self: *OriginStorageContext) void {
+    pub fn updateAccess(self: *OriginStorageContext) void {
         self.last_accessed = getCurrentTimestamp();
         self.reference_count += 1;
     }
@@ -560,7 +560,7 @@ pub const QuotaSummary = struct {
         self.quotas.deinit();
     }
     
-    pub fn put(inout self: *QuotaSummary, key: []const u8, value: u64) !void {
+    pub fn put(self: *QuotaSummary, key: []const u8, value: u64) !void {
         try self.quotas.put(key, value);
     }
 };
@@ -613,7 +613,7 @@ pub fn createBrowserStorage(allocator: Allocator, event_loop: *EventLoopManager,
     return storage_ptr;
 }
 
-pub fn destroyBrowserStorage(inout storage: *BrowserStorage, allocator: Allocator) void {
+pub fn destroyBrowserStorage(storage: *BrowserStorage, allocator: Allocator) void {
     storage.deinit();
     allocator.destroy(storage);
 }

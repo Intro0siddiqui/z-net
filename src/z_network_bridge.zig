@@ -14,11 +14,16 @@ pub const NetEngineHandle = ?*anyopaque;
 pub const ConnectionHandle = ?*anyopaque;
 pub const FetchHandle = ?*anyopaque;
 pub const ConnHandle = ?*anyopaque;
+pub const BodyRingHandle = ?*anyopaque;
+
+pub const BodyRingDescriptor = @import("z_body_ring.zig").BodyRingDescriptor;
 
 /// Fetch options
 pub const FetchOptions = extern struct {
     method: [*:0]const u8,
     timeout: u32,
+    top_level_site: [*:0]const u8,
+    origin: [*:0]const u8,
 };
 
 /// Network metrics
@@ -119,6 +124,11 @@ extern fn net_http3_connect(engine: NetEngineHandle, host: [*:0]const u8, port: 
 /// Get metrics
 extern fn net_get_metrics(engine: NetEngineHandle) *const NetworkMetrics;
 
+/// BodyRing registration
+extern fn net_body_ring_register(engine: NetEngineHandle, id: u64, descriptor: *BodyRingDescriptor) i32;
+extern fn net_body_ring_unregister(engine: NetEngineHandle, id: u64) i32;
+extern fn net_conn_bind_body_ring(engine: NetEngineHandle, conn: ConnectionHandle, id: u64) i32;
+
 // ============================================================
 // High-Level Zig API
 // ============================================================
@@ -167,7 +177,7 @@ pub const NetworkEngine = struct {
     }
 
     /// Fetch URL
-    pub fn fetch(self: *Self, url: []const u8, method: []const u8) !FetchHandle {
+    pub fn fetch(self: *Self, url: []const u8, method: []const u8, top_level_site: []const u8, origin: []const u8) !FetchHandle {
         _ = self;
         var url_buf: [1024]u8 = undefined;
         if (url.len >= 1024) return error.UrlTooLong;
@@ -179,9 +189,21 @@ pub const NetworkEngine = struct {
         @memcpy(method_buf[0..method.len], method);
         method_buf[method.len] = 0;
 
+        var tls_buf: [256]u8 = undefined;
+        if (top_level_site.len >= 256) return error.HostTooLong;
+        @memcpy(tls_buf[0..top_level_site.len], top_level_site);
+        tls_buf[top_level_site.len] = 0;
+
+        var origin_buf: [256]u8 = undefined;
+        if (origin.len >= 256) return error.HostTooLong;
+        @memcpy(origin_buf[0..origin.len], origin);
+        origin_buf[origin.len] = 0;
+
         const opts = FetchOptions{
             .method = @ptrCast(&method_buf),
             .timeout = 30000,
+            .top_level_site = @ptrCast(&tls_buf),
+            .origin = @ptrCast(&origin_buf),
         };
 
         return net_fetch_create(@ptrCast(&url_buf), &opts);
@@ -203,6 +225,17 @@ pub const NetworkEngine = struct {
         if (@intFromPtr(metrics) == 0) return error.MetricsUnavailable;
         return metrics;
     }
+
+    /// Register BodyRing
+    pub fn registerBodyRing(self: *Self, id: u64, descriptor: *BodyRingDescriptor) !void {
+        const result = net_body_ring_register(self.handle, id, descriptor);
+        if (result != 0) return error.RegistrationFailed;
+    }
+
+    /// Unregister BodyRing
+    pub fn unregisterBodyRing(self: *Self, id: u64) void {
+        _ = net_body_ring_unregister(self.handle, id);
+    }
 };
 
 /// Connection wrapper
@@ -211,6 +244,18 @@ pub const Connection = struct {
     handle: ConnectionHandle,
 
     const Self = @This();
+
+    /// Bind BodyRing to connection
+    pub fn bindBodyRing(self: *Self, id: u64) !void {
+        const result = net_conn_bind_body_ring(self.engine, self.handle, id);
+        if (result != 0) return error.BindFailed;
+    }
+
+    pub fn getBodyRing(self: *Self) ?*BodyRingDescriptor {
+        // This would call into the engine to get the bound descriptor
+        // Mocking for now as the actual mapping lives in Rust or a shared manager
+        return null;
+    }
 
     /// Read data into provided buffer (zero-copy)
     pub fn read(self: *Self, buffer: []u8) !usize {

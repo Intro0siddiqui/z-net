@@ -63,7 +63,7 @@ pub const WebSocketExtension = struct {
         self.parameters.deinit();
     }
     
-    pub fn addParameter(inout self: *WebSocketExtension, key: []const u8, value: []const u8) void {
+    pub fn addParameter(self: *WebSocketExtension, key: []const u8, value: []const u8) void {
         self.parameters.put(key, value) catch {};
     }
     
@@ -96,12 +96,12 @@ pub const WebSocketFrame = struct {
         };
     }
     
-    pub fn setMasking(inout self: *WebSocketFrame, masked: bool, key: [4]u8) void {
+    pub fn setMasking(self: *WebSocketFrame, masked: bool, key: [4]u8) void {
         self.masked = masked;
         self.masking_key = key;
     }
     
-    pub fn encode(inout self: *WebSocketFrame, allocator: Allocator) ![]const u8 {
+    pub fn encode(self: *WebSocketFrame, allocator: Allocator) ![]const u8 {
         var frame_data = ArrayList(u8).init(allocator);
         
         // First byte: FIN + RSV + opcode
@@ -153,7 +153,7 @@ pub const WebSocketFrame = struct {
         return frame_data.toOwnedSlice();
     }
     
-    pub fn decode(inout self: *WebSocketFrame, data: []const u8, allocator: Allocator) !usize {
+    pub fn decode(self: *WebSocketFrame, data: []const u8, allocator: Allocator) !usize {
         if (data.len < 2) return error.InsufficientData;
         
         // Parse first byte
@@ -240,7 +240,7 @@ pub const WebSocketMessage = struct {
         self.complete_data.deinit();
     }
     
-    pub fn appendFrame(inout self: *WebSocketMessage, frame: *WebSocketFrame) !void {
+    pub fn appendFrame(self: *WebSocketMessage, frame: *WebSocketFrame) !void {
         self.frame_count += 1;
         
         // For continuation frames, append to existing data
@@ -261,7 +261,7 @@ pub const WebSocketMessage = struct {
         return self.complete_data.items;
     }
     
-    pub fn clear(inout self: *WebSocketMessage) void {
+    pub fn clear(self: *WebSocketMessage) void {
         self.complete_data.clearRetainingCapacity();
         self.is_complete = false;
         self.frame_count = 0;
@@ -301,15 +301,15 @@ pub const WebSocketNegotiation = struct {
         self.negotiated_extensions.deinit();
     }
     
-    pub fn addClientExtension(inout self: *WebSocketNegotiation, extension: WebSocketExtension) void {
+    pub fn addClientExtension(self: *WebSocketNegotiation, extension: WebSocketExtension) void {
         self.client_extensions.append(extension) catch {};
     }
     
-    pub fn addServerExtension(inout self: *WebSocketNegotiation, extension: WebSocketExtension) void {
+    pub fn addServerExtension(self: *WebSocketNegotiation, extension: WebSocketExtension) void {
         self.server_extensions.append(extension) catch {};
     }
     
-    pub fn negotiate(inout self: *WebSocketNegotiation) !void {
+    pub fn negotiate(self: *WebSocketNegotiation) !void {
         // Simple negotiation: match by name
         for (self.client_extensions.items) |client_ext| {
             for (self.server_extensions.items) |server_ext| {
@@ -401,31 +401,31 @@ pub const WebSocketConnection = struct {
         self.ping_queue.deinit();
     }
     
-    pub fn addProtocol(inout self: *WebSocketConnection, protocol: []const u8) void {
+    pub fn addProtocol(self: *WebSocketConnection, protocol: []const u8) void {
         self.protocols.append(protocol) catch {};
     }
     
-    pub fn setBinaryMode(inout self: *WebSocketConnection, binary: bool) void {
+    pub fn setBinaryMode(self: *WebSocketConnection, binary: bool) void {
         self.binary_mode = binary;
     }
     
-    pub fn setMaxMessageSize(inout self: *WebSocketConnection, max_size: u64) void {
+    pub fn setMaxMessageSize(self: *WebSocketConnection, max_size: u64) void {
         self.max_message_size = max_size;
     }
     
-    pub fn enableCompression(inout self: *WebSocketConnection, enabled: bool) void {
+    pub fn enableCompression(self: *WebSocketConnection, enabled: bool) void {
         self.compression_enabled = enabled;
     }
     
-    pub fn updateActivity(inout self: *WebSocketConnection) void {
+    pub fn updateActivity(self: *WebSocketConnection) void {
         self.last_activity_timestamp = getCurrentTimestamp();
     }
     
-    pub fn isActive(inout self: *WebSocketConnection, timeout_seconds: u64) bool {
+    pub fn isActive(self: *WebSocketConnection, timeout_seconds: u64) bool {
         return (getCurrentTimestamp() - self.last_activity_timestamp) < timeout_seconds;
     }
     
-    pub fn sendText(inout self: *WebSocketConnection, text: []const u8, allocator: Allocator) !void {
+    pub fn sendText(self: *WebSocketConnection, text: []const u8, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
         const frame = WebSocketFrame.init(allocator, .TEXT, text);
@@ -443,7 +443,7 @@ pub const WebSocketConnection = struct {
         _ = frame_data; // Placeholder for actual send
     }
     
-    pub fn sendBinary(inout self: *WebSocketConnection, binary_data: []const u8, allocator: Allocator) !void {
+    pub fn sendBinary(self: *WebSocketConnection, binary_data: []const u8, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
         const frame = WebSocketFrame.init(allocator, .BINARY, binary_data);
@@ -461,7 +461,7 @@ pub const WebSocketConnection = struct {
         _ = frame_data; // Placeholder for actual send
     }
     
-    pub fn sendPing(inout self: *WebSocketConnection, allocator: Allocator) !void {
+    pub fn sendPing(self: *WebSocketConnection, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
         const ping_data = std.fmt.allocPrint(allocator, "ping-{}", .{self.connection_id}) catch "";
@@ -483,7 +483,7 @@ pub const WebSocketConnection = struct {
         _ = frame_data; // Placeholder for actual send
     }
     
-    pub fn sendPong(inout self: *WebSocketConnection, ping_data: []const u8, allocator: Allocator) !void {
+    pub fn sendPong(self: *WebSocketConnection, ping_data: []const u8, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
         const frame = WebSocketFrame.init(allocator, .PONG, ping_data);
@@ -499,7 +499,7 @@ pub const WebSocketConnection = struct {
         _ = frame_data; // Placeholder for actual send
     }
     
-    pub fn sendClose(inout self: *WebSocketConnection, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
+    pub fn sendClose(self: *WebSocketConnection, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
         const reason_with_code = std.fmt.allocPrint(allocator, "{}{}", .{
             std.mem.toBytes(@as(u16, @intFromEnum(code))),
             reason,
@@ -521,7 +521,7 @@ pub const WebSocketConnection = struct {
         _ = frame_data; // Placeholder for actual send
     }
     
-    pub fn processFrame(inout self: *WebSocketConnection, frame_data: []const u8, allocator: Allocator) !void {
+    pub fn processFrame(self: *WebSocketConnection, frame_data: []const u8, allocator: Allocator) !void {
         var frame = WebSocketFrame.init(allocator, .TEXT, "");
         defer frame.deinit();
         
@@ -558,7 +558,7 @@ pub const WebSocketConnection = struct {
         _ = bytes_consumed; // Would be used to track buffer consumption
     }
     
-    fn processDataFrame(inout self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
+    fn processDataFrame(self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
         if (frame.payload.len > self.max_message_size) {
             return error.MessageTooLarge;
         }
@@ -577,7 +577,7 @@ pub const WebSocketConnection = struct {
         }
     }
     
-    fn processContinuationFrame(inout self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
+    fn processContinuationFrame(self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
         if (self.current_message == null) {
             return error.UnexpectedContinuation;
         }
@@ -590,12 +590,12 @@ pub const WebSocketConnection = struct {
         }
     }
     
-    fn processPingFrame(inout self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
+    fn processPingFrame(self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
         // Send corresponding pong
         try self.sendPong(frame.payload, allocator);
     }
     
-    fn processPongFrame(inout self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
+    fn processPongFrame(self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
         _ = frame;
         _ = allocator;
         
@@ -605,14 +605,14 @@ pub const WebSocketConnection = struct {
         }
     }
     
-    fn processCloseFrame(inout self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
+    fn processCloseFrame(self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
         _ = frame;
         _ = allocator;
         
         self.state = .CLOSING;
     }
     
-    pub fn getNextMessage(inout self: *WebSocketConnection) ?WebSocketMessage {
+    pub fn getNextMessage(self: *WebSocketConnection) ?WebSocketMessage {
         if (self.message_queue.items.len == 0) return null;
         
         const message = self.message_queue.orderedRemove(0);
@@ -657,7 +657,7 @@ pub const WebSocketPool = struct {
         self.url_to_connection.deinit();
     }
     
-    pub fn createConnection(inout self: *WebSocketPool, url: []const u8, protocols: ?ArrayList([]const u8)) !*WebSocketConnection {
+    pub fn createConnection(self: *WebSocketPool, url: []const u8, protocols: ?ArrayList([]const u8)) !*WebSocketConnection {
         // Check if connection already exists for this URL
         if (self.url_to_connection.get(url)) |existing_id| {
             if (self.connections.get(existing_id)) |existing| {
@@ -691,7 +691,7 @@ pub const WebSocketPool = struct {
         return null;
     }
     
-    pub fn removeConnection(inout self: *WebSocketPool, connection_id: u64) void {
+    pub fn removeConnection(self: *WebSocketPool, connection_id: u64) void {
         if (self.connections.get(connection_id)) |connection| {
             _ = self.url_to_connection.remove(connection.url);
             connection.deinit();
@@ -699,14 +699,14 @@ pub const WebSocketPool = struct {
         _ = self.connections.remove(connection_id);
     }
     
-    pub fn closeConnection(inout self: *WebSocketPool, connection_id: u64, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
+    pub fn closeConnection(self: *WebSocketPool, connection_id: u64, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
         if (self.connections.get(connection_id)) |connection| {
             try connection.sendClose(code, reason, allocator);
             connection.state = .CLOSING;
         }
     }
     
-    pub fn cleanupInactive(inout self: *WebSocketPool) void {
+    pub fn cleanupInactive(self: *WebSocketPool) void {
         var to_remove = ArrayList(u64).init(self.allocator);
         defer to_remove.deinit();
         

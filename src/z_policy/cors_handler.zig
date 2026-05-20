@@ -70,15 +70,15 @@ pub const CORSOptions = struct {
         self.expose_headers.deinit();
     }
     
-    pub fn addMethod(inout self: CORSOptions, method: CORSMethod) void {
+    pub fn addMethod(self: CORSOptions, method: CORSMethod) void {
         self.methods.append(method) catch {};
     }
     
-    pub fn addHeader(inout self: CORSOptions, header: []const u8) void {
+    pub fn addHeader(self: CORSOptions, header: []const u8) void {
         self.headers.append(header) catch {};
     }
     
-    pub fn addExposeHeader(inout self: CORSOptions, header: []const u8) void {
+    pub fn addExposeHeader(self: CORSOptions, header: []const u8) void {
         self.expose_headers.append(header) catch {};
     }
 };
