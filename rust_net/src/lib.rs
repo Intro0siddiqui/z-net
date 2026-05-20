@@ -333,14 +333,20 @@ pub extern "C" fn net_read(
     if let Some(&ring_id) = engine.conn_body_rings.get(&conn_id) {
         if let Some(&ring_ptr) = engine.body_rings.get(&ring_id) {
             let ring = unsafe { &*ring_ptr };
-            let connection = engine.connections.get_mut(&conn_id).unwrap();
+            let connection = match engine.connections.get_mut(&conn_id) {
+                Some(c) => c,
+                None => return NetError::NotConnected as i32,
+            };
 
             let head = ring.head.load(Ordering::Acquire);
             let tail = ring.tail.load(Ordering::Acquire);
+            if head - tail >= ring.capacity as u64 {
+                return NetError::WouldBlock as i32;
+            }
             let head_idx = (head % ring.capacity as u64) as usize;
             let tail_idx = (tail % ring.capacity as u64) as usize;
 
-            let mut bufs = [IoSliceMut::new(&mut []); 2];
+            let mut bufs = [IoSliceMut::new(&mut []), IoSliceMut::new(&mut [])];
             let n_bufs = if head_idx >= tail_idx {
                 bufs[0] = IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ring.buffer_ptr.add(head_idx), ring.capacity - head_idx) });
                 bufs[1] = IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ring.buffer_ptr, tail_idx) });
@@ -354,7 +360,11 @@ pub extern "C" fn net_read(
                 Ok(0) => return NetError::NotConnected as i32,
                 Ok(n) => {
                     ring.head.fetch_add(n as u64, Ordering::Release);
-                    unsafe { *bytes_read = n; }
+                    unsafe {
+                        if !bytes_read.is_null() {
+                            *bytes_read = n;
+                        }
+                    }
 
                     // Backpressure: 95% High Watermark
                     let available_read = (ring.head.load(Ordering::Acquire) - ring.tail.load(Ordering::Acquire)) as usize;
@@ -399,7 +409,11 @@ pub extern "C" fn net_read(
         // 2. Read plaintext from TLS
         match tlsconn.reader().read(dst) {
             Ok(n) => {
-                unsafe { *bytes_read = n; }
+                unsafe {
+                    if !bytes_read.is_null() {
+                        *bytes_read = n;
+                    }
+                }
                 return NetError::None as i32;
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -412,7 +426,11 @@ pub extern "C" fn net_read(
     // Non-TLS path
     match connection.stream.read(dst) {
         Ok(n) => {
-            unsafe { *bytes_read = n; }
+            unsafe {
+                if !bytes_read.is_null() {
+                    *bytes_read = n;
+                }
+            }
             NetError::None as i32
         }
         Err(ref e) if e.kind() == ErrorKind::WouldBlock => NetError::WouldBlock as i32,
@@ -459,14 +477,22 @@ pub extern "C" fn net_write(
             }
         }
         
-        unsafe { *bytes_written = n; }
+        unsafe {
+            if !bytes_written.is_null() {
+                *bytes_written = n;
+            }
+        }
         return NetError::None as i32;
     }
     
     // Non-TLS path
     match connection.stream.write(src) {
         Ok(n) => {
-            unsafe { *bytes_written = n; }
+            unsafe {
+                if !bytes_written.is_null() {
+                    *bytes_written = n;
+                }
+            }
             NetError::None as i32
         }
         Err(ref e) if e.kind() == ErrorKind::WouldBlock => NetError::WouldBlock as i32,

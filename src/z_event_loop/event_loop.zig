@@ -67,15 +67,15 @@ pub const WebAPIEvent = struct {
         self.metadata.deinit();
     }
     
-    pub fn setData(self: WebAPIEvent, data: []const u8) void {
+    pub fn setData(self: *WebAPIEvent, data: []const u8) void {
         self.data = data;
     }
     
-    pub fn setPriority(self: WebAPIEvent, priority: EventPriority) void {
+    pub fn setPriority(self: *WebAPIEvent, priority: EventPriority) void {
         self.priority = priority;
     }
     
-    pub fn addMetadata(self: WebAPIEvent, key: []const u8, value: []const u8) void {
+    pub fn addMetadata(self: *WebAPIEvent, key: []const u8, value: []const u8) void {
         self.metadata.put(key, value) catch {};
     }
 };

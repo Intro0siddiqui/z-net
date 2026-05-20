@@ -318,6 +318,7 @@ pub const HttpCache = struct {
 
         // Check vary headers
         const vary_key = self.buildVaryKey(url, request_headers);
+        defer if (vary_key.ptr != url.ptr) self.cache.allocator.free(vary_key);
         if (self.vary_cache.get(vary_key)) |key| {
             cache_key = key;
         }
