@@ -285,10 +285,12 @@ pub extern "C" fn net_connect(
     
     let mut conn = Connection::new(stream, host_str, port);
     
-    // Initialize TLS
-    if let Ok(server_name) = rustls::pki_types::ServerName::try_from(conn.host.as_str()) {
-        if let Ok(tls) = ClientConnection::new(engine.tls_config.clone(), server_name.to_owned()) {
-            conn.tlsconn = Some(tls);
+    // Initialize TLS only if port is 443
+    if port == 443 {
+        if let Ok(server_name) = rustls::pki_types::ServerName::try_from(conn.host.as_str()) {
+            if let Ok(tls) = ClientConnection::new(engine.tls_config.clone(), server_name.to_owned()) {
+                conn.tlsconn = Some(tls);
+            }
         }
     }
     
