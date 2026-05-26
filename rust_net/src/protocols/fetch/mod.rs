@@ -19,7 +19,9 @@ impl SmartMiddleware {
 
     /// Handles file:// URLs by reading from the local filesystem
     pub fn handle_file_url(&self, url: &Url) -> Result<Vec<u8>, std::io::Error> {
-        let path = url.path();
+        let path = url.to_file_path().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid file URL path")
+        })?;
         let mut file = File::open(path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
