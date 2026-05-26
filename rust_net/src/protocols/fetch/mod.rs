@@ -31,17 +31,18 @@ impl SmartMiddleware {
     /// Decompresses content based on the encoding type
     pub fn decompress(&self, data: &[u8], encoding: &str) -> Result<Vec<u8>, std::io::Error> {
         let mut decompressed = Vec::new();
+        // Limit decompressed size to 10MB to prevent zip bomb OOM crashes
+        let max_size = 10 * 1024 * 1024;
         match encoding {
             "gzip" => {
-                let mut decoder = GzDecoder::new(data);
+                let mut decoder = GzDecoder::new(data).take(max_size);
                 decoder.read_to_end(&mut decompressed)?;
             }
             "br" | "brotli" => {
-                let mut decoder = Decompressor::new(data, 4096); // 4KB buffer
+                let mut decoder = Decompressor::new(data, 4096).take(max_size);
                 decoder.read_to_end(&mut decompressed)?;
             }
             _ => {
-                // If unknown or none, return data as is
                 decompressed.extend_from_slice(data);
             }
         }
