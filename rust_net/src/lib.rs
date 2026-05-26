@@ -534,9 +534,52 @@ pub extern "C" fn net_conn_state(
 // ============================================================
 
 #[no_mangle]
-pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOptions) -> FetchHandle {
-    // Scaffolding implementation
-    null_mut()
+pub extern "C" fn net_fetch_create(url: *const c_char, _options: *const FetchOptions) -> FetchHandle {
+    if url.is_null() {
+        return null_mut();
+    }
+
+    // SAFETY: We expect the caller to provide a valid, aligned, null-terminated string for `url`.
+    // We enforce a max length check before parsing to prevent excessively long inputs.
+    let url_str = unsafe {
+        let c_str = std::ffi::CStr::from_ptr(url);
+        let bytes = c_str.to_bytes();
+        if bytes.len() > 8192 {
+            log::error!("URL length exceeds maximum allowed length of 8192 bytes");
+            return null_mut();
+        }
+        c_str.to_string_lossy()
+    };
+
+    let mut timeout = 30000; // Default timeout
+    if !_options.is_null() {
+        let opts = unsafe { &*_options };
+        timeout = opts.timeout;
+        // Note: other fields (method, top_level_site, origin) are intentionally ignored
+        // in this current scaffolding phase. They will be passed down and utilized
+        // once the full networking stack integration is complete.
+    }
+
+    match url::Url::parse(&url_str) {
+        Ok(parsed_url) => {
+            let mut engine = Box::new(protocols::fetch::FetchEngine::new(timeout));
+            engine.fetch(parsed_url);
+            return Box::into_raw(engine) as FetchHandle;
+        }
+        Err(e) => {
+            log::error!("Failed to parse URL '{}': {}", url_str, e);
+            return null_mut();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_fetch_destroy(handle: FetchHandle) {
+    if !handle.is_null() {
+        unsafe {
+            let _ = Box::from_raw(handle as *mut protocols::fetch::FetchEngine);
+        }
+    }
 }
 
 #[no_mangle]
