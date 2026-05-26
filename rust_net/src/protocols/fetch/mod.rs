@@ -139,7 +139,7 @@ impl FetchEngine {
             };
 
             // 3. Automatic Redirection
-            if let Some(new_url) = self.middleware.handle_redirect(status_code, location_header, &mut redirect_count) {
+            if let Some(new_url) = self.middleware.handle_redirect(status_code, location_header, &mut redirect_count, &url) {
                 url = new_url;
                 continue;
             }
