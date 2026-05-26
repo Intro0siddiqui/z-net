@@ -49,11 +49,11 @@ impl SmartMiddleware {
     }
 
     /// Handles automatic redirection logic
-    pub fn handle_redirect(&self, status_code: u16, location: Option<&str>, redirect_count: &mut u32) -> Option<Url> {
+    pub fn handle_redirect(&self, status_code: u16, location: Option<&str>, redirect_count: &mut u32, base_url: &Url) -> Option<Url> {
         if (300..400).contains(&status_code) {
             if *redirect_count < self.max_redirects {
                 if let Some(loc) = location {
-                    if let Ok(new_url) = Url::parse(loc) {
+                    if let Ok(new_url) = base_url.join(loc) {
                         *redirect_count += 1;
                         return Some(new_url);
                     }
