@@ -1,0 +1,21 @@
+--- rust_net/src/protocols/fetch/mod.rs
++++ rust_net/src/protocols/fetch/mod.rs
+@@ -127,14 +127,13 @@
+             let content_encoding = "gzip";
+             let location_header: Option<&str> = None;
+             // Simulated gzip response body for testing
+-            let mut raw_body = Vec::new();
+-            if content_encoding == "gzip" {
++            let raw_body = if content_encoding == "gzip" {
+                 use std::io::Write;
+                 let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                 encoder.write_all(b"Hello from simulated network response").unwrap();
+-                raw_body = encoder.finish().unwrap();
++                encoder.finish().unwrap()
+             } else {
+-                raw_body = b"Hello from simulated network response".to_vec();
+-            }
++                b"Hello from simulated network response".to_vec()
++            };
+
+             // 3. Automatic Redirection

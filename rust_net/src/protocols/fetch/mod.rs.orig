@@ -127,14 +127,15 @@ impl FetchEngine {
             let content_encoding = "gzip";
             let location_header: Option<&str> = None;
             // Simulated gzip response body for testing
-            let raw_body = if content_encoding == "gzip" {
+            let mut raw_body = Vec::new();
+            if content_encoding == "gzip" {
                 use std::io::Write;
                 let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
                 encoder.write_all(b"Hello from simulated network response").unwrap();
-                encoder.finish().unwrap()
+                raw_body = encoder.finish().unwrap();
             } else {
-                b"Hello from simulated network response".to_vec()
-            };
+                raw_body = b"Hello from simulated network response".to_vec();
+            }
 
             // 3. Automatic Redirection
             if let Some(new_url) = self.middleware.handle_redirect(status_code, location_header, &mut redirect_count) {
@@ -204,7 +205,7 @@ mod tests {
         assert!(no_url.is_none());
         assert_eq!(redirect_count, 5);
     }
-    
+
     #[test]
     fn test_fetch_engine_mock_network() {
         let mut engine = FetchEngine::new();

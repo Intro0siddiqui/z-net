@@ -1,0 +1,11 @@
+--- rust_net/src/lib.rs
++++ rust_net/src/lib.rs
+@@ -540,7 +540,7 @@
+     }
+     let url_str = unsafe { std::ffi::CStr::from_ptr(url).to_string_lossy() };
+     if let Ok(parsed_url) = url::Url::parse(&url_str) {
+-        let engine = Box::new(protocols::fetch::FetchEngine::new());
++        let mut engine = Box::new(protocols::fetch::FetchEngine::new());
+         engine.fetch(parsed_url);
+         return Box::into_raw(engine) as FetchHandle;
+     }

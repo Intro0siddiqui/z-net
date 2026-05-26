@@ -534,8 +534,16 @@ pub extern "C" fn net_conn_state(
 // ============================================================
 
 #[no_mangle]
-pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOptions) -> FetchHandle {
-    // Scaffolding implementation
+pub extern "C" fn net_fetch_create(url: *const c_char, _options: *const FetchOptions) -> FetchHandle {
+    if url.is_null() {
+        return null_mut();
+    }
+    let url_str = unsafe { std::ffi::CStr::from_ptr(url).to_string_lossy() };
+    if let Ok(parsed_url) = url::Url::parse(&url_str) {
+        let mut engine = Box::new(protocols::fetch::FetchEngine::new());
+        engine.fetch(parsed_url);
+        return Box::into_raw(engine) as FetchHandle;
+    }
     null_mut()
 }
 
