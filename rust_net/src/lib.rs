@@ -54,6 +54,10 @@ pub struct FetchOptions {
     pub timeout: u32,
 }
 
+/// nsresult constants (match WPE/XPCOM)
+const NS_OK: i32 = 0;
+const NS_ERROR_FAILURE: i32 = -2147467259i32;
+
 /// Error codes
 #[repr(i32)]
 #[derive(Debug, Clone, Copy)]
@@ -302,16 +306,16 @@ pub extern "C" fn net_connect(
 #[no_mangle]
 pub extern "C" fn net_close(engine_handle: NetEngineHandle, conn_handle: ConnectionHandle) -> i32 {
     if engine_handle.is_null() || conn_handle.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     let conn_id = conn_handle as usize;
     
     if engine.connections.remove(&conn_id).is_some() {
-        NetError::None as i32
+        NS_OK
     } else {
-        NetError::InvalidHandle as i32
+        NS_ERROR_FAILURE
     }
 }
 
@@ -325,7 +329,7 @@ pub extern "C" fn net_read(
     bytes_read: *mut usize,
 ) -> i32 {
     if engine_handle.is_null() || conn_handle.is_null() || buffer.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
@@ -337,13 +341,13 @@ pub extern "C" fn net_read(
             let ring = unsafe { &*ring_ptr };
             let connection = match engine.connections.get_mut(&conn_id) {
                 Some(c) => c,
-                None => return NetError::NotConnected as i32,
+                None => return NS_ERROR_FAILURE,
             };
 
             let head = ring.head.load(Ordering::Acquire);
             let tail = ring.tail.load(Ordering::Acquire);
             if head.wrapping_sub(tail) >= ring.capacity as u64 {
-                return NetError::WouldBlock as i32;
+                return NS_ERROR_FAILURE;
             }
             let head_idx = (head % ring.capacity as u64) as usize;
             let tail_idx = (tail % ring.capacity as u64) as usize;
@@ -359,7 +363,7 @@ pub extern "C" fn net_read(
             };
 
             match connection.stream.read_vectored(&mut bufs[..n_bufs]) {
-                Ok(0) => return NetError::NotConnected as i32,
+                Ok(0) => return NS_ERROR_FAILURE,
                 Ok(n) => {
                     ring.head.fetch_add(n as u64, Ordering::Release);
                     unsafe {
@@ -374,17 +378,17 @@ pub extern "C" fn net_read(
                         let _ = engine.poll.registry().deregister(&mut connection.stream);
                         connection.is_paused = true;
                     }
-                    return NetError::None as i32;
+                    return NS_OK;
                 }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return NetError::WouldBlock as i32,
-                Err(_) => return NetError::IoError as i32,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return NS_ERROR_FAILURE,
+                Err(_) => return NS_ERROR_FAILURE,
             }
         }
     }
     
     let connection = match engine.connections.get_mut(&conn_id) {
         Some(c) => c,
-        None => return NetError::NotConnected as i32,
+        None => return NS_ERROR_FAILURE,
     };
     
     let dst = unsafe { from_raw_parts_mut(buffer, buffer_len) };
@@ -392,20 +396,20 @@ pub extern "C" fn net_read(
     if let Some(ref mut tlsconn) = connection.tlsconn {
         // 1. Try to read from socket and feed to TLS
         match connection.stream.read(&mut connection.read_buf) {
-            Ok(0) => return NetError::NotConnected as i32,
+            Ok(0) => return NS_ERROR_FAILURE,
             Ok(n) => {
                 let mut cursor = std::io::Cursor::new(&connection.read_buf[..n]);
                 if tlsconn.read_tls(&mut cursor).is_err() {
-                    return NetError::TlsError as i32;
+                    return NS_ERROR_FAILURE;
                 }
                 if tlsconn.process_new_packets().is_err() {
-                    return NetError::TlsError as i32;
+                    return NS_ERROR_FAILURE;
                 }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 // No new data, check if we have pending plaintext
             }
-            Err(_) => return NetError::IoError as i32,
+            Err(_) => return NS_ERROR_FAILURE,
         }
         
         // 2. Read plaintext from TLS
@@ -416,12 +420,12 @@ pub extern "C" fn net_read(
                         *bytes_read = n;
                     }
                 }
-                return NetError::None as i32;
+                return NS_OK;
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                return NetError::WouldBlock as i32;
+                return NS_ERROR_FAILURE;
             }
-            Err(_) => return NetError::TlsError as i32,
+            Err(_) => return NS_ERROR_FAILURE,
         }
     }
     
@@ -433,10 +437,10 @@ pub extern "C" fn net_read(
                     *bytes_read = n;
                 }
             }
-            NetError::None as i32
+            NS_OK
         }
-        Err(ref e) if e.kind() == ErrorKind::WouldBlock => NetError::WouldBlock as i32,
-        Err(_) => NetError::IoError as i32,
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => NS_ERROR_FAILURE,
+        Err(_) => NS_ERROR_FAILURE,
     }
 }
 
@@ -450,7 +454,7 @@ pub extern "C" fn net_write(
     bytes_written: *mut usize,
 ) -> i32 {
     if engine_handle.is_null() || conn_handle.is_null() || data.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
@@ -458,7 +462,7 @@ pub extern "C" fn net_write(
     
     let connection = match engine.connections.get_mut(&conn_id) {
         Some(c) => c,
-        None => return NetError::NotConnected as i32,
+        None => return NS_ERROR_FAILURE,
     };
     
     let src = unsafe { from_raw_parts(data, data_len) };
@@ -467,7 +471,7 @@ pub extern "C" fn net_write(
         // 1. Write plaintext to TLS
         let n = match tlsconn.writer().write(src) {
             Ok(n) => n,
-            Err(_) => return NetError::TlsError as i32,
+            Err(_) => return NS_ERROR_FAILURE,
         };
         
         // 2. Flush ciphertext to socket
@@ -475,7 +479,7 @@ pub extern "C" fn net_write(
             match tlsconn.write_tls(&mut connection.stream) {
                 Ok(_) => {},
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => return NetError::IoError as i32,
+                Err(_) => return NS_ERROR_FAILURE,
             }
         }
         
@@ -484,7 +488,7 @@ pub extern "C" fn net_write(
                 *bytes_written = n;
             }
         }
-        return NetError::None as i32;
+        return NS_OK;
     }
     
     // Non-TLS path
@@ -495,10 +499,10 @@ pub extern "C" fn net_write(
                     *bytes_written = n;
                 }
             }
-            NetError::None as i32
+            NS_OK
         }
-        Err(ref e) if e.kind() == ErrorKind::WouldBlock => NetError::WouldBlock as i32,
-        Err(_) => NetError::IoError as i32,
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => NS_ERROR_FAILURE,
+        Err(_) => NS_ERROR_FAILURE,
     }
 }
 
@@ -509,7 +513,7 @@ pub extern "C" fn net_poll(
     timeout_ms: i32,
 ) -> i32 {
     if engine_handle.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
@@ -552,7 +556,7 @@ pub extern "C" fn net_body_ring_register(
     ptr: *mut BodyRingDescriptor,
 ) -> i32 {
     if engine_handle.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     engine.body_rings.insert(id, ptr);
@@ -562,7 +566,7 @@ pub extern "C" fn net_body_ring_register(
 #[no_mangle]
 pub extern "C" fn net_body_ring_unregister(engine_handle: NetEngineHandle, id: u64) -> i32 {
     if engine_handle.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     engine.body_rings.remove(&id);
@@ -576,7 +580,7 @@ pub extern "C" fn net_conn_bind_body_ring(
     id: u64,
 ) -> i32 {
     if engine_handle.is_null() || conn_handle.is_null() {
-        return NetError::InvalidHandle as i32;
+        return NS_ERROR_FAILURE;
     }
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     let conn_id = conn_handle as usize;
