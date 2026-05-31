@@ -252,6 +252,7 @@ pub const Connection = struct {
     }
 
     pub fn getBodyRing(self: *Self) ?*BodyRingDescriptor {
+        _ = self;
         // This would call into the engine to get the bound descriptor
         // Mocking for now as the actual mapping lives in Rust or a shared manager
         return null;
