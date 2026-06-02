@@ -20,12 +20,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    z_socket.linkSystemLibrary("z", .{});
+    z_socket.linkSystemLibrary("brotlidec", .{});
+    z_socket.linkSystemLibrary("brotlicommon", .{});
+    z_socket.linkSystemLibrary("zstd", .{});
 
     const z_network_bridge = b.addModule("z_network_bridge", .{
         .root_source_file = b.path("src/z_network_bridge.zig"),
         .target = target,
         .optimize = optimize,
     });
+    z_network_bridge.linkSystemLibrary("z", .{});
+    z_network_bridge.linkSystemLibrary("brotlidec", .{});
+    z_network_bridge.linkSystemLibrary("brotlicommon", .{});
+    z_network_bridge.linkSystemLibrary("zstd", .{});
 
     const z_config = b.addModule("z_config", .{
         .root_source_file = b.path("src/z_config/validator.zig"),
@@ -60,11 +68,9 @@ pub fn build(b: *std.Build) void {
     // Monitor Executable
     const monitor_exe = b.addExecutable(.{
         .name = "znet-monitor",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/z_monitoring/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_source_file = b.path("src/z_monitoring/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
     monitor_exe.root_module.addImport("dashboard", z_monitoring);
     monitor_exe.root_module.addImport("z_config", z_config);
@@ -80,7 +86,9 @@ pub fn build(b: *std.Build) void {
 
     for (modules_to_test) |mod| {
         const t = b.addTest(.{
-            .root_module = mod,
+            .root_source_file = mod.root_source_file.?,
+            .target = target,
+            .optimize = optimize,
         });
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);

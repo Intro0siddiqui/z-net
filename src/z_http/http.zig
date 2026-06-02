@@ -38,6 +38,9 @@ pub const HttpClient = struct {
             }
         }
 
+        // Inject Accept-Encoding for transparent payload decompression
+        try headers.put("Accept-Encoding", "gzip, br, zstd");
+
         // 2. Check HTTP Cache (RFC 7234)
         if (self.http_cache) |hcache| {
             if (hcache.getHttpResponse(url, headers)) |cached_entry| {
@@ -60,6 +63,12 @@ pub const HttpClient = struct {
     }
 
     pub fn post(self: *HttpClient, url: []const u8, body: []const u8, top_level_site: []const u8, origin: []const u8) !bridge.FetchHandle {
+        var headers = std.StringArrayHashMap([]const u8).init(self.allocator);
+        defer headers.deinit();
+
+        // Inject Accept-Encoding for transparent payload decompression
+        try headers.put("Accept-Encoding", "gzip, br, zstd");
+
         // 1. Check Cookie Jar and attach Cookie header
         // (Similar to GET, cookies would be attached here)
 

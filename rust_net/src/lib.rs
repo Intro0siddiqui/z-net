@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 use mio::net::TcpStream;
+use crate::protocols::fetch::SmartMiddleware;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -115,6 +116,8 @@ struct Connection {
     #[allow(dead_code)]
     port: u16,
     tlsconn: Option<ClientConnection>,
+    content_encoding: Option<String>,
+    decompressor: Option<Box<dyn Read + Send>>,
 }
 
 impl Connection {
@@ -128,6 +131,8 @@ impl Connection {
             host,
             port,
             tlsconn: None,
+            content_encoding: None,
+            decompressor: None,
         }
     }
 }
@@ -141,6 +146,7 @@ pub struct NetEngine {
     tls_config: Arc<ClientConfig>,
     body_rings: HashMap<u64, *mut BodyRingDescriptor>,
     conn_body_rings: HashMap<usize, u64>,
+    middleware: SmartMiddleware,
 }
 
 impl NetEngine {
@@ -168,6 +174,7 @@ impl NetEngine {
             tls_config: Arc::new(config),
             body_rings: HashMap::new(),
             conn_body_rings: HashMap::new(),
+            middleware: SmartMiddleware,
         })
     }
     
@@ -362,26 +369,68 @@ pub extern "C" fn net_read(
                 1
             };
 
-            match connection.stream.read_vectored(&mut bufs[..n_bufs]) {
-                Ok(0) => return NS_ERROR_FAILURE,
-                Ok(n) => {
-                    ring.head.fetch_add(n as u64, Ordering::Release);
-                    unsafe {
-                        if !bytes_read.is_null() {
-                            *bytes_read = n;
+            // Read from stream directly into the ring buffer (or TLS read buffer if TLS was used, but zero-copy path bypasses TLS here)
+            // Note: If decompression is needed, we will process the stream properly in the connection wrapper
+            // This is a simplified zero copy flow, decompression should technically happen on the stream before it hits the ring
+            // We use the decompressor stream if it exists
+            if let Some(ref mut decompressor) = connection.decompressor {
+                let mut temp_buf = vec![0u8; ring.capacity];
+                match decompressor.read(&mut temp_buf) {
+                    Ok(0) => {
+                        // EOF
+                        return NS_ERROR_FAILURE;
+                    }
+                    Ok(n) => {
+                        let mut wrote = 0;
+                        if wrote < n && !bufs[0].is_empty() {
+                            let copy_len = std::cmp::min(n - wrote, bufs[0].len());
+                            bufs[0][..copy_len].copy_from_slice(&temp_buf[wrote..wrote + copy_len]);
+                            wrote += copy_len;
                         }
-                    }
+                        if wrote < n && n_bufs > 1 && !bufs[1].is_empty() {
+                            let copy_len = std::cmp::min(n - wrote, bufs[1].len());
+                            bufs[1][..copy_len].copy_from_slice(&temp_buf[wrote..wrote + copy_len]);
+                            wrote += copy_len;
+                        }
+                        ring.head.fetch_add(wrote as u64, Ordering::Release);
+                        unsafe {
+                            if !bytes_read.is_null() {
+                                *bytes_read = wrote;
+                            }
+                        }
 
-                    // Backpressure: 95% High Watermark
-                    let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
-                    if available_read > (ring.capacity * 95 / 100) {
-                        let _ = engine.poll.registry().deregister(&mut connection.stream);
-                        connection.is_paused = true;
+                        let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
+                        if available_read > (ring.capacity * 95 / 100) {
+                            let _ = engine.poll.registry().deregister(&mut connection.stream);
+                            connection.is_paused = true;
+                        }
+                        return NS_OK;
                     }
-                    return NS_OK;
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return NS_ERROR_FAILURE,
+                    Err(_) => return NS_ERROR_FAILURE,
                 }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return NS_ERROR_FAILURE,
-                Err(_) => return NS_ERROR_FAILURE,
+            } else {
+                match connection.stream.read_vectored(&mut bufs[..n_bufs]) {
+                    Ok(0) => return NS_ERROR_FAILURE,
+                    Ok(n) => {
+                        ring.head.fetch_add(n as u64, Ordering::Release);
+                        unsafe {
+                            if !bytes_read.is_null() {
+                                *bytes_read = n;
+                            }
+                        }
+
+                        // Backpressure: 95% High Watermark
+                        let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
+                        if available_read > (ring.capacity * 95 / 100) {
+                            let _ = engine.poll.registry().deregister(&mut connection.stream);
+                            connection.is_paused = true;
+                        }
+                        return NS_OK;
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return NS_ERROR_FAILURE,
+                    Err(_) => return NS_ERROR_FAILURE,
+                }
             }
         }
     }

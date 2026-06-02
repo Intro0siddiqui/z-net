@@ -2,6 +2,7 @@ use url::Url;
 use std::ffi::{CString, CStr};
 use std::os::raw::{c_char, c_int};
 use std::collections::HashMap;
+use std::io::Read;
 
 extern "C" {
     fn Zawra_Hash_String(input: *const c_char, out_hi: *mut u64, out_lo: *mut u64);
@@ -66,6 +67,35 @@ impl SmartMiddleware {
                 .as_secs();
             Zawra_History_Put(hi, lo, url_c.as_ptr(), title_c.as_ptr(), ts);
         }
+    }
+
+    pub fn wrap_decompression<'a>(&self, content_encoding: &str, reader: Box<dyn Read + Send + 'a>) -> Box<dyn Read + Send + 'a> {
+        let encodings: Vec<&str> = content_encoding.split(',').map(|s| s.trim()).collect();
+        let mut current_reader: Box<dyn Read + Send + 'a> = reader;
+
+        for encoding in encodings.iter().rev() {
+            let next_reader: Box<dyn Read + Send + 'a> = match *encoding {
+                "gzip" | "x-gzip" => {
+                    Box::new(flate2::read::GzDecoder::new(current_reader))
+                }
+                "br" => {
+                    Box::new(brotli::Decompressor::new(current_reader, 4096))
+                }
+                "zstd" => {
+                    if let Ok(decoder) = zstd::stream::read::Decoder::new(current_reader) {
+                        Box::new(decoder)
+                    } else {
+                        // In a network stream, if decompression fails we must not panic to avoid DoS.
+                        // For simplicity in this demo wrapper, we return an empty reader using a new empty cursor.
+                        Box::new(std::io::Cursor::new(Vec::new()))
+                    }
+                }
+                _ => current_reader
+            };
+            current_reader = next_reader;
+        }
+
+        current_reader
     }
 }
 

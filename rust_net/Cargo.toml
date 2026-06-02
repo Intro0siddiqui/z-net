@@ -40,6 +40,15 @@ version = "2.5"
 [dependencies.cookie]
 version = "0.18"
 
+[dependencies.flate2]
+version = "1.0"
+
+[dependencies.brotli]
+version = "6.0"
+
+[dependencies.zstd]
+version = "0.13"
+
 [features]
 default = ["ring"]
 ring = ["rustls/ring"]
