@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::time::{timeout, sleep, Duration as TokioDuration};
 
+// Pull in the auth state machine that lives in rust_net.
+use lean_net::protocols::auth::{AuthEngine, AuthHeader as AuthKind};
+
 /// z_pipeline - Async Orchestration Layer
 /// Rust-based high-performance async pipeline executor
 
@@ -103,6 +106,8 @@ pub struct Pipeline {
     http_cache: Arc<HttpCache>,
     cookie_cache: Arc<CookieCache>,
     metrics: Arc<Mutex<PipelineMetrics>>,
+    /// Feature 4: NTLM / Kerberos / Negotiate trap-and-retry.
+    auth_engine: AuthEngine,
 }
 
 #[derive(Debug, Default)]
@@ -169,6 +174,7 @@ impl Pipeline {
             http_cache,
             cookie_cache,
             metrics: Arc::new(Mutex::new(PipelineMetrics::default())),
+            auth_engine: AuthEngine::new(),
         }
     }
 
@@ -270,12 +276,46 @@ impl Pipeline {
         }
 
         // Prepare request
-        let request = self.build_http_request(&parsed_url, &options)?;
-        
+        let mut request = self.build_http_request(&parsed_url, &options)?;
+
         // Send request and receive response
         let transfer_start = Instant::now();
-        let response = self.send_http_request(&mut connection, &request).await?;
+        let mut response = self.send_http_request(&mut connection, &request).await?;
         let transfer_time = transfer_start.elapsed();
+
+        // ------------------------------------------------------------
+        // Feature 4: Auth trap-and-retry
+        // ------------------------------------------------------------
+        // If the server (or proxy) returned a 401 / 407 we observe the
+        // challenge, ask the auth subsystem to compute the right
+        // Authorization header, and resend the request on the same
+        // persistent connection. This is critical for NTLM (which is a
+        // 3-message handshake) and Kerberos (which uses a single AP-REQ
+        // but the server tracks the auth state per-connection).
+        let host_for_spn = parsed_url.host_str().unwrap_or("").to_string();
+        if let Some(challenge) = self
+            .auth_engine
+            .observe(
+                &pool_key,
+                response.status_code,
+                response.headers.get("www-authenticate").map(|s| s.as_str()),
+                response.headers.get("proxy-authenticate").map(|s| s.as_str()),
+            )
+            .await
+        {
+            if let Ok((header, value)) = self
+                .auth_engine
+                .build_retry_header(&pool_key, &challenge, &host_for_spn)
+                .await
+            {
+                let header_name = match header {
+                    AuthKind::Authorization => "Authorization".to_string(),
+                    AuthKind::ProxyAuthorization => "Proxy-Authorization".to_string(),
+                };
+                request.headers.insert(header_name, value);
+                response = self.send_http_request(&mut connection, &request).await?;
+            }
+        }
 
         // Cache the response if appropriate
         if response.status_code < 400 {

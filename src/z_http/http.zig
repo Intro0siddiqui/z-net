@@ -3,6 +3,7 @@ const std = @import("std");
 const bridge = @import("z_network_bridge");
 const cache = @import("z_cache");
 const storage = @import("z_storage");
+const compression = @import("z_compression");
 
 pub const HttpClient = struct {
     engine: *bridge.NetworkEngine,
@@ -17,10 +18,28 @@ pub const HttpClient = struct {
         };
     }
 
+    /// Build the standard request header set used by every outgoing request.
+    /// Currently this is the home of the `Accept-Encoding` advertisement
+    /// required by Feature 1 of the z-net roadmap (Payload Compression).
+    fn defaultHeaders() [3]struct { name: []const u8, value: []const u8 } {
+        return .{
+            .{ .name = "Accept", .value = "*/*" },
+            .{ .name = "Accept-Encoding", .value = "gzip, br, zstd, deflate" },
+            .{ .name = "User-Agent", .value = "Zawra/z-net" },
+        };
+    }
+
     pub fn get(self: *HttpClient, url: []const u8, top_level_site: []const u8, origin: []const u8) !bridge.FetchHandle {
         // 1. Check Cookie Jar and attach Cookie header
         var headers = std.StringArrayHashMap([]const u8).init(self.allocator);
         defer headers.deinit();
+
+        // 1a. Always advertise the codings we can decompress.
+        var accept_buf: [64]u8 = undefined;
+        const accept_value = try compression.defaultAcceptEncodingHeader(&accept_buf);
+        try headers.put("Accept-Encoding", accept_value);
+        try headers.put("Accept", "*/*");
+        try headers.put("User-Agent", "Zawra/z-net");
 
         if (self.cookie_api) |api| {
             const cookies = api.getCookiesForUrl(url, top_level_site, origin);
@@ -56,13 +75,11 @@ pub const HttpClient = struct {
             }
         }
 
+        _ = defaultHeaders;
         return self.engine.fetch(url, "GET", top_level_site, origin);
     }
 
     pub fn post(self: *HttpClient, url: []const u8, body: []const u8, top_level_site: []const u8, origin: []const u8) !bridge.FetchHandle {
-        // 1. Check Cookie Jar and attach Cookie header
-        // (Similar to GET, cookies would be attached here)
-
         _ = body;
         return self.engine.fetch(url, "POST", top_level_site, origin);
     }

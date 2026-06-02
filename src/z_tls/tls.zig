@@ -10,7 +10,8 @@
 //! 3. Or replace with a pure-Zig TLS implementation
 
 const std = @import("std");
-const socket = @import("socket.zig");
+const socket = @import("z_socket");
+const z_proxy = @import("z_proxy");
 
 // Error types for TLS operations
 pub const TlsError = error{
@@ -88,7 +89,6 @@ pub const TlsConnection = struct {
 
     /// Connect to a socket (stub)
     pub fn connect(self: *Self, sock: socket.Socket) TlsError!void {
-        _ = self;
         _ = sock;
         // TODO: Perform actual TLS handshake when mbedTLS is available
         self.state = .Established;
@@ -181,6 +181,7 @@ pub const CertificateValidator = struct {
 pub const TlsManager = struct {
     allocator: std.mem.Allocator,
     session_cache: TlsSessionCache,
+    proxy: ?*z_proxy.ProxyConfig = null,
 
     const Self = @This();
 
@@ -191,10 +192,33 @@ pub const TlsManager = struct {
         };
     }
 
+    /// Configure a proxy to be honored for every subsequent TLS connection.
+    /// The proxy handshake (SOCKS5 or HTTP CONNECT) runs *before* the TLS
+    /// ClientHello so the tunneled socket is byte-identical to a direct
+    /// connection from `z_tls`'s perspective.
+    pub fn setProxy(self: *Self, cfg: ?*z_proxy.ProxyConfig) void {
+        self.proxy = cfg;
+    }
+
     pub fn connect(self: *Self, sock: socket.Socket, host: []const u8) TlsError!TlsConnection {
         var tls_conn = try TlsConnection.init(self.allocator, host);
         try tls_conn.connect(sock);
         return tls_conn;
+    }
+
+    /// High-level helper: open a tunneled socket via the configured proxy
+    /// (if any) and return it so the caller can hand it to `connect`.
+    pub fn connectTunneled(
+        self: *Self,
+        io_ctx: *std.Io,
+        target_host: []const u8,
+        target_port: u16,
+    ) !socket.Socket {
+        const hop: ?z_proxy.ProxyHop = if (self.proxy) |cfg| blk: {
+            const is_https = target_port == 443;
+            break :blk z_proxy.resolveFor(cfg, target_host, is_https);
+        } else null;
+        return z_proxy.connectTunneled(io_ctx, hop, target_host, target_port, null);
     }
 
     pub fn deinit(self: *Self) void {
