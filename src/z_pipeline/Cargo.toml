@@ -13,25 +13,32 @@ path = "pipeline.rs"
 tokio = { version = "1.0", features = ["sync", "time", "net", "rt"] }
 
 # Auth state machine from the lean_net (rust_net) crate.
-lean_net = { path = "../../rust_net" }
+lean_net = { package = "lean-net", path = "../../rust_net" }
 
 # Feature 1: Compression
 zstd = { version = "0.13", default-features = false }
-brotli = { version = "7.0", default-features = false }
-flate2 = { version = "1.0", default-features = false }
+brotli = { version = "7.0", default-features = false, features = ["std"] }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 # Feature 2: Proxies
 socks = "0.3"
 
-# Feature 4: Auth
-[target.'cfg(target_os = "windows")'.dependencies.sspi]
+# Feature 4: Auth (gated - see lean_net feature flag)
+[dependencies.sspi]
 version = "0.10"
+optional = true
 features = ["tsssp"]
 
-[target.'cfg(not(target_os = "windows"))'.dependencies.libgssapi]
+[dependencies.libgssapi]
 version = "0.8"
+optional = true
 
-base64 = "0.22"
+[dependencies.base64]
+version = "0.22"
+
+[features]
+default = []
+enterprise-auth = ["dep:sspi", "dep:libgssapi", "lean_net/enterprise-auth"]
 
 # Removed unused heavy dependencies: reqwest, hyper, prometheus, async-std, clap
 # These were identified as binary size bloat.

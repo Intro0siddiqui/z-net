@@ -556,9 +556,8 @@ pub extern "C" fn net_http3_connect(engine_handle: NetEngineHandle, host: *const
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     
     let host_str = unsafe {
-        std.ffi::CStr::from_ptr(host)
-            .to_string_lossy()
-            .into_owned()
+        let cstr = std::ffi::CStr::from_ptr(host);
+        cstr.to_string_lossy().into_owned()
     };
     
     let addr_str = format!("{}:{}", host_str, port);

@@ -15,6 +15,7 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 /// C-ABI mirror of the Zig `WebTransport::Session` handle.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct WTSession {
     pub session_id: u64,
@@ -25,6 +26,7 @@ pub struct WTSession {
     pub datagrams_enabled: bool,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct WTStream {
     pub stream_id: u64,
@@ -33,6 +35,7 @@ pub struct WTStream {
     pub is_readable: bool,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct WTDatagram {
     pub session_id: u64,
@@ -40,10 +43,25 @@ pub struct WTDatagram {
     pub data_len: usize,
 }
 
+// SAFETY: WTDatagram is a plain-old-data FFI struct containing a pointer
+// to network-owned memory. We promise to only access it while valid.
+unsafe impl Send for WTDatagram {}
+unsafe impl Sync for WTDatagram {}
+
 struct WtRegistry {
     sessions: VecDeque<WTSession>,
     streams: VecDeque<WTStream>,
     datagrams: VecDeque<WTDatagram>,
+}
+
+impl WtRegistry {
+    fn new() -> Self {
+        Self {
+            sessions: VecDeque::new(),
+            streams: VecDeque::new(),
+            datagrams: VecDeque::new(),
+        }
+    }
 }
 
 static WT_REGISTRY: OnceLock<Mutex<WtRegistry>> = OnceLock::new();
@@ -70,7 +88,14 @@ pub extern "C" fn znet_wt_create_session(
         max_sessions,
         datagrams_enabled,
     };
-    reg.sessions.push_back(session);
+    reg.sessions.push_back(WTSession {
+        session_id,
+        outgoing_streams: 0,
+        incoming_streams: 0,
+        datagrams_queued: 0,
+        max_sessions,
+        datagrams_enabled,
+    });
     Box::into_raw(Box::new(session)) as *mut c_void
 }
 

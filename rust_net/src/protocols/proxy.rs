@@ -5,7 +5,7 @@
 //! The actual TCP tunneling (SOCKS5 / HTTP CONNECT) is performed on the
 //! Zig side because it has direct access to the `z_socket::Socket` we
 //! are going to wrap. This module just provides the system discovery +
-! PAC evaluation in Rust where the ecosystem (system-configuration
+//! PAC evaluation in Rust where the ecosystem (system-configuration
 //! crates, etc.) is more mature.
 
 use std::collections::HashMap;
