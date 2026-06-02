@@ -45,6 +45,50 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Feature 1: Compression
+    const z_compression = b.addModule("z_compression", .{
+        .root_source_file = b.path("src/z_compression/compression.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    z_compression.addImport("z_body_ring", b.createModule(.{
+        .root_source_file = b.path("src/z_body_ring.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+
+    // Feature 2: Proxies
+    const z_proxy = b.addModule("z_proxy", .{
+        .root_source_file = b.path("src/z_proxy/proxy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    z_proxy.addImport("z_socket", z_socket);
+
+    // Feature 3: WebTransport
+    const z_webtransport = b.addModule("z_webtransport", .{
+        .root_source_file = b.path("src/z_webtransport/webtransport.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const z_quic = b.addModule("z_quic", .{
+        .root_source_file = b.path("src/z_quic/quic.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    z_quic.addImport("z_socket", z_socket);
+    z_quic.addImport("z_tls", b.createModule(.{
+        .root_source_file = b.path("src/z_tls/tls.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    z_webtransport.addImport("z_quic", z_quic);
+    z_webtransport.addImport("z_http3", b.createModule(.{
+        .root_source_file = b.path("src/z_http3/http3.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+
     // Root module
     const znet = b.addModule("znet", .{
         .root_source_file = b.path("src/root.zig"),
@@ -56,6 +100,9 @@ pub fn build(b: *std.Build) void {
     znet.addImport("z_config", z_config);
     znet.addImport("z_health", z_health);
     znet.addImport("z_monitoring", z_monitoring);
+    znet.addImport("z_compression", z_compression);
+    znet.addImport("z_proxy", z_proxy);
+    znet.addImport("z_webtransport", z_webtransport);
 
     // Monitor Executable
     const monitor_exe = b.addExecutable(.{
@@ -76,6 +123,7 @@ pub fn build(b: *std.Build) void {
 
     const modules_to_test = [_]*std.Build.Module{
         z_socket, z_network_bridge, z_config, z_health, z_monitoring,
+        z_compression, z_proxy, z_webtransport,
     };
 
     for (modules_to_test) |mod| {

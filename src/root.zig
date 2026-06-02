@@ -106,6 +106,24 @@ pub const Fetch = @import("z_fetch/fetch.zig").Fetch;
 pub const FetchOptions = @import("z_fetch/fetch.zig").FetchOptions;
 pub const EarlyHintProcessor = @import("z_early_hints/early_hints.zig").EarlyHintProcessor;
 
+// Feature 1: Compression
+pub const Compression = @import("z_compression/compression.zig");
+pub const DecompressingStream = @import("z_compression/compression.zig").DecompressingStream;
+pub const Encoding = @import("z_compression/compression.zig").Encoding;
+
+// Feature 2: Enterprise Proxies
+pub const ProxyConfig = @import("z_proxy/proxy.zig").ProxyConfig;
+pub const ProxyHop = @import("z_proxy/proxy.zig").ProxyHop;
+pub const SystemProxy = @import("z_proxy/proxy.zig").SystemProxy;
+pub const PacEngine = @import("z_proxy/pac.zig").PacEngine;
+pub const ProxyTunnel = @import("z_proxy/tunnel.zig");
+
+// Feature 3: WebTransport
+pub const WebTransport = @import("z_webtransport/webtransport.zig").WebTransport;
+pub const WTConnectOptions = @import("z_webtransport/webtransport.zig").ConnectOptions;
+pub const WTStreamHandle = @import("z_webtransport/webtransport.zig").StreamHandle;
+pub const WT_DATAGRAM = @import("z_webtransport/webtransport.zig").ALPN;
+
 // Security and Privacy
 pub const PrivacyDNS = @import("z_security/privacy_dns.zig").PrivacyDNS;
 pub const OcspManager = @import("z_security/ocsp_stapling.zig").OcspManager;
@@ -186,9 +204,9 @@ pub const destroyServiceWorkerManager = @import("z_service_worker/service_worker
 
 // Version information
 pub const VERSION_MAJOR = 1;
-pub const VERSION_MINOR = 0;
+pub const VERSION_MINOR = 1;
 pub const VERSION_PATCH = 0;
-pub const VERSION_STRING = "1.0.0";
+pub const VERSION_STRING = "1.1.0";
 
 // Feature flags
 pub const FEATURES = struct {
@@ -204,6 +222,10 @@ pub const FEATURES = struct {
     pub const HAS_STORAGE = true; // Browser Storage Bridge (localStorage, sessionStorage, IndexedDB, Cache API)
     pub const HAS_WEBSOCKET = true; // WebSocket Protocol Implementation (RFC 6455)
     pub const HAS_SERVICE_WORKER = true; // Service Worker Foundation (Registration, Lifecycle, Fetch, Cache, Push, Sync, Messaging, Routing)
+    pub const HAS_COMPRESSION = true; // Feature 1: Brotli, Zstd, Gzip streaming decoders over BodyRing
+    pub const HAS_PROXY = true; // Feature 2: HTTP CONNECT, SOCKS5, PAC
+    pub const HAS_WEBTRANSPORT = true; // Feature 3: WebTransport over HTTP/3
+    pub const HAS_NTLM = true; // Feature 4: NTLM, Kerberos, Negotiate
 } pub const BuildInfo = struct {
     pub const COMPILER = "Zig " ++ builtin.zig_version_string;
     pub const TARGET = builtin.target機器名;
@@ -223,7 +245,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     
     std.log.info("Compiler: {}", .{BuildInfo.COMPILER});
     std.log.info("Target: {}", .{BuildInfo.TARGET});
-    std.log.info("Features: TLS={}, DNS={}, HTTP={}, Cache={}, Pipeline={}, Policy={}, EventLoop={}, Storage={}, WebSocket={}, ServiceWorker={}", .{
+    std.log.info("Features: TLS={}, DNS={}, HTTP={}, Cache={}, Pipeline={}, Policy={}, EventLoop={}, Storage={}, WebSocket={}, ServiceWorker={}, Compression={}, Proxy={}, WebTransport={}, NTLM={}", .{
         FEATURES.HAS_TLS,
         FEATURES.HAS_DNS,
         FEATURES.HAS_HTTP,
@@ -234,6 +256,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         FEATURES.HAS_STORAGE,
         FEATURES.HAS_WEBSOCKET,
         FEATURES.HAS_SERVICE_WORKER,
+        FEATURES.HAS_COMPRESSION,
+        FEATURES.HAS_PROXY,
+        FEATURES.HAS_WEBTRANSPORT,
+        FEATURES.HAS_NTLM,
     });
 }
 

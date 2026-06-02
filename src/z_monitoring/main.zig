@@ -1,12 +1,12 @@
 const std = @import("std");
-const dashboard = @import("dashboard.zig");
-const validator = @import("../z_config/validator.zig");
-const checker = @import("../z_health/checker.zig");
+const dashboard = @import("dashboard");
+const validator = @import("z_config");
+const checker = @import("z_health");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var dbga: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbga.deinit();
+    const allocator = dbga.allocator();
 
     std.debug.print("Starting z-net Monitor...\n", .{});
 

@@ -40,9 +40,64 @@ version = "2.5"
 [dependencies.cookie]
 version = "0.18"
 
+# Feature 1: Payload Compression Streams
+[dependencies.zstd]
+version = "0.13"
+default-features = false
+
+[dependencies.brotli]
+version = "7.0"
+default-features = false
+features = ["std"]
+
+[dependencies.flate2]
+version = "1.0"
+default-features = false
+features = ["rust_backend"]
+
+# Feature 2: Enterprise Proxy Support
+[dependencies.socks]
+version = "0.3"
+
+[dependencies.trust-dns-resolver]
+version = "0.23"
+optional = true
+
+# Feature 4: Advanced Authentication (NTLM / Kerberos / Negotiate)
+# System GSSAPI / SSPI is optional. The default build does NOT pull in
+# the system libraries, so it compiles on any platform without needing
+# libkrb5-dev / MIT Kerberos headers installed. Enable the
+# `enterprise-auth` feature to opt in to actual Kerberos AP-REQ /
+# Windows SSPI token generation.
+[dependencies.sspi]
+version = "0.10"
+optional = true
+features = ["tsssp"]
+
+[dependencies.libgssapi]
+version = "0.8"
+optional = true
+
+[dependencies.base64]
+version = "0.22"
+
+[dependencies.thiserror]
+version = "1.0"
+
+[dependencies.tokio]
+version = "1.0"
+features = ["sync"]
+
 [features]
 default = ["ring"]
 ring = ["rustls/ring"]
+# Pulls in sspi (Windows) or libgssapi (POSIX) and turns on the actual
+# Kerberos / NTLM challenge-response code path in auth.rs. Requires
+# platform-specific system libraries to be installed at build time:
+#   * Linux:   apt install libkrb5-dev  (or yum install krb5-devel)
+#   * macOS:   ships with the OS, no extra step
+#   * Windows: requires the Windows SDK / Heimdal packaging
+enterprise-auth = ["dep:sspi", "dep:libgssapi"]
 
 [profile.release]
 opt-level = 3

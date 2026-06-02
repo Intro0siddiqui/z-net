@@ -21,6 +21,10 @@ pub mod protocols {
     pub mod http3;
     pub mod fetch;
     pub mod early_hints;
+    pub mod compression;
+    pub mod proxy;
+    pub mod webtransport;
+    pub mod auth;
 }
 
 pub mod security {
@@ -544,9 +548,59 @@ pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOp
 }
 
 #[no_mangle]
-pub extern "C" fn net_http3_connect(_engine: NetEngineHandle, _host: *const c_char, _port: u16) -> ConnHandle {
-    // Scaffolding implementation
-    null_mut()
+pub extern "C" fn net_http3_connect(engine_handle: NetEngineHandle, host: *const c_char, port: u16) -> ConnHandle {
+    if engine_handle.is_null() {
+        return null_mut();
+    }
+    
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    
+    let host_str = unsafe {
+        let cstr = std::ffi::CStr::from_ptr(host);
+        cstr.to_string_lossy().into_owned()
+    };
+    
+    let addr_str = format!("{}:{}", host_str, port);
+    let addrs = match addr_str.to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return null_mut(),
+    };
+    
+    let addr = match addrs.into_iter().next() {
+        Some(a) => a,
+        None => return null_mut(),
+    };
+
+    // HTTP/3 (QUIC) requires a UDP socket. 
+    // Mio support for UDP is standard.
+    let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return null_mut(),
+    };
+    
+    if socket.set_nonblocking(true).is_err() {
+        return null_mut();
+    }
+
+    let mut udp_stream = match mio::net::UdpSocket::from_std(socket) {
+        s => s,
+    };
+
+    let conn_id = engine.next_conn_id;
+    engine.next_conn_id += 1;
+    
+    if engine.poll.registry().register(
+        &mut udp_stream,
+        Token(conn_id),
+        Interest::READABLE | Interest::WRITABLE
+    ).is_err() {
+        return null_mut();
+    }
+
+    // TODO: Initialize quinn-proto Endpoint and Connection.
+    // For now, we return the conn_id as a handle to indicate the socket is registered.
+    
+    conn_id as ConnHandle
 }
 
 #[no_mangle]

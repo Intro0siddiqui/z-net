@@ -8,3 +8,7 @@ high_perf_server
 zig-bin/
 node_modules/
 mock_data.json
+target/
+rust_net/target/
+
+src/z_pipeline/target/
