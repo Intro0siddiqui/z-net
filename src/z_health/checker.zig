@@ -1,7 +1,6 @@
 const std = @import("std");
 const net = std.net;
 const mem = std.mem;
-const os = std.os;
 
 pub const HealthStatus = enum {
     healthy,
@@ -26,7 +25,8 @@ pub const HealthChecker = struct {
 
     pub fn checkTcpConnection(self: *HealthChecker, host: []const u8, port: u16, timeout_ns: u64) !HealthCheckResult {
         const start = std.time.milliTimestamp();
-        
+        const deadline = start + @as(i64, @intCast(timeout_ns / std.time.ns_per_ms));
+
         const address = net.Address.parseIp(host, port) catch {
             return HealthCheckResult{
                 .name = "TCP Connection",
@@ -36,17 +36,21 @@ pub const HealthChecker = struct {
             };
         };
 
-        const stream = net.tcpConnectToAddress(address) catch |err| {
+        const stream = blk: {
+            var current = std.time.milliTimestamp();
+            while (current < deadline) {
+                if (net.tcpConnectToAddress(address)) |s| break :blk s;
+                std.time.sleep(std.time.ns_per_ms * 10);
+                current = std.time.milliTimestamp();
+            }
             return HealthCheckResult{
                 .name = "TCP Connection",
                 .status = .failing,
-                .message = try std.fmt.allocPrint(self.allocator, "Connection failed: {}", .{err}),
-                .response_time_ms = std.time.milliTimestamp() - start,
+                .message = try std.fmt.allocPrint(self.allocator, "Connection timed out after {} ms", .{timeout_ns / std.time.ns_per_ms}),
+                .response_time_ms = current - start,
             };
         };
         stream.close();
-
-        _ = timeout_ns; // TODO: Implement timeout if needed
 
         return HealthCheckResult{
             .name = "TCP Connection",
