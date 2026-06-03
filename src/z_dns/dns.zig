@@ -409,34 +409,43 @@ fn parseDoHResponse(json_response: std.json.Value, query: DnsQuery, allocator: s
 
 fn parseDomainName(data: []const u8, offset: *usize, allocator: std.mem.Allocator) ![]const u8 {
     var labels = std.ArrayList(u8).init(allocator);
-    defer labels.deinit();
+    errdefer labels.deinit();
 
     var current_offset = offset.*;
-    
-    while (current_offset < data.len and data[current_offset] != 0) {
-        if (data[current_offset] & 0xC0 != 0) {
-            // Pointer compression
-            const ptr_offset = ((@as(u16, data[current_offset]) & 0x3F) << 8) | data[current_offset + 1];
-            const ptr_target = ptr_offset;
-            // TODO: Handle pointer resolution properly
-            current_offset += 2;
-            break;
-        } else {
-            const label_length = data[current_offset];
+    var jumped = false;
+    var return_offset = offset.*;
+    var jumps_left: u8 = 16;
+
+    while (current_offset < data.len) {
+        const len_byte = data[current_offset];
+        if (len_byte == 0) {
             current_offset += 1;
-            
-            if (labels.len > 0) {
-                try labels.append('.');
-            }
-            try labels.appendSlice(data[current_offset..current_offset + label_length]);
-            current_offset += label_length;
+            break;
         }
-    }
+        if ((len_byte & 0xC0) == 0xC0) {
+            if (current_offset + 1 >= data.len) return error.MalformedDnsMessage;
+            if (jumps_left == 0) return error.MalformedDnsMessage;
+            jumps_left -= 1;
+            const ptr: usize = (@as(usize, len_byte & 0x3F) << 8) | @as(usize, data[current_offset + 1]);
+            if (ptr >= current_offset) return error.MalformedDnsMessage;
+            if (!jumped) {
+                return_offset = current_offset + 2;
+                jumped = true;
+            }
+            current_offset = ptr;
+            continue;
+        }
+        if ((len_byte & 0xC0) != 0) return error.MalformedDnsMessage;
 
-    if (current_offset < data.len and data[current_offset] == 0) {
+        const label_length: usize = len_byte;
         current_offset += 1;
+        if (current_offset + label_length > data.len) return error.MalformedDnsMessage;
+
+        if (labels.items.len > 0) try labels.append('.');
+        try labels.appendSlice(data[current_offset..current_offset + label_length]);
+        current_offset += label_length;
     }
 
-    offset.* = current_offset;
+    offset.* = if (jumped) return_offset else current_offset;
     return labels.toOwnedSlice();
 }
