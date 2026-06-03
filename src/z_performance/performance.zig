@@ -132,8 +132,8 @@ pub const PriorityTree = struct {
     groups: std.ArrayList(*std.ArrayList(u32)),
     allocator: std.mem.Allocator,
     
-    pub fn init(allocator: std.mem.Allocator) PriorityTree {
-        const tree = allocator.create(PriorityTree) catch unreachable;
+    pub fn init(allocator: std.mem.Allocator) !PriorityTree {
+        const tree = allocator.create(PriorityTree) catch return error.OutOfMemory;
         tree.* = PriorityTree{
             .streams = std.HashMap(u32, *StreamPriority, std.hash_map.AutoContext(u32)).init(allocator),
             .root_group = 0,
@@ -280,7 +280,7 @@ pub const ConnectionCoalescer = struct {
     };
     
     pub fn init(allocator: std.mem.Allocator, dns_cache: *dns.Cache) !ConnectionCoalescer {
-        const coalescer = allocator.create(ConnectionCoalescer) catch unreachable;
+        const coalescer = allocator.create(ConnectionCoalescer) catch return error.OutOfMemory;
         coalescer.* = ConnectionCoalescer{
             .pools = std.HashMap([]const u8, *std.ArrayList(*PooledConnection), StringHash).init(allocator),
             .dns_cache = dns_cache,
@@ -438,7 +438,7 @@ pub const EarlyHintsManager = struct {
         ttl: std.time.Duration,
         
         pub fn init(hint_type: EarlyHint.EHintType, url: []const u8, allocator: std.mem.Allocator) !*EarlyHint {
-            const hint = allocator.create(EarlyHint) catch unreachable;
+            const hint = allocator.create(EarlyHint) catch return error.OutOfMemory;
             hint.* = EarlyHint{
                 .hint_type = hint_type,
                 .url = try allocator.dupe(u8, url),
@@ -457,8 +457,8 @@ pub const EarlyHintsManager = struct {
         hints: std.ArrayList(*EarlyHint),
         completed: bool,
         
-        pub fn init(request_id: []const u8, main_url: []const u8, allocator: std.mem.Allocator) *EarlyHintRequest {
-            const req = allocator.create(EarlyHintRequest) catch unreachable;
+        pub fn init(request_id: []const u8, main_url: []const u8, allocator: std.mem.Allocator) !*EarlyHintRequest {
+            const req = allocator.create(EarlyHintRequest) catch return error.OutOfMemory;
             req.* = EarlyHintRequest{
                 .request_id = try allocator.dupe(u8, request_id),
                 .main_url = try allocator.dupe(u8, main_url),
@@ -562,8 +562,8 @@ pub const RetryManager = struct {
         jitter_enabled: bool = true,
         retryable_errors: std.ArrayList([]const u8),
         
-        pub fn init(allocator: std.mem.Allocator) *RetryPolicy {
-            const policy = allocator.create(RetryPolicy) catch unreachable;
+        pub fn init(allocator: std.mem.Allocator) !*RetryPolicy {
+            const policy = allocator.create(RetryPolicy) catch return error.OutOfMemory;
             policy.* = RetryPolicy{
                 .retryable_errors = std.ArrayList([]const u8).init(allocator),
             };
@@ -586,8 +586,8 @@ pub const RetryManager = struct {
         last_error: []const u8,
         backoff_factor: f64,
         
-        pub fn init(allocator: std.mem.Allocator) *ConnectionAttemptState {
-            const state = allocator.create(ConnectionAttemptState) catch unreachable;
+        pub fn init(allocator: std.mem.Allocator) !*ConnectionAttemptState {
+            const state = allocator.create(ConnectionAttemptState) catch return error.OutOfMemory;
             state.* = ConnectionAttemptState{
                 .attempts = 0,
                 .last_attempt = std.time.Instant.now(),
@@ -609,12 +609,12 @@ pub const RetryManager = struct {
     
     pub fn shouldRetry(self: *RetryManager, connection_id: []const u8, error: []const u8) bool {
         const state = self.connection_states.get(connection_id) orelse {
-            const new_state = ConnectionAttemptState.init(self.allocator);
+            const new_state = ConnectionAttemptState.init(self.allocator) catch return true;
             self.connection_states.put(connection_id, new_state) catch {};
             return true; // First attempt
         };
         
-        const policy = self.getOrCreatePolicy(connection_id);
+        const policy = self.getOrCreatePolicy(connection_id) orelse return false;
         state.attempts += 1;
         state.last_error = error;
         
@@ -643,9 +643,9 @@ pub const RetryManager = struct {
         return std.time.Instant.now().compare(state.next_retry_time) == .lt;
     }
     
-    fn getOrCreatePolicy(self: *RetryManager, connection_id: []const u8) *RetryPolicy {
+    fn getOrCreatePolicy(self: *RetryManager, connection_id: []const u8) ?*RetryPolicy {
         return self.policies.get(connection_id) orelse {
-            const policy = RetryPolicy.init(self.allocator);
+            const policy = RetryPolicy.init(self.allocator) catch return null;
             self.policies.put(connection_id, policy) catch {};
             return policy;
         };
@@ -713,7 +713,7 @@ test "Performance Features Basic Tests" {
     defer coalescer.deinit();
     
     // Test priority tree
-    var priority_tree = PriorityTree.init(allocator);
+    var priority_tree = try PriorityTree.init(allocator);
     defer priority_tree.deinit();
     
     const priority = StreamPriority.init(1, 16, null, false);

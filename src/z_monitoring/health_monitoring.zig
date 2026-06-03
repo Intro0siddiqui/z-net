@@ -236,8 +236,8 @@ pub const HealthMonitor = struct {
         return self.connections.getPtr(connection_id);
     }
 
-    pub fn getAllConnectionsHealth(self: *Self) std.StringHashMap(ConnectionHealth) {
-        return self.connections.clone() catch unreachable;
+    pub fn getAllConnectionsHealth(self: *Self) !std.StringHashMap(ConnectionHealth) {
+        return self.connections.clone() catch return error.OutOfMemory;
     }
 
     pub fn getHealthSummary(self: *Self) !HealthSummary {

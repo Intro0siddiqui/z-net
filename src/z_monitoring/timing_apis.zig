@@ -229,8 +229,8 @@ pub const TimingCollector = struct {
         return self.metrics_by_protocol.get(protocol);
     }
 
-    pub fn getAllMetrics(self: *Self) std.AutoHashMap(Protocol, TimingMetrics) {
-        return self.metrics_by_protocol.clone() catch unreachable;
+    pub fn getAllMetrics(self: *Self) !std.AutoHashMap(Protocol, TimingMetrics) {
+        return self.metrics_by_protocol.clone() catch return error.OutOfMemory;
     }
 
     pub fn exportPrometheus(self: *Self) ![]const u8 {

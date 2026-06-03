@@ -129,7 +129,7 @@ pub const DependencyTreeNode = struct {
     allocator: std.mem.Allocator,
     
     pub fn init(allocator: std.mem.Allocator, stream_id: u32, priority: *HTTP2StreamPriority, parent: ?*DependencyTreeNode) !*DependencyTreeNode {
-        const node = allocator.create(DependencyTreeNode) catch unreachable;
+        const node = allocator.create(DependencyTreeNode) catch return error.OutOfMemory;
         node.* = DependencyTreeNode{
             .stream_id = stream_id,
             .priority = priority,
@@ -568,8 +568,8 @@ pub const ServerPushManager = struct {
         timestamp: std.time.Instant,
         timeout: std.time.Duration,
         
-        pub fn init(allocator: std.mem.Allocator, push_id: u32, stream_id: u32) *PushPromise {
-            const promise = allocator.create(PushPromise) catch unreachable;
+        pub fn init(allocator: std.mem.Allocator, push_id: u32, stream_id: u32) !*PushPromise {
+            const promise = allocator.create(PushPromise) catch return error.OutOfMemory;
             promise.* = PushPromise{
                 .push_id = push_id,
                 .stream_id = stream_id,
@@ -598,8 +598,8 @@ pub const ServerPushManager = struct {
         size: u64,
         is_cached: bool,
         
-        pub fn init(url: []const u8, allocator: std.mem.Allocator) *PushResource {
-            const resource = allocator.create(PushResource) catch unreachable;
+        pub fn init(url: []const u8, allocator: std.mem.Allocator) !*PushResource {
+            const resource = allocator.create(PushResource) catch return error.OutOfMemory;
             resource.* = PushResource{
                 .url = try allocator.dupe(u8, url),
                 .content_type = "application/octet-stream",
@@ -629,7 +629,7 @@ pub const ServerPushManager = struct {
     pub fn createPushPromise(self: *ServerPushManager, stream_id: u32, url: []const u8, headers: std.HashMap([]const u8, []const u8, StringHash)) !u32 {
         const push_id = @as(u32, @intCast(std.time.milliTimestamp()));
         
-        const promise = PushPromise.init(self.allocator, push_id, stream_id);
+        const promise = try PushPromise.init(self.allocator, push_id, stream_id);
         promise.url = try self.allocator.dupe(u8, url);
         promise.headers = headers;
         
@@ -697,7 +697,7 @@ pub const ServerPushManager = struct {
     }
     
     fn cachePushResource(self: *ServerPushManager, promise: *PushPromise) !void {
-        const resource = PushResource.init(promise.url, self.allocator);
+        const resource = try PushResource.init(promise.url, self.allocator);
         resource.content_type = promise.headers.get("content-type") orelse "application/octet-stream";
         resource.size = promise.actual_size;
         
