@@ -110,7 +110,7 @@ pub struct Pipeline {
     auth_engine: AuthEngine,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PipelineMetrics {
     total_requests: u64,
     successful_requests: u64,
@@ -131,7 +131,6 @@ struct ConnectionPool {
     last_used: Instant,
 }
 
-#[derive(Debug)]
 struct ConnectionHandle {
     id: u64,
     host: String,
@@ -141,7 +140,14 @@ struct ConnectionHandle {
     in_use: bool,
 }
 
+impl std::fmt::Debug for ConnectionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionHandle").field("id", &self.id).field("host", &self.host).field("last_used", &self.last_used).field("in_use", &self.in_use).finish()
+    }
+}
+
 trait SocketConnection: Send + Sync {
+    fn get_port(&self) -> u16;
     fn connect(&mut self, host: &str, port: u16) -> Result<(), String>;
     fn send(&mut self, data: &[u8]) -> Result<usize, String>;
     fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, String>;
@@ -185,7 +191,7 @@ impl Pipeline {
 
         // Check if we need rate limiting
         if let Some(limit) = self.config.rate_limit_per_host {
-            self.acquire_rate_limit(&current_url, limit).await?;
+            self.acquire_rate_limit(&current_url, limit)?;
         }
 
         // Follow redirects
@@ -263,12 +269,12 @@ impl Pipeline {
 
         // Try to establish connection
         let connection_start = Instant::now();
-        self.establish_connection(&mut connection, &resolved_ips).await?;
+        self.establish_connection(&mut connection, &resolved_ips, &options).await?;
         let connection_time = connection_start.elapsed();
 
         // Perform TLS handshake if needed
         let mut handshake_time = None;
-        let mut tls_connection = None;
+        let mut tls_connection: Option<Box<dyn TlsConnection>> = None;
         if scheme == "https" {
             let tls_handshake_start = Instant::now();
             self.perform_tls_handshake(&mut connection).await?;
@@ -385,7 +391,7 @@ impl Pipeline {
         Ok(connection)
     }
 
-    async fn establish_connection(&self, connection: &mut ConnectionHandle, ips: &[String]) -> Result<(), PipelineError> {
+    async fn establish_connection(&self, connection: &mut ConnectionHandle, ips: &[String], options: &RequestOptions) -> Result<(), PipelineError> {
         let timeout_duration = options.timeout.unwrap_or(self.config.connection_timeout);
 
         for ip in ips {
@@ -593,7 +599,7 @@ impl Pipeline {
         });
     }
 
-    fn acquire_rate_limit(&self, url: &str, limit: usize) -> Result<tokio::sync::SemaphorePermit, PipelineError> {
+    fn acquire_rate_limit(&self, url: &str, limit: usize) -> Result<tokio::sync::OwnedSemaphorePermit, PipelineError> {
         let host = url::Url::parse(url)
             .map_err(|_| PipelineError::InvalidRedirect)?
             .host()
@@ -605,7 +611,7 @@ impl Pipeline {
             .entry(host)
             .or_insert_with(|| Arc::new(Semaphore::new(limit)));
 
-        semaphore.try_acquire()
+        semaphore.try_acquire_owned()
             .map_err(|_| PipelineError::NetworkError("Rate limit exceeded".to_string()))
     }
 
@@ -648,7 +654,7 @@ impl Pipeline {
 
         // Update average request time
         metrics.average_request_time = Duration::from_nanos(
-            (metrics.average_request_time.as_nanos() * (metrics.total_requests - 1) + request_duration.as_nanos()) / metrics.total_requests
+            (((metrics.average_request_time.as_nanos() * (metrics.total_requests as u128 - 1) + request_duration.as_nanos()) / (metrics.total_requests as u128)) as u64)
         );
     }
 
@@ -688,6 +694,7 @@ struct HttpResponse {
 struct MockSocketConnection;
 
 impl SocketConnection for MockSocketConnection {
+    fn get_port(&self) -> u16 { 80 }
     fn connect(&mut self, _host: &str, _port: u16) -> Result<(), String> {
         Ok(())
     }
@@ -758,7 +765,7 @@ trait SocketConnectionBoxClone {
 
 impl SocketConnectionBoxClone for Box<dyn SocketConnection> {
     fn box_clone(&self) -> Box<dyn SocketConnection> {
-        self.clone()
+        panic!("Cloning Box<dyn SocketConnection> is not supported")
     }
 }
 
@@ -768,7 +775,7 @@ trait TlsConnectionBoxClone {
 
 impl TlsConnectionBoxClone for Box<dyn TlsConnection> {
     fn box_clone(&self) -> Box<dyn TlsConnection> {
-        self.clone()
+        panic!("Cloning Box<dyn TlsConnection> is not supported")
     }
 }
 
