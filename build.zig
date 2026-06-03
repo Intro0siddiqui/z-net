@@ -7,11 +7,11 @@ pub fn build(b: *std.Build) void {
     // ============================================================
     // Phase 4.1: Automate Cargo Build Step
     // ============================================================
-    const cargo_build = b.addSystemCommand(&.{ 
-        "cargo", "build", "--release", "--lib", 
+    const cargo_build = b.addSystemCommand(&.{
+        "cargo", "build", "--release", "--lib",
         "--manifest-path", "rust_net/Cargo.toml"
     });
-    
+
     const rust_lib_path = b.path("rust_net/target/release/liblean_net.a");
 
     // Module Definitions
@@ -76,12 +76,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    z_quic.addImport("z_socket", z_socket);
-    z_quic.addImport("z_tls", b.createModule(.{
+    // z_tls is backed by the rustls C ABI in lean-net (see
+    // `rust_net/src/lib.rs`). The static library itself is gated on a
+    // build option so the default test build does not need the full
+    // transitive Rust dependency graph; passing `-Dznet-link-rust=true`
+    // enables the FFI link for downstream executables that need a
+    // real TLS implementation.
+    const link_rust = b.option(bool, "znet-link-rust", "Link the lean-net static lib (liblean_net.a) into Zig modules that consume its C ABI") orelse false;
+    const z_tls = b.createModule(.{
         .root_source_file = b.path("src/z_tls/tls.zig"),
         .target = target,
         .optimize = optimize,
-    }));
+    });
+    if (link_rust) {
+        z_tls.addObjectFile(rust_lib_path);
+        z_tls.link_libc = true;
+    }
+    z_tls.addImport("z_socket", z_socket);
+    z_tls.addImport("z_proxy", z_proxy);
+    z_quic.addImport("z_socket", z_socket);
+    z_quic.addImport("z_tls", z_tls);
     z_webtransport.addImport("z_quic", z_quic);
     z_webtransport.addImport("z_http3", b.createModule(.{
         .root_source_file = b.path("src/z_http3/http3.zig"),
@@ -123,7 +137,7 @@ pub fn build(b: *std.Build) void {
 
     const modules_to_test = [_]*std.Build.Module{
         z_socket, z_network_bridge, z_config, z_health, z_monitoring,
-        z_compression, z_proxy, z_webtransport,
+        z_compression, z_proxy, z_tls, z_webtransport,
     };
 
     for (modules_to_test) |mod| {
@@ -135,5 +149,4 @@ pub fn build(b: *std.Build) void {
     }
 
     _ = cargo_build;
-    _ = rust_lib_path;
 }

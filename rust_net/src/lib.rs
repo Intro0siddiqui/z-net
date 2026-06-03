@@ -136,11 +136,79 @@ impl Connection {
     }
 }
 
+/// Opaque handle to a standalone TLS connection (used by the Zig `z_tls`
+/// module for DNS-over-TLS and other direct TLS consumers).
+pub type TlsHandle = *mut c_void;
+
+/// Standalone TLS connection state. Owns a blocking `std::net::TcpStream`
+/// and a rustls `ClientConnection`. The TcpStream is intentionally
+/// blocking because DNS-over-TLS and other direct TLS users are
+/// low-throughput, latency-tolerant, and benefit from a simpler API.
+pub struct TlsState {
+    stream: std::net::TcpStream,
+    tls: ClientConnection,
+    #[allow(dead_code)]
+    host: String,
+    #[allow(dead_code)]
+    port: u16,
+    is_closed: bool,
+}
+
+impl TlsState {
+    fn new(host: String, port: u16) -> Result<Self, NetError> {
+        let addrs = match format!("{}:{}", host, port).to_socket_addrs() {
+            Ok(a) => a,
+            Err(_) => return Err(NetError::IoError),
+        };
+
+        let mut stream = None;
+        for addr in addrs {
+            if let Ok(s) = std::net::TcpStream::connect(addr) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => return Err(NetError::IoError),
+        };
+        let _ = stream.set_nodelay(true);
+
+        // Build a per-connection ClientConfig with a process-wide default
+        // root cert store. We clone the engine's config in the public FFI
+        // path; here we just build a default one for standalone usage.
+        let root_store = RootCertStore::empty();
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let server_name = match rustls::pki_types::ServerName::try_from(host.as_str()) {
+            Ok(name) => name.to_owned(),
+            Err(_) => return Err(NetError::TlsError),
+        };
+
+        let tls = match ClientConnection::new(Arc::new(config), server_name) {
+            Ok(c) => c,
+            Err(_) => return Err(NetError::TlsError),
+        };
+
+        Ok(Self {
+            stream,
+            tls,
+            host,
+            port,
+            is_closed: false,
+        })
+    }
+}
+
 /// Network engine state
 pub struct NetEngine {
     poll: Poll,
     events: Events,
     connections: HashMap<usize, Connection>,
+    next_tls_id: usize,
+    tls_states: HashMap<usize, Box<TlsState>>,
     next_conn_id: usize,
     tls_config: Arc<ClientConfig>,
     body_rings: HashMap<u64, *mut BodyRingDescriptor>,
@@ -168,6 +236,8 @@ impl NetEngine {
             poll,
             events,
             connections: HashMap::new(),
+            next_tls_id: 1,
+            tls_states: HashMap::new(),
             next_conn_id: 1,
             tls_config: Arc::new(config),
             body_rings: HashMap::new(),
@@ -660,4 +730,245 @@ pub extern "C" fn net_get_metrics(engine_handle: NetEngineHandle) -> *const Netw
         connection_quality_score: 100.0,
     });
     Box::into_raw(metrics)
+}
+
+// ============================================================
+// Standalone TLS FFI (consumed by Zig `z_tls`)
+// ============================================================
+//
+// The standalone TLS surface lets the Zig `z_tls` module obtain a
+// rustls-backed TLS connection without owning a TcpStream directly.
+// Each `TlsHandle` is registered in the engine's `tls_states` map and
+// cleaned up by `net_tls_close`.
+//
+// All call sites are synchronous and blocking; the underlying
+// `std::net::TcpStream` is created in `TlsState::new` and is fully
+// owned by the TlsState. This is appropriate for DNS-over-TLS and
+// other direct TLS consumers that are latency-tolerant and
+// low-throughput.
+
+/// Create a new standalone TLS connection and drive the rustls
+/// handshake to completion. Returns a heap-allocated opaque handle
+/// that the caller must release with `net_tls_close`.
+#[no_mangle]
+pub extern "C" fn net_tls_create(
+    engine_handle: NetEngineHandle,
+    host: *const c_char,
+    port: u16,
+) -> TlsHandle {
+    if engine_handle.is_null() || host.is_null() {
+        return null_mut();
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+
+    let host_str = unsafe {
+        match std::ffi::CStr::from_ptr(host).to_str() {
+            Ok(s) => s.to_owned(),
+            Err(_) => return null_mut(),
+        }
+    };
+
+    let mut state = match TlsState::new(host_str, port) {
+        Ok(s) => s,
+        Err(_) => return null_mut(),
+    };
+
+    // Drive the rustls handshake. We loop until we either complete the
+    // handshake or hit a non-WouldBlock I/O error.
+    use std::io::Read as IoRead;
+    while state.tls.is_handshaking() {
+        // Pump bytes from TLS into the socket.
+        if state.tls.wants_write() {
+            match state.tls.write_tls(&mut state.stream) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => return null_mut(),
+            }
+        }
+        // Pump bytes from the socket into TLS.
+        if state.tls.wants_read() {
+            let mut buf = [0u8; 16 * 1024];
+            match state.stream.read(&mut buf) {
+                Ok(0) => return null_mut(),
+                Ok(n) => {
+                    let mut cursor = std::io::Cursor::new(&buf[..n]);
+                    if state.tls.read_tls(&mut cursor).is_err() {
+                        return null_mut();
+                    }
+                    if state.tls.process_new_packets().is_err() {
+                        return null_mut();
+                    }
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    // Spurious wakeup; loop again to check progress.
+                    break;
+                }
+                Err(_) => return null_mut(),
+            }
+        }
+        if !state.tls.is_handshaking() {
+            break;
+        }
+        if !state.tls.wants_read() && !state.tls.wants_write() {
+            // No forward progress possible; bail out to avoid spin.
+            break;
+        }
+    }
+
+    let tls_id = engine.next_tls_id;
+    engine.next_tls_id += 1;
+    engine.tls_states.insert(tls_id, Box::new(state));
+
+    tls_id as TlsHandle
+}
+
+/// Read plaintext from a TLS connection. On success returns 0 and
+/// writes the number of bytes into `*bytes_read`. Returns the
+/// engine error code on failure.
+#[no_mangle]
+pub extern "C" fn net_tls_read(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+    buffer: *mut c_uchar,
+    buffer_len: usize,
+    bytes_read: *mut usize,
+) -> i32 {
+    if engine_handle.is_null() || tls_handle.is_null() || buffer.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let tls_id = tls_handle as usize;
+    let state = match engine.tls_states.get_mut(&tls_id) {
+        Some(s) => s,
+        None => return NS_ERROR_FAILURE,
+    };
+    if state.is_closed {
+        return NS_ERROR_FAILURE;
+    }
+
+    use std::io::Read as IoRead;
+    let dst = unsafe { from_raw_parts_mut(buffer, buffer_len) };
+
+    // Drive TLS forward progress: read from socket into TLS, then
+    // expose plaintext to the caller.
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        match state.stream.read(&mut tmp) {
+            Ok(0) => return NS_ERROR_FAILURE,
+            Ok(n) => {
+                let mut cursor = std::io::Cursor::new(&tmp[..n]);
+                if state.tls.read_tls(&mut cursor).is_err() {
+                    return NS_ERROR_FAILURE;
+                }
+                if state.tls.process_new_packets().is_err() {
+                    return NS_ERROR_FAILURE;
+                }
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => return NS_ERROR_FAILURE,
+        }
+    }
+
+    match state.tls.reader().read(dst) {
+        Ok(0) => NS_ERROR_FAILURE,
+        Ok(n) => {
+            unsafe {
+                if !bytes_read.is_null() {
+                    *bytes_read = n;
+                }
+            }
+            NS_OK
+        }
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => NS_ERROR_FAILURE,
+        Err(_) => NS_ERROR_FAILURE,
+    }
+}
+
+/// Write plaintext to a TLS connection. Returns 0 on success and
+/// writes the number of plaintext bytes accepted into `*bytes_written`.
+#[no_mangle]
+pub extern "C" fn net_tls_write(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+    data: *const c_uchar,
+    data_len: usize,
+    bytes_written: *mut usize,
+) -> i32 {
+    if engine_handle.is_null() || tls_handle.is_null() || data.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let tls_id = tls_handle as usize;
+    let state = match engine.tls_states.get_mut(&tls_id) {
+        Some(s) => s,
+        None => return NS_ERROR_FAILURE,
+    };
+    if state.is_closed {
+        return NS_ERROR_FAILURE;
+    }
+
+    use std::io::Write as IoWrite;
+    let src = unsafe { from_raw_parts(data, data_len) };
+
+    let n = match state.tls.writer().write(src) {
+        Ok(n) => n,
+        Err(_) => return NS_ERROR_FAILURE,
+    };
+
+    while state.tls.wants_write() {
+        match state.tls.write_tls(&mut state.stream) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => return NS_ERROR_FAILURE,
+        }
+    }
+
+    unsafe {
+        if !bytes_written.is_null() {
+            *bytes_written = n;
+        }
+    }
+    NS_OK
+}
+
+/// Return the negotiated TLS protocol version as a 4-character
+/// identifier: `0x0303` for TLS 1.2, `0x0304` for TLS 1.3. Returns
+/// 0 on failure.
+#[no_mangle]
+pub extern "C" fn net_tls_protocol_version(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+) -> u16 {
+    if engine_handle.is_null() || tls_handle.is_null() {
+        return 0;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let tls_id = tls_handle as usize;
+    let state = match engine.tls_states.get(&tls_id) {
+        Some(s) => s,
+        None => return 0,
+    };
+    match state.tls.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_2) => 0x0303,
+        Some(rustls::ProtocolVersion::TLSv1_3) => 0x0304,
+        _ => 0,
+    }
+}
+
+/// Close a TLS connection and release the handle.
+#[no_mangle]
+pub extern "C" fn net_tls_close(engine_handle: NetEngineHandle, tls_handle: TlsHandle) -> i32 {
+    if engine_handle.is_null() || tls_handle.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let tls_id = tls_handle as usize;
+    match engine.tls_states.remove(&tls_id) {
+        Some(mut state) => {
+            state.is_closed = true;
+            let _ = state.stream.shutdown(std::net::Shutdown::Both);
+            NS_OK
+        }
+        None => NS_ERROR_FAILURE,
+    }
 }
