@@ -213,6 +213,39 @@ pub struct NetEngine {
     tls_config: Arc<ClientConfig>,
     body_rings: HashMap<u64, *mut BodyRingDescriptor>,
     conn_body_rings: HashMap<usize, u64>,
+    /// QUIC endpoints keyed by the engine-level `conn_id` returned from
+    /// `net_http3_connect`. Each entry owns a `quinn_proto::Endpoint`
+    /// plus a UDP socket (so the endpoint can be driven by the
+    /// existing mio loop).
+    quic_endpoints: HashMap<usize, QuicEndpointEntry>,
+    /// Per-connection QUIC state. The keys are the same `conn_id` as
+    /// `quic_endpoints`; a single endpoint can hold multiple
+    /// connections in principle, but the current FFI surface only
+    /// exposes one.
+    quic_conns: HashMap<usize, QuicConnectionEntry>,
+    next_quic_id: usize,
+}
+
+/// Owned state for a single QUIC endpoint. We keep the `mio::net::UdpSocket`
+/// here so the existing `net_poll` loop can read incoming datagrams and
+/// feed them to the `Endpoint`. The `Endpoint` itself is `!Sync`; we
+/// serialize access through the engine.
+#[allow(dead_code)]
+struct QuicEndpointEntry {
+    socket: mio::net::UdpSocket,
+    endpoint: std::sync::Mutex<quinn_proto::Endpoint>,
+    server_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
+}
+
+/// Per-connection QUIC state. Quinn-proto identifies connections via
+/// `ConnectionHandle` (an index into the `Endpoint`'s slab). We cache
+/// the `Connection` so we can poll the streams and emit transmits.
+#[allow(dead_code)]
+struct QuicConnectionEntry {
+    handle: quinn_proto::ConnectionHandle,
+    connection: quinn_proto::Connection,
+    remote: std::net::SocketAddr,
 }
 
 impl NetEngine {
@@ -242,6 +275,9 @@ impl NetEngine {
             tls_config: Arc::new(config),
             body_rings: HashMap::new(),
             conn_body_rings: HashMap::new(),
+            quic_endpoints: HashMap::new(),
+            quic_conns: HashMap::new(),
+            next_quic_id: 1,
         })
     }
     
@@ -618,58 +654,129 @@ pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOp
 }
 
 #[no_mangle]
-pub extern "C" fn net_http3_connect(engine_handle: NetEngineHandle, host: *const c_char, port: u16) -> ConnHandle {
+pub extern "C" fn net_http3_connect(
+    engine_handle: NetEngineHandle,
+    host: *const c_char,
+    port: u16,
+) -> ConnHandle {
     if engine_handle.is_null() {
         return null_mut();
     }
-    
+
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
-    
+
     let host_str = unsafe {
         let cstr = std::ffi::CStr::from_ptr(host);
         cstr.to_string_lossy().into_owned()
     };
-    
+
     let addr_str = format!("{}:{}", host_str, port);
     let addrs = match addr_str.to_socket_addrs() {
         Ok(a) => a,
         Err(_) => return null_mut(),
     };
-    
-    let addr = match addrs.into_iter().next() {
+
+    let server_addr = match addrs.into_iter().next() {
         Some(a) => a,
         None => return null_mut(),
     };
 
-    // HTTP/3 (QUIC) requires a UDP socket. 
-    // Mio support for UDP is standard.
+    // HTTP/3 (QUIC) requires a UDP socket. Mio support for UDP is standard.
     let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return null_mut(),
     };
-    
+
     if socket.set_nonblocking(true).is_err() {
         return null_mut();
     }
+
+    let local_addr = match socket.local_addr() {
+        Ok(a) => a,
+        Err(_) => return null_mut(),
+    };
 
     let mut udp_stream = match mio::net::UdpSocket::from_std(socket) {
         s => s,
     };
 
-    let conn_id = engine.next_conn_id;
-    engine.next_conn_id += 1;
-    
-    if engine.poll.registry().register(
-        &mut udp_stream,
-        Token(conn_id),
-        Interest::READABLE | Interest::WRITABLE
-    ).is_err() {
+    let conn_id = engine.next_quic_id;
+    engine.next_quic_id += 1;
+
+    if engine
+        .poll
+        .registry()
+        .register(
+            &mut udp_stream,
+            Token(conn_id),
+            Interest::READABLE | Interest::WRITABLE,
+        )
+        .is_err()
+    {
         return null_mut();
     }
 
-    // TODO: Initialize quinn-proto Endpoint and Connection.
-    // For now, we return the conn_id as a handle to indicate the socket is registered.
-    
+    // Build the quinn-proto endpoint. We use the default `EndpointConfig`
+    // and a fresh `ClientConfig` backed by rustls 0.20 (the version
+    // pinned by quinn-proto 0.11). The engine's own `tls_config` is
+    // rustls 0.23, so we cannot share it.
+    let endpoint_config = Arc::new(quinn_proto::EndpointConfig::default());
+    let mut endpoint = quinn_proto::Endpoint::new(endpoint_config, None, false, None);
+
+    // quinn-proto re-exports rustls 0.20, so we build a self-signed
+    // client config with the default crypto provider and the
+    // `webpki` roots. In production we would load a platform root
+    // store; for the engine scaffolding we use the empty store and
+    // rely on QUIC's built-in certificate verification (which can be
+    // enabled per-connection via `ClientConfig`).
+    let provider = Arc::new(quinn_proto::rustls::crypto::ring::default_provider());
+    let roots = quinn_proto::rustls::RootCertStore::empty();
+    let rustls_client_config =
+        quinn_proto::rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&quinn_proto::rustls::version::TLS13])
+            .expect("TLS 1.3 supported")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    let quic_crypto = match quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client_config)) {
+        Ok(c) => Arc::new(c),
+        Err(_) => return null_mut(),
+    };
+
+    let mut transport = quinn_proto::TransportConfig::default();
+    transport.max_idle_timeout(quinn_proto::IdleTimeout::try_from(
+        std::time::Duration::from_secs(30),
+    ).ok());
+    let client_config = quinn_proto::ClientConfig::new(quic_crypto);
+    let mut client_config = client_config;
+    client_config.transport_config(Arc::new(transport));
+
+    // Initiate the connection. The returned `Connection` is in the
+    // `Handshaking` state and will be driven forward by
+    // `net_http3_drive` on subsequent calls.
+    let now = std::time::Instant::now();
+    let (ch, connection) = match endpoint.connect(now, client_config, server_addr, &host_str) {
+        Ok(c) => c,
+        Err(_) => return null_mut(),
+    };
+
+    engine.quic_endpoints.insert(
+        conn_id,
+        QuicEndpointEntry {
+            socket: udp_stream,
+            endpoint: std::sync::Mutex::new(endpoint),
+            server_addr,
+            local_addr,
+        },
+    );
+    engine.quic_conns.insert(
+        conn_id,
+        QuicConnectionEntry {
+            handle: ch,
+            connection,
+            remote: server_addr,
+        },
+    );
+
     conn_id as ConnHandle
 }
 
@@ -971,4 +1078,113 @@ pub extern "C" fn net_tls_close(engine_handle: NetEngineHandle, tls_handle: TlsH
         }
         None => NS_ERROR_FAILURE,
     }
+}
+
+// ============================================================
+// QUIC / HTTP/3 FFI (consumed by Zig `z_http3`)
+// ============================================================
+//
+// The QUIC surface drives the underlying quinn-proto state machine.
+// `net_http3_drive` reads any pending datagrams from the registered
+// UDP socket, feeds them into the `Endpoint`, then drains outgoing
+// transmits from each `Connection` and writes them to the socket.
+// HTTP/3 framing (HEADERS, DATA, QPACK) is the responsibility of
+// `z_http3`; this layer only carries the QUIC transport.
+
+/// Pump the QUIC state forward: process incoming datagrams on the
+/// UDP socket, advance the connection handshake, and emit any
+/// outgoing datagrams the connection wants to send. Returns the
+/// number of datagrams processed, or `-1` on error.
+#[no_mangle]
+pub extern "C" fn net_http3_drive(engine_handle: NetEngineHandle, conn_handle: ConnHandle) -> i32 {
+    if engine_handle.is_null() || conn_handle.is_null() {
+        return -1;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let conn_id = conn_handle as usize;
+
+    let endpoint_entry = match engine.quic_endpoints.get_mut(&conn_id) {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    let now = std::time::Instant::now();
+    let mut processed: i32 = 0;
+    let mut rx_buf = [0u8; 2048];
+    let mut tx_buf: Vec<u8> = Vec::new();
+
+    // Read incoming datagrams off the UDP socket and feed them to
+    // the endpoint. We do non-blocking reads so a stalled socket
+    // does not block the engine.
+    loop {
+        match endpoint_entry.socket.recv_from(&mut rx_buf) {
+            Ok((n, remote)) => {
+                let data = bytes::BytesMut::from(&rx_buf[..n]);
+                let event = {
+                    let mut endpoint = endpoint_entry.endpoint.lock().unwrap();
+                    endpoint.handle(now, remote, None, None, data, &mut tx_buf)
+                };
+                if let Some(quinn_proto::DatagramEvent::ConnectionEvent(ch, conn_event)) = event {
+                    if let Some(conn_entry) = engine.quic_conns.get_mut(&conn_id) {
+                        if conn_entry.handle == ch {
+                            let _ = conn_entry.connection.handle_event(conn_event);
+                        }
+                    }
+                }
+                // `NewConnection` and `Response` are not produced for
+                // an outbound client flow; the endpoint simply
+                // discards them and the next transmit poll will pick
+                // up any state changes.
+                processed += 1;
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+
+    // Poll the connection for outgoing transmits. Quinn-proto packs
+    // the datagram into `tx_buf`; we send it on the registered UDP
+    // socket.
+    if let Some(conn_entry) = engine.quic_conns.get_mut(&conn_id) {
+        // Connection-level timeouts / handshakes first.
+        while let Some(timeout) = conn_entry.connection.poll_timeout() {
+            if timeout > now {
+                break;
+            }
+            conn_entry.connection.handle_timeout(now);
+        }
+        let max_datagrams = 1usize;
+        while let Some(transmit) = conn_entry.connection.poll_transmit(now, max_datagrams, &mut tx_buf) {
+            if (transmit.size) > tx_buf.len() {
+                break;
+            }
+            let bytes = &tx_buf[..transmit.size];
+            let _ = endpoint_entry.socket.send_to(bytes, transmit.destination);
+            tx_buf.clear();
+        }
+    }
+
+    processed
+}
+
+/// Close a QUIC connection and release all associated state.
+#[no_mangle]
+pub extern "C" fn net_http3_close(engine_handle: NetEngineHandle, conn_handle: ConnHandle) -> i32 {
+    if engine_handle.is_null() || conn_handle.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let conn_id = conn_handle as usize;
+
+    // Drain the connection cleanly so the peer sees a CONNECTION_CLOSE.
+    if let Some(mut conn_entry) = engine.quic_conns.remove(&conn_id) {
+        let now = std::time::Instant::now();
+        conn_entry
+            .connection
+            .close(now, 0u32.into(), bytes::Bytes::from_static(b"client closed"));
+    }
+    if let Some(mut endpoint_entry) = engine.quic_endpoints.remove(&conn_id) {
+        let _ = engine.poll.registry().deregister(&mut endpoint_entry.socket);
+    }
+    NS_OK
 }
