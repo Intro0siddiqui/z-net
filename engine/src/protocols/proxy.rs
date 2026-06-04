@@ -181,6 +181,7 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                             semi_offset = idx + 1;
                             break;
                         } else if c == '\n' || (!c.is_whitespace() && c != '\r') {
+                            semi_offset = idx;
                             break;
                         }
                     }
@@ -189,8 +190,12 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                     (after_start.trim_matches('"'), value_offset + after_start.len())
                 }
             } else {
-                let semi_idx = after_start.find(';').map(|idx| idx + 1).unwrap_or(after_start.len());
-                (after_start[..semi_idx.saturating_sub(1)].trim(), value_offset + semi_idx)
+                let (val, semi_idx) = if let Some(idx) = after_start.find(';') {
+                    (after_start[..idx].trim(), idx + 1)
+                } else {
+                    (after_start.trim(), after_start.len())
+                };
+                (val, value_offset + semi_idx)
             };
             last_return = Some(v.to_string());
             pos += consumed;
@@ -205,15 +210,17 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                 let block = &block_with_brace[1..close];
                 if let Some(ret_off) = block.find("return ") {
                     let ret_stmt = &block[ret_off..];
-                    let ret_after_start = &ret_stmt["return ".len()..];
-                    let v = if ret_after_start.starts_with('"') {
-                        if let Some(close_quote) = ret_after_start[1..].find('"') {
-                            &ret_after_start[1..1 + close_quote]
+                    let ret_after = ret_stmt["return ".len()..].trim();
+                    let v = if ret_after.starts_with('"') {
+                        if let Some(close_quote) = ret_after[1..].find('"') {
+                            &ret_after[1..1 + close_quote]
                         } else {
-                            ret_after_start.trim_matches('"')
+                            ret_after.trim_matches('"')
                         }
+                    } else if let Some(semi) = ret_after.find(';') {
+                        ret_after[..semi].trim()
                     } else {
-                        ret_after_start.trim()
+                        ret_after.trim()
                     };
                     last_return = Some(v.to_string());
                 }
