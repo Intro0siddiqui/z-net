@@ -168,22 +168,29 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
         pos += skipped;
 
         if s.starts_with("return ") {
-            let after = s["return ".len()..].trim();
-            let (v, consumed) = if after.starts_with('"') {
-                if let Some(close_quote) = after[1..].find('"') {
-                    let val = &after[1..1 + close_quote];
-                    let rest = &after[1 + close_quote..];
-                    let semi_idx = rest.find(';').map(|idx| 1 + close_quote + idx + 1).unwrap_or(after.len());
-                    (val, "return ".len() + semi_idx)
+            let return_len = "return ".len();
+            let value_offset = return_len + (s[return_len..].len() - s[return_len..].trim_start().len());
+            let after_start = &s[value_offset..];
+            let (v, consumed) = if after_start.starts_with('"') {
+                if let Some(close_quote) = after_start[1..].find('"') {
+                    let val = &after_start[1..1 + close_quote];
+                    let after_quote = &after_start[1 + close_quote..];
+                    let mut semi_offset = after_quote.len();
+                    for (idx, c) in after_quote.char_indices() {
+                        if c == ';' {
+                            semi_offset = idx + 1;
+                            break;
+                        } else if c == '\n' || (!c.is_whitespace() && c != '\r') {
+                            break;
+                        }
+                    }
+                    (val, value_offset + 1 + close_quote + semi_offset)
                 } else {
-                    let val = after.trim_matches('"');
-                    let semi_idx = after.find(';').map(|idx| idx + 1).unwrap_or(after.len());
-                    (val, "return ".len() + semi_idx)
+                    (after_start.trim_matches('"'), value_offset + after_start.len())
                 }
             } else {
-                let semi_idx = after.find(';').map(|idx| idx + 1).unwrap_or(after.len());
-                let val = after[..semi_idx.saturating_sub(1)].trim();
-                (val, "return ".len() + semi_idx)
+                let semi_idx = after_start.find(';').map(|idx| idx + 1).unwrap_or(after_start.len());
+                (after_start[..semi_idx.saturating_sub(1)].trim(), value_offset + semi_idx)
             };
             last_return = Some(v.to_string());
             pos += consumed;
@@ -198,17 +205,15 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                 let block = &block_with_brace[1..close];
                 if let Some(ret_off) = block.find("return ") {
                     let ret_stmt = &block[ret_off..];
-                    let after = ret_stmt["return ".len()..].trim();
-                    let v = if after.starts_with('"') {
-                        if let Some(close_quote) = after[1..].find('"') {
-                            &after[1..1 + close_quote]
+                    let ret_after_start = &ret_stmt["return ".len()..];
+                    let v = if ret_after_start.starts_with('"') {
+                        if let Some(close_quote) = ret_after_start[1..].find('"') {
+                            &ret_after_start[1..1 + close_quote]
                         } else {
-                            after.trim_matches('"')
+                            ret_after_start.trim_matches('"')
                         }
-                    } else if let Some(semi) = after.find(';') {
-                        after[..semi].trim()
                     } else {
-                        after.trim()
+                        ret_after_start.trim()
                     };
                     last_return = Some(v.to_string());
                 }
