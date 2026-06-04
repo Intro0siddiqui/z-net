@@ -155,28 +155,47 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
     let marker = "FindProxyForURL";
     let idx = src.find(marker)?;
     let body_start = src[idx..].find('{')?;
-    let body = &src[idx + body_start + 1..];
-    let end = match_brace(body)?;
-    let body = &body[..end];
-    // Tokenize: split on whitespace and "();,!|&=<>+-*/\"'"
+    let body_with_brace = &src[idx + body_start..];
+    let end = match_brace(body_with_brace)?;
+    let body = &body_with_brace[1..end];
+
     let mut last_return: Option<String> = None;
-    for stmt in body.split(';') {
-        let s = stmt.trim();
+    let mut pos = 0;
+    while pos < body.len() {
+        let rest = &body[pos..];
+        let s = rest.trim_start();
+        let skipped = rest.len() - s.len();
+        pos += skipped;
+
         if s.starts_with("return ") {
-            let v = s["return ".len()..].trim().trim_matches('"');
+            let after = s["return ".len()..].trim();
+            let v = after.trim_matches('"');
             last_return = Some(v.to_string());
+            if let Some(semi) = body[pos..].find(';') {
+                pos += semi + 1;
+            } else {
+                break;
+            }
         } else if s.starts_with("if ") {
-            let cond = &s["if ".len()..];
-            if eval_cond(cond, url, host) {
-                // Scan forward for the return inside this if-block.
-                let remaining = &body[body[s.len()..].len()..];
-                if let Some(close) = remaining.find('}') {
-                    let block = &remaining[..close];
-                    if let Some(ret) = block.find("return ") {
-                        let v = block[ret + "return ".len()..].trim().trim_matches('"');
-                        last_return = Some(v.to_string());
-                    }
+            let cond_end = body[pos..].find('{')?;
+            let cond = s["if ".len()..cond_end].trim();
+            let matched = eval_cond(cond, url, host);
+            pos += cond_end;
+            let block_with_brace = &body[pos..];
+            let close = match_brace(block_with_brace)?;
+            if matched {
+                let block = &block_with_brace[1..close];
+                if let Some(ret_off) = block.find("return ") {
+                    let v = block[ret_off + "return ".len()..].trim().trim_matches('"');
+                    last_return = Some(v.to_string());
                 }
+            }
+            pos += close + 1;
+        } else {
+            if let Some(semi) = body[pos..].find(';') {
+                pos += semi + 1;
+            } else {
+                break;
             }
         }
     }
