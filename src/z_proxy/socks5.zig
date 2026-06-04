@@ -5,7 +5,6 @@
 //! handshake, just as if it had connected directly to the target host.
 
 const std = @import("std");
-const net = std.net;
 const ProxyHop = @import("proxy.zig").ProxyHop;
 const Socket = @import("../z_socket/socket.zig").Socket;
 

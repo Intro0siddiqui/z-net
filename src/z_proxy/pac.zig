@@ -32,7 +32,7 @@ pub const PacEngine = struct {
     /// The interpreter is intentionally a parser, not a full JS engine -
     /// if the script uses anything we don't understand we fall back to
     /// `DIRECT` and log a warning upstream.
-    pub fn findProxyForURL(self: *const Self, url: []const u8, host: []const u8) ?PacResult {
+    pub     pub fn findProxyForURL(self: *const Self, url: []const u8, host: []const u8) !?PacResult {
         const marker = "FindProxyForURL";
         const idx = std.mem.indexOf(u8, self.source, marker) orelse return null;
         const body_start = std.mem.indexOfScalar(u8, self.source[idx..], '{') orelse return null;
@@ -57,8 +57,8 @@ pub const PacEngine = struct {
             if (std.mem.eql(u8, tok, "if")) {
                 // Push placeholder - actual condition evaluation
                 // is the "minimal PAC" set listed below.
-                const cond = evalCond(&it, url, host) orelse false;
-                cond_stack.append(cond) catch {};
+                const cond = try evalCond(&it, url, host) orelse false;
+                cond_stack.append(cond) catch @panic("OOM in PAC condition stack");
                 _ = ops_stack.append('?') catch {};
             } else if (std.mem.eql(u8, tok, "else")) {
                 _ = cond_stack;
@@ -79,7 +79,7 @@ pub const PacEngine = struct {
         return null;
     }
 
-    fn evalCond(it: *std.mem.TokenIterator(u8, .any), url: []const u8, host: []const u8) ?bool {
+    fn evalCond(it: *std.mem.TokenIterator(u8, .any), url: []const u8, host: []const u8) !?bool {
         const fn_name = it.next() orelse return null;
         const open_paren_consumed = it.next(); // "("
         _ = open_paren_consumed;
@@ -92,17 +92,16 @@ pub const PacEngine = struct {
             return std.mem.endsWith(u8, host, arg1);
         }
         if (std.mem.eql(u8, fn_name, "isInNet")) {
-            // arg1: host, arg2: network, arg3: mask (ignored for stub).
-            return std.mem.endsWith(u8, host, arg2);
+            @panic("isInNet: network/mask args not yet supported in PAC engine");
         }
         if (std.mem.eql(u8, fn_name, "shExpMatch")) {
             return globMatch(arg2, arg1);
         }
         if (std.mem.eql(u8, fn_name, "localHostOrDomainIs")) {
-            return std.mem.eql(u8, host, arg1) orelse false;
+            return std.mem.eql(u8, host, arg1);
         }
         _ = url;
-        return null;
+        return error.UnsupportedPacFunction;
     }
 };
 
@@ -145,11 +144,11 @@ test "PAC interpreter handles the common predicates" {
     ;
     var engine = PacEngine.init(allocator, src);
 
-    if (engine.findProxyForURL("http://intra", "intra")) |r| {
+    if (try engine.findProxyForURL("http://intra", "intra")) |r| {
         try std.testing.expectEqualStrings("DIRECT", r.proxy);
     } else return error.TestExpectedSome;
 
-    if (engine.findProxyForURL("http://api.corp.example/x", "api.corp.example")) |r| {
+    if (try engine.findProxyForURL("http://api.corp.example/x", "api.corp.example")) |r| {
         try std.testing.expectEqualStrings("PROXY proxy.corp.example:3128", r.proxy);
     } else return error.TestExpectedSome;
 }

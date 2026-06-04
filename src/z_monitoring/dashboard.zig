@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const http = std.http;
 const mem = std.mem;
 
@@ -51,69 +51,71 @@ pub const DashboardServer = struct {
         };
     }
 
-    pub fn start(self: *DashboardServer) !void {
-        const address = try net.Address.parseIp("127.0.0.1", self.port);
-        var server = try address.listen(.{ .reuse_address = true });
-        defer server.deinit();
+    pub fn start(self: *DashboardServer, io: *std.Io) !void {
+        const address = try net.IpAddress.parseIp4("127.0.0.1", self.port);
+        var server = try address.listen(io.*, .{ .reuse_address = true });
+        defer server.deinit(io.*);
 
         std.debug.print("Dashboard server listening on http://127.0.0.1:{d}\n", .{self.port});
 
         while (true) {
-            const conn = try server.accept();
-            _ = try std.Thread.spawn(.{}, handleConnection, .{ self.allocator, conn });
+            const conn = try server.accept(io.*);
+            _ = try std.Thread.spawn(.{}, handleConnection, .{ self.allocator, conn, io.* });
         }
-    }
-
-    fn handleConnection(allocator: mem.Allocator, conn: net.Server.Connection) void {
-        defer conn.stream.close();
-
-        var read_buffer: [4096]u8 = undefined;
-        var server = http.Server.init(conn, &read_buffer);
-
-        var request = server.receiveHead() catch |err| {
-            std.debug.print("Error receiving head: {}\n", .{err});
-            return;
-        };
-
-        if (mem.eql(u8, request.head.target, "/") or mem.eql(u8, request.head.target, "/dashboard")) {
-            handleRoot(allocator, &request) catch |err| {
-                std.debug.print("Error handling root: {}\n", .{err});
-            };
-        } else if (mem.eql(u8, request.head.target, "/api/metrics")) {
-            handleMetrics(allocator, &request) catch |err| {
-                std.debug.print("Error handling metrics: {}\n", .{err});
-            };
-        } else {
-            handleNotFound(&request) catch |err| {
-                std.debug.print("Error handling not found: {}\n", .{err});
-            };
-        }
-    }
-
-    fn handleRoot(allocator: mem.Allocator, request: *http.Server.Request) !void {
-        _ = allocator;
-        var response = try request.respondHead(.ok, .{
-            .content_type = .{ .override = "text/html" },
-        });
-        try response.writeAll(dashboard_html);
-        try response.finish();
-    }
-
-    fn handleMetrics(allocator: mem.Allocator, request: *http.Server.Request) !void {
-        _ = allocator;
-        var response = try request.respondHead(.ok, .{
-            .content_type = .{ .override = "application/json" },
-        });
-        try response.writeAll("{\"status\":\"ok\",\"metrics\":[]}");
-        try response.finish();
-    }
-
-    fn handleNotFound(request: *http.Server.Request) !void {
-        var response = try request.respondHead(.not_found, .{});
-        try response.writeAll("Not Found");
-        try response.finish();
     }
 };
+
+fn handleConnection(allocator: mem.Allocator, conn: net.Stream, io: std.Io) void {
+    defer conn.close(io);
+
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
+    var reader = net.Stream.Reader.init(conn, io, &read_buf);
+    var writer = net.Stream.Writer.init(conn, io, &write_buf);
+
+    var server = http.Server.init(&reader.interface, &writer.interface);
+
+    var request = server.receiveHead() catch |err| {
+        std.debug.print("Error receiving head: {}\n", .{err});
+        return;
+    };
+
+    if (mem.eql(u8, request.head.target, "/") or mem.eql(u8, request.head.target, "/dashboard")) {
+        handleRoot(allocator, &request) catch |err| {
+            std.debug.print("Error handling root: {}\n", .{err});
+        };
+    } else if (mem.eql(u8, request.head.target, "/api/metrics")) {
+        handleMetrics(allocator, &request) catch |err| {
+            std.debug.print("Error handling metrics: {}\n", .{err});
+        };
+    } else {
+        handleNotFound(&request) catch |err| {
+            std.debug.print("Error handling not found: {}\n", .{err});
+        };
+    }
+}
+
+fn handleRoot(allocator: mem.Allocator, request: *http.Server.Request) !void {
+    _ = allocator;
+    const headers = [_]http.Header{.{ .name = "Content-Type", .value = "text/html" }};
+    try request.respond(dashboard_html, .{
+        .extra_headers = &headers,
+    });
+}
+
+fn handleMetrics(allocator: mem.Allocator, request: *http.Server.Request) !void {
+    _ = allocator;
+    const headers = [_]http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try request.respond("{\"status\":\"ok\",\"metrics\":[]}", .{
+        .extra_headers = &headers,
+    });
+}
+
+fn handleNotFound(request: *http.Server.Request) !void {
+    try request.respond("Not Found", .{
+        .status = .not_found,
+    });
+}
 
 const dashboard_html =
     \\<!DOCTYPE html>

@@ -218,7 +218,7 @@ fn demoSecurityValidation(allocator: std.mem.Allocator) !void {
     defer auditor.deinit();
 
     // Create a mock security manager for the auditor
-    var mock_manager = z_security.SecurityManager.init(allocator, high_security_config) catch unreachable;
+    var mock_manager = try z_security.SecurityManager.init(allocator, high_security_config);
     auditor.setSecurityManager(&mock_manager);
 
     // Generate security report

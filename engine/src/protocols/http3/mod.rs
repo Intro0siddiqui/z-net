@@ -1,5 +1,4 @@
 pub mod qpack;
-use quinn_proto;
 
 pub struct Http3Handler {
     // QUIC and HTTP/3 state

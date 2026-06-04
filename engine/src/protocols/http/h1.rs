@@ -1,4 +1,4 @@
-use httparse;
+use httparse as _;
 
 pub struct Http1Handler {
     // State for HTTP/1.1 parsing and handling

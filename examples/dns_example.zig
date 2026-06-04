@@ -285,10 +285,10 @@ pub fn main() !void {
         }
 
         if (part_index == 4) {
-            const reverse_name = std.fmt.allocPrint(allocator, 
+            const reverse_name = try std.fmt.allocPrint(allocator, 
                 "{}.{}.{}.{}.in-addr.arpa", .{
                     ip_parts[3], ip_parts[2], ip_parts[1], ip_parts[0]
-                }) catch unreachable;
+                });
             defer allocator.free(reverse_name);
 
             std.log.info("🔄 Reverse lookup: {}", .{reverse_name});

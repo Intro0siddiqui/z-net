@@ -40,7 +40,7 @@ pub const CICDIntegrationTests = struct {
     var pipeline_configs: []PipelineConfig = undefined;
 
     pub fn init(allocator: std.mem.Allocator) CICDIntegrationTests {
-        var configs = allocator.alloc(PipelineConfig, 3) catch unreachable;
+        var configs = try allocator.alloc(PipelineConfig, 3);
         
         configs[0] = PipelineConfig{
             .name = "GitHub Actions",
