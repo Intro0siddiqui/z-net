@@ -168,12 +168,25 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
         pos += skipped;
 
         if s.starts_with("return ") {
-            let semi = body[pos..].find(';').unwrap_or(body[pos..].len());
-            let stmt = &body[pos..pos + semi];
-            let after = stmt["return ".len()..].trim();
-            let v = after.trim_matches('"');
+            let after = s["return ".len()..].trim();
+            let (v, consumed) = if after.starts_with('"') {
+                if let Some(close_quote) = after[1..].find('"') {
+                    let val = &after[1..1 + close_quote];
+                    let rest = &after[1 + close_quote..];
+                    let semi_idx = rest.find(';').map(|idx| 1 + close_quote + idx + 1).unwrap_or(after.len());
+                    (val, "return ".len() + semi_idx)
+                } else {
+                    let val = after.trim_matches('"');
+                    let semi_idx = after.find(';').map(|idx| idx + 1).unwrap_or(after.len());
+                    (val, "return ".len() + semi_idx)
+                }
+            } else {
+                let semi_idx = after.find(';').map(|idx| idx + 1).unwrap_or(after.len());
+                let val = after[..semi_idx.saturating_sub(1)].trim();
+                (val, "return ".len() + semi_idx)
+            };
             last_return = Some(v.to_string());
-            pos += semi + 1;
+            pos += consumed;
         } else if s.starts_with("if ") {
             let cond_end = s.find('{')?;
             let cond = s["if ".len()..cond_end].trim();
@@ -185,9 +198,18 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                 let block = &block_with_brace[1..close];
                 if let Some(ret_off) = block.find("return ") {
                     let ret_stmt = &block[ret_off..];
-                    let semi = ret_stmt.find(';').unwrap_or(ret_stmt.len());
-                    let stmt = &ret_stmt[..semi];
-                    let v = stmt["return ".len()..].trim().trim_matches('"');
+                    let after = ret_stmt["return ".len()..].trim();
+                    let v = if after.starts_with('"') {
+                        if let Some(close_quote) = after[1..].find('"') {
+                            &after[1..1 + close_quote]
+                        } else {
+                            after.trim_matches('"')
+                        }
+                    } else if let Some(semi) = after.find(';') {
+                        after[..semi].trim()
+                    } else {
+                        after.trim()
+                    };
                     last_return = Some(v.to_string());
                 }
             }
