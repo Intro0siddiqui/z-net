@@ -190,8 +190,14 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                     (after_start.trim_matches('"'), value_offset + after_start.len())
                 }
             } else {
-                let (val, semi_idx) = if let Some(idx) = after_start.find(';') {
-                    (after_start[..idx].trim(), idx + 1)
+                let (val, semi_idx) = if let Some(nl_idx) = after_start.find('\n') {
+                    if let Some(semi_idx) = after_start[..nl_idx].find(';') {
+                        (after_start[..semi_idx].trim(), semi_idx + 1)
+                    } else {
+                        (after_start[..nl_idx].trim(), nl_idx + 1)
+                    }
+                } else if let Some(semi_idx) = after_start.find(';') {
+                    (after_start[..semi_idx].trim(), semi_idx + 1)
                 } else {
                     (after_start.trim(), after_start.len())
                 };
@@ -217,10 +223,13 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                         } else {
                             ret_after.trim_matches('"')
                         }
-                    } else if let Some(semi) = ret_after.find(';') {
-                        ret_after[..semi].trim()
                     } else {
-                        ret_after.trim()
+                        let line = ret_after.split('\n').next().unwrap_or("");
+                        if let Some(semi) = line.find(';') {
+                            line[..semi].trim()
+                        } else {
+                            line.trim()
+                        }
                     };
                     last_return = Some(v.to_string());
                 }
