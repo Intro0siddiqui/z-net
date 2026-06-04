@@ -158,25 +158,49 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
     let body = &src[idx + body_start + 1..];
     let end = match_brace(body)?;
     let body = &body[..end];
-    // Tokenize: split on whitespace and "();,!|&=<>+-*/\"'"
+
     let mut last_return: Option<String> = None;
-    for stmt in body.split(';') {
-        let s = stmt.trim();
+    let mut pos = 0;
+    while pos < body.len() {
+        let rest = &body[pos..];
+        let s = rest.trim_start();
+        let skipped = rest.len() - s.len();
+        pos += skipped;
+
         if s.starts_with("return ") {
-            let v = s["return ".len()..].trim().trim_matches('"');
+            let after = s["return ".len()..].trim();
+            let v = after.trim_matches('"');
             last_return = Some(v.to_string());
+            // advance past this statement
+            if let Some(semi) = body[pos..].find(';') {
+                pos += semi + 1;
+            } else {
+                break;
+            }
         } else if s.starts_with("if ") {
-            let cond = &s["if ".len()..];
-            if eval_cond(cond, url, host) {
-                // Scan forward for the return inside this if-block.
-                let remaining = &body[body[s.len()..].len()..];
-                if let Some(close) = remaining.find('}') {
-                    let block = &remaining[..close];
-                    if let Some(ret) = block.find("return ") {
-                        let v = block[ret + "return ".len()..].trim().trim_matches('"');
-                        last_return = Some(v.to_string());
-                    }
+            let cond_end = body[pos..].find('{')?;
+            let cond = &s["if ".len()..cond_end - skipped].trim();
+            let matched = eval_cond(cond, url, host);
+            // skip past the condition to the opening brace
+            pos += cond_end;
+            // find matching close brace
+            let block_body = &body[pos + 1..];
+            let close = match_brace(block_body)?;
+            if matched {
+                let block = &block_body[..close];
+                if let Some(ret_off) = block.find("return ") {
+                    let v = block[ret_off + "return ".len()..].trim().trim_matches('"');
+                    last_return = Some(v.to_string());
                 }
+            }
+            // advance past the entire block
+            pos += 1 + close + 1;
+        } else {
+            // skip to next semicolon
+            if let Some(semi) = body[pos..].find(';') {
+                pos += semi + 1;
+            } else {
+                break;
             }
         }
     }
