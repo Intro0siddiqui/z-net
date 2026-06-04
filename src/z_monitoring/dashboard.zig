@@ -51,29 +51,28 @@ pub const DashboardServer = struct {
         };
     }
 
-    pub fn start(self: *DashboardServer, io: *std.Io) !void {
-        const address = try net.IpAddress.parseIp4("127.0.0.1", self.port);
-        var server = try address.listen(io.*, .{ .reuse_address = true });
-        defer server.deinit(io.*);
+    pub fn start(self: *DashboardServer, io: std.Io) !void {
+        const address = try net.IpAddress.parse("127.0.0.1", self.port);
+        var server = try address.listen(io, .{ .reuse_address = true });
+        defer server.deinit(io);
 
         std.debug.print("Dashboard server listening on http://127.0.0.1:{d}\n", .{self.port});
 
         while (true) {
-            const conn = try server.accept(io.*);
-            _ = try std.Thread.spawn(.{}, handleConnection, .{ self.allocator, conn, io.* });
+            const stream = try server.accept(io);
+            _ = try std.Thread.spawn(.{}, handleConnection, .{ self.allocator, io, stream });
         }
     }
 };
 
-fn handleConnection(allocator: mem.Allocator, conn: net.Stream, io: std.Io) void {
-    defer conn.close(io);
+fn handleConnection(allocator: mem.Allocator, io: std.Io, stream: net.Stream) void {
+    defer stream.close(io);
 
-    var read_buf: [4096]u8 = undefined;
-    var write_buf: [4096]u8 = undefined;
-    var reader = net.Stream.Reader.init(conn, io, &read_buf);
-    var writer = net.Stream.Writer.init(conn, io, &write_buf);
-
-    var server = http.Server.init(&reader.interface, &writer.interface);
+    var recv_buffer: [4096]u8 = undefined;
+    var send_buffer: [4096]u8 = undefined;
+    var conn_reader = stream.reader(io, &recv_buffer);
+    var conn_writer = stream.writer(io, &send_buffer);
+    var server = http.Server.init(&conn_reader.interface, &conn_writer.interface);
 
     var request = server.receiveHead() catch |err| {
         std.debug.print("Error receiving head: {}\n", .{err});

@@ -10,12 +10,10 @@ pub fn main() !void {
 
     std.debug.print("Starting z-net Monitor...\n", .{});
 
-    // Initialize I/O runtime
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
-    var io = threaded.io();
+    const io = threaded.io();
 
-    // Initialize components
     var db_server = dashboard.DashboardServer.init(allocator, 8080);
     const config_val = validator.ConfigValidator.init(allocator);
     const health_chk = checker.HealthChecker.init(allocator);
@@ -23,6 +21,5 @@ pub fn main() !void {
     _ = config_val;
     _ = health_chk;
 
-    // Start dashboard
-    try db_server.start(&io);
+    try db_server.start(io);
 }
