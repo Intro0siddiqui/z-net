@@ -90,6 +90,9 @@ extern fn net_tls_protocol_version(
 
 extern fn net_tls_close(engine: ?*anyopaque, tls: TlsHandle) i32;
 
+extern fn net_tls_verify_result(engine: ?*anyopaque, tls: TlsHandle) i32;
+extern fn net_tls_peer_certificate(engine: ?*anyopaque, tls: TlsHandle, out: [*]u8, out_len: usize) i32;
+
 // ============================================================
 // Public API
 // ============================================================
@@ -99,6 +102,7 @@ extern fn net_tls_close(engine: ?*anyopaque, tls: TlsHandle) i32;
 /// `z_network_bridge` module; passing it is what gives the FFI access
 /// to the engine's `tls_states` registry.
 pub const TlsConnection = struct {
+    allocator: std.mem.Allocator,
     engine: ?*anyopaque,
     handle: TlsHandle = null,
     state: TlsConnectionState = .Initial,
@@ -111,9 +115,9 @@ pub const TlsConnection = struct {
     /// Initialize a TLS connection. The actual rustls handshake is
     /// deferred to `connect` because the host string needs to be
     /// null-terminated for the FFI boundary.
-    pub fn init(_allocator: std.mem.Allocator, host: []const u8) TlsError!Self {
-        _ = _allocator;
+    pub fn init(allocator: std.mem.Allocator, host: []const u8) TlsError!Self {
         return Self{
+            .allocator = allocator,
             .engine = null,
             .handle = null,
             .state = .Initial,
@@ -189,10 +193,17 @@ pub const TlsConnection = struct {
         return got;
     }
 
-    /// Get handshake information. The `peer_certificate` and
-    /// `handshake_time` fields are not yet populated by the FFI; the
-    /// other two are sourced from the negotiated protocol version.
+    /// Get handshake information. Populates `peer_certificate` from
+    /// the rustls FFI when the connection is established.
     pub fn getHandshakeInfo(self: *Self) TlsError!TlsHandshakeInfo {
+        if (self.state != .Established) return error.NotImplemented;
+        var cert_buf: [4096]u8 = undefined;
+        const cert_len = net_tls_peer_certificate(self.engine, self.handle, &cert_buf, cert_buf.len);
+        const peer_cert = if (cert_len > 0) blk: {
+            const owned = try self.allocator.alloc(u8, @intCast(cert_len));
+            @memcpy(owned, cert_buf[0..@intCast(cert_len)]);
+            break :blk owned;
+        } else null;
         return TlsHandshakeInfo{
             .protocol = switch (self.version) {
                 .tls_1_2 => "TLS 1.2",
@@ -203,18 +214,21 @@ pub const TlsConnection = struct {
                 .aes_256_gcm_sha384 => "TLS_AES_256_GCM_SHA384",
                 .chacha20_poly1305_sha256 => "TLS_CHACHA20_POLY1305_SHA256",
             },
-            .peer_certificate = null,
+            .peer_certificate = peer_cert,
             .handshake_time = 0,
         };
     }
 
-    /// Verify certificate. Always returns `true` because the FFI does
-    /// not yet expose rustls' WebPKI verification result. This matches
-    /// the previous stub behaviour; a follow-up PR can wire in
-    /// `net_tls_peer_certificates` and a rustls verifier.
+    /// Verify certificate using rustls's WebPKI verifier.
     pub fn verifyCertificate(self: *Self) TlsError!bool {
-        _ = self;
-        return true;
+        if (self.engine == null or self.handle == null) return error.LibraryNotLoaded;
+        const result = net_tls_verify_result(self.engine, self.handle);
+        return switch (result) {
+            0 => true,
+            -1 => false,
+            -2 => error.NotImplemented,
+            else => error.NotImplemented,
+        };
     }
 
     /// Close TLS connection.
@@ -248,9 +262,8 @@ pub const TlsSessionCache = struct {
 // Certificate validator
 pub const CertificateValidator = struct {
     /// Validate certificate chain
-    pub fn validateChain(cert_chain: []const u8) TlsError!bool {
-        _ = cert_chain;
-        return true;
+    pub fn validateChain(_: []const u8) TlsError!bool {
+        return error.NotImplemented;
     }
 
     /// Check certificate pinning
@@ -324,6 +337,8 @@ pub const BuildConfig = struct {
     pub const HAS_TLS_1_2 = true;
     pub const HAS_TLS_1_3 = true;
     pub const BACKEND = "rustls";
+    /// Set to true once the Rust FFI is linked and wired.
+    pub const WIRED = false;
 };
 
 test "TlsConnection.init stores host" {

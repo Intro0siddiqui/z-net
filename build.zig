@@ -9,10 +9,10 @@ pub fn build(b: *std.Build) void {
     // ============================================================
     const cargo_build = b.addSystemCommand(&.{
         "cargo", "build", "--release", "--lib",
-        "--manifest-path", "rust_net/Cargo.toml"
+        "--manifest-path", "engine/Cargo.toml"
     });
 
-    const rust_lib_path = b.path("rust_net/target/release/liblean_net.a");
+    const rust_lib_path = b.path("engine/target/release/libz_net_engine.a");
 
     // Module Definitions
     const z_socket = b.addModule("z_socket", .{
@@ -77,12 +77,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     // z_tls is backed by the rustls C ABI in lean-net (see
-    // `rust_net/src/lib.rs`). The static library itself is gated on a
+    // `engine/src/lib.rs`). The static library itself is gated on a
     // build option so the default test build does not need the full
     // transitive Rust dependency graph; passing `-Dznet-link-rust=true`
     // enables the FFI link for downstream executables that need a
     // real TLS implementation.
-    const link_rust = b.option(bool, "znet-link-rust", "Link the lean-net static lib (liblean_net.a) into Zig modules that consume its C ABI") orelse false;
+    const link_rust = b.option(bool, "znet-link-rust", "Link the z-net-engine static lib (libz_net_engine.a) into Zig modules that consume its C ABI") orelse false;
     const z_tls = b.createModule(.{
         .root_source_file = b.path("src/z_tls/tls.zig"),
         .target = target,

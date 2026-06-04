@@ -1268,33 +1268,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lean-net"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "brotli",
- "bytes",
- "cookie",
- "errno",
- "flate2",
- "h2",
- "httparse",
- "libc",
- "libgssapi",
- "log",
- "mio",
- "quinn-proto",
- "rustls 0.23.40",
- "socks",
- "sspi",
- "thiserror 1.0.69",
- "tokio",
- "trust-dns-resolver",
- "url",
- "zstd",
-]
-
-[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3493,6 +3466,33 @@ dependencies = [
  "quote 1.0.45",
  "syn 2.0.117",
  "synstructure",
+]
+
+[[package]]
+name = "z-net-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "brotli",
+ "bytes",
+ "cookie",
+ "errno",
+ "flate2",
+ "h2",
+ "httparse",
+ "libc",
+ "libgssapi",
+ "log",
+ "mio",
+ "quinn-proto",
+ "rustls 0.23.40",
+ "socks",
+ "sspi",
+ "thiserror 1.0.69",
+ "tokio",
+ "trust-dns-resolver",
+ "url",
+ "zstd",
 ]
 
 [[package]]

@@ -57,7 +57,10 @@ pub extern "C" fn znet_proxy_discover_env(out: *mut c_char, out_len: usize) -> c
         }
     }
     let bytes = buf.into_bytes();
-    let n = bytes.len().min(out_len - 1);
+    if bytes.len() >= out_len {
+        return -2;
+    }
+    let n = bytes.len();
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
         *out.add(n) = 0;
@@ -84,7 +87,7 @@ pub extern "C" fn znet_pac_evaluate(
     let host_str = unsafe { CStr::from_ptr(host) }.to_string_lossy().into_owned();
     let result = match evaluate_minimal(&src, &url_str, &host_str) {
         Some(s) => s,
-        None => return 0,
+        None => return -1,
     };
     let bytes = result.into_bytes();
     let n = bytes.len().min(out_len - 1);
@@ -165,8 +168,15 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
         } else if s.starts_with("if ") {
             let cond = &s["if ".len()..];
             if eval_cond(cond, url, host) {
-                // Look ahead for the `return` statement on the next line.
-                // The Zig interpreter is more precise; this is a stub.
+                // Scan forward for the return inside this if-block.
+                let remaining = &body[body[s.len()..].len()..];
+                if let Some(close) = remaining.find('}') {
+                    let block = &remaining[..close];
+                    if let Some(ret) = block.find("return ") {
+                        let v = block[ret + "return ".len()..].trim().trim_matches('"');
+                        last_return = Some(v.to_string());
+                    }
+                }
             }
         }
     }

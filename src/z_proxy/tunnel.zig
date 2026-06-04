@@ -10,7 +10,7 @@
 //! still expected to drive `z_tls::TlsConnection::connect` afterwards.
 
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const ProxyConfig = @import("proxy.zig").ProxyConfig;
 const ProxyHop = @import("proxy.zig").ProxyHop;
 const socks5 = @import("socks5.zig");
@@ -55,10 +55,10 @@ pub fn connectTunneled(
     return sock;
 }
 
-fn resolveHost(host: []const u8, port: u16) SocketError!net.Address {
+fn resolveHost(host: []const u8, port: u16) SocketError!net.IpAddress {
     // First try IPv4 literal, then DNS. In a real impl this would use
     // `z_dns`; we keep the dep light here to avoid a circular build.
-    if (net.Address.parseIp4(host, port)) |a| return a else |_| {}
+    if (net.IpAddress.parseIp4(host, port)) |a| return a else |_| {}
     // Real DNS resolution is handled one layer up in z_socket::getConnection
     // so we surface a typed error here; the proxy layer is a tunnel, not a
     // resolver.

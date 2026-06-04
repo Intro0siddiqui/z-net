@@ -1,6 +1,6 @@
 use url::Url;
 use std::ffi::{CString, CStr};
-use std::os::raw::{c_char, c_int};
+use std::os::raw::c_char;
 use std::collections::HashMap;
 
 extern "C" {

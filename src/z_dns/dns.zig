@@ -148,7 +148,7 @@ pub const DnsResolver = struct {
             var socket_conn = socket.Socket.create(self.io_ctx, .inet, .stream) catch continue;
             defer socket_conn.close(self.io_ctx);
 
-            const addr = std.net.Address.parseIp4(host, port) catch continue;
+            const addr = std.Io.net.IpAddress.parseIp4(host, port) catch continue;
             socket_conn.connect(self.io_ctx, addr) catch continue;
 
             // Wrap in TLS
@@ -192,7 +192,7 @@ pub const DnsResolver = struct {
             var socket_conn = socket.Socket.create(self.io_ctx, .inet, .dgram) catch continue;
             defer socket_conn.close(self.io_ctx);
 
-            const addr = std.net.Address.parseIp4(host, port) catch continue;
+            const addr = std.Io.net.IpAddress.parseIp4(host, port) catch continue;
 
             // Send DNS query
             const dns_query = try encodeDnsQuery(query);

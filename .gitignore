@@ -1,6 +1,6 @@
 .zig-cache/
 zig-out/
-rust_net/target/
+engine/target/
 *.o
 js_runtime_native
 js_runtime_znet
@@ -9,6 +9,6 @@ zig-bin/
 node_modules/
 mock_data.json
 target/
-rust_net/target/
+engine/target/
 
 src/z_pipeline/target/

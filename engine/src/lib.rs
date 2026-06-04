@@ -1080,6 +1080,75 @@ pub extern "C" fn net_tls_close(engine_handle: NetEngineHandle, tls_handle: TlsH
     }
 }
 
+/// Rustls verification result.
+#[repr(C)]
+pub enum TlsVerifyResult {
+    Accepted = 0,
+    Rejected = -1,
+    NotEstablished = -2,
+}
+
+/// Returns rustls's WebPKI verification result after the handshake.
+#[no_mangle]
+pub extern "C" fn net_tls_verify_result(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+) -> TlsVerifyResult {
+    if engine_handle.is_null() || tls_handle.is_null() {
+        return TlsVerifyResult::Rejected;
+    }
+    let engine = unsafe { &*(engine_handle as *mut NetEngine) };
+    let tls_id = tls_handle as usize;
+    match engine.tls_states.get(&tls_id) {
+        Some(state) => {
+            if state.is_closed {
+                return TlsVerifyResult::Rejected;
+            }
+            if state.tls.is_handshaking() {
+                return TlsVerifyResult::NotEstablished;
+            }
+            match state.tls.peer_certificates() {
+                Some(_) => TlsVerifyResult::Accepted,
+                None => TlsVerifyResult::Rejected,
+            }
+        }
+        None => TlsVerifyResult::Rejected,
+    }
+}
+
+/// Copies the peer certificate (first cert, DER-encoded) into the
+/// caller-provided buffer. Returns bytes written, or -1 on error.
+#[no_mangle]
+pub extern "C" fn net_tls_peer_certificate(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+    out: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if engine_handle.is_null() || tls_handle.is_null() || out.is_null() {
+        return -1;
+    }
+    let engine = unsafe { &*(engine_handle as *mut NetEngine) };
+    let tls_id = tls_handle as usize;
+    match engine.tls_states.get(&tls_id) {
+        Some(state) => {
+            match state.tls.peer_certificates() {
+                Some(certs) if !certs.is_empty() => {
+                    let first_cert = &certs[0];
+                    let der = first_cert.as_ref();
+                    let len = der.len().min(out_len);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(der.as_ptr(), out, len);
+                    }
+                    len as i32
+                }
+                _ => -1,
+            }
+        }
+        None => -1,
+    }
+}
+
 // ============================================================
 // QUIC / HTTP/3 FFI (consumed by Zig `z_http3`)
 // ============================================================

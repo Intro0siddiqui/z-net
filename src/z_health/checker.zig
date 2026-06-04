@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const mem = std.mem;
 
 pub const HealthStatus = enum {
@@ -23,11 +23,11 @@ pub const HealthChecker = struct {
         return .{ .allocator = allocator };
     }
 
-    pub fn checkTcpConnection(self: *HealthChecker, host: []const u8, port: u16, timeout_ns: u64) !HealthCheckResult {
+    pub fn checkTcpConnection(self: *HealthChecker, io_ctx: *std.Io, host: []const u8, port: u16, timeout_ns: u64) !HealthCheckResult {
         const start = std.time.milliTimestamp();
         const deadline = start + @as(i64, @intCast(timeout_ns / std.time.ns_per_ms));
 
-        const address = net.Address.parseIp(host, port) catch {
+        const address = net.IpAddress.parse(host, port) catch {
             return HealthCheckResult{
                 .name = "TCP Connection",
                 .status = .failing,
@@ -36,21 +36,28 @@ pub const HealthChecker = struct {
             };
         };
 
-        const stream = blk: {
-            var current = std.time.milliTimestamp();
-            while (current < deadline) {
-                if (net.tcpConnectToAddress(address)) |s| break :blk s;
+        var stream: net.Stream = undefined;
+        var connected = false;
+        var current = std.time.milliTimestamp();
+        while (current < deadline) {
+            if (net.Stream.connect(&address, io_ctx.*, .{})) |s| {
+                stream = s;
+                connected = true;
+                break;
+            } else |_| {
                 std.time.sleep(std.time.ns_per_ms * 10);
                 current = std.time.milliTimestamp();
             }
+        }
+        if (!connected) {
             return HealthCheckResult{
                 .name = "TCP Connection",
                 .status = .failing,
                 .message = try std.fmt.allocPrint(self.allocator, "Connection timed out after {} ms", .{timeout_ns / std.time.ns_per_ms}),
                 .response_time_ms = current - start,
             };
-        };
-        stream.close();
+        }
+        stream.close(io_ctx.*);
 
         return HealthCheckResult{
             .name = "TCP Connection",

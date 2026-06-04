@@ -15,7 +15,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    
+
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +29,14 @@ jobs:
 
       - name: Build Rust Backend
         run: |
-          cd rust_net
+          cd engine
           cargo build --release
 
-      - name: Run Zig Tests
+      - name: Run Zig Tests (no FFI)
         run: zig build test --summary all
+
+      - name: Build Zig (no FFI)
+        run: zig build --summary all
+
+      - name: Build Zig (with Rust FFI linked)
+        run: zig build -Dznet-link-rust=true --summary all

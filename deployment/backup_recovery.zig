@@ -369,14 +369,14 @@ pub const BackupManager = struct {
         // Add active jobs
         for (self.active_jobs.values()) |job| {
             if (jobs.items.len < limit) {
-                jobs.append(job) catch unreachable;
+                jobs.append(job) catch continue;
             }
         }
         
         // Add recent completed jobs
         for (self.completed_jobs.items) |job| {
             if (jobs.items.len < limit) {
-                jobs.append(job) catch unreachable;
+                jobs.append(job) catch continue;
             }
         }
         
@@ -475,7 +475,7 @@ pub const BackupManager = struct {
         defer {
             // Move to completed jobs
             job.status = .completed;
-            self.completed_jobs.append(job) catch unreachable;
+            self.completed_jobs.append(job) catch continue;
             self.active_jobs.remove(job_id);
         };
 

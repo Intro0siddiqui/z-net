@@ -201,7 +201,7 @@ pub const DeploymentManager = struct {
     pub fn listDeployments(self: *Self) ArrayList([]const u8) {
         const keys = ArrayList([]const u8).init(self.allocator);
         for (self.deployments.keys()) |key| {
-            keys.append(key) catch unreachable;
+            keys.append(key) catch continue;
         }
         return keys;
     }

@@ -224,7 +224,7 @@ pub const RollingUpdateManager = struct {
         const deployments = ArrayList(DeploymentInstance).init(self.allocator);
         for (self.current_deployments.values()) |deployment| {
             if (std.mem.eql(u8, deployment.status, "active")) {
-                deployments.append(deployment) catch unreachable;
+                deployments.append(deployment) catch continue;
             }
         }
         return deployments;
@@ -455,7 +455,7 @@ pub const RollingUpdateManager = struct {
         const traffic_rule = self.traffic_splits.get(service_name) orelse return;
         
         // Update traffic splitting rules
-        traffic_rule.traffic_rules.put(new_version, traffic_percent) catch unreachable;
+        traffic_rule.traffic_rules.put(new_version, traffic_percent) catch continue;
         
         // Apply the traffic split
         try self.applyTrafficSplit(service_name, traffic_rule);
@@ -527,7 +527,7 @@ pub const RollingUpdateManager = struct {
         
         for (self.current_deployments.values()) |deployment| {
             if (std.mem.indexOf(u8, deployment.name, service_name) != null) {
-                deployments.append(deployment) catch unreachable;
+                deployments.append(deployment) catch continue;
             }
         }
         

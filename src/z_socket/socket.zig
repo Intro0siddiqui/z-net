@@ -2,7 +2,7 @@
 //! Zig implementation for high-performance socket operations
 
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const mem = std.mem;
 
 pub const SocketError = error{
@@ -37,7 +37,7 @@ pub const Socket = struct {
 
     const Self = @This();
 
-    pub fn create(io_ctx: *std.Io, domain: net.Address.Family, sock_type: std.Io.SocketType) SocketError!Self {
+    pub fn create(io_ctx: *std.Io, domain: net.IpAddress.Family, sock_type: std.Io.SocketType) SocketError!Self {
         const handle = io_ctx.socket(domain, sock_type) catch return error.SocketCreationFailed;
         
         return Self{
@@ -45,7 +45,7 @@ pub const Socket = struct {
         };
     }
 
-    pub fn connect(self: *Self, io_ctx: *std.Io, addr: net.Address) SocketError!void {
+    pub fn connect(self: *Self, io_ctx: *std.Io, addr: net.IpAddress) SocketError!void {
         io_ctx.connect(self.handle, addr) catch |err| {
             return switch (err) {
                 error.ConnectionRefused => error.ConnectionRefused,
@@ -95,7 +95,7 @@ pub const Socket = struct {
         }
     }
 
-    pub fn bind(self: *Self, io_ctx: *std.Io, addr: net.Address) SocketError!void {
+    pub fn bind(self: *Self, io_ctx: *std.Io, addr: net.IpAddress) SocketError!void {
         io_ctx.bind(self.handle, addr) catch return error.BindFailed;
     }
 
@@ -163,7 +163,7 @@ pub const ConnectionPool = struct {
         }
 
         // Create new connection
-        const addr = net.Address.parseIp4(host, port) catch return error.SocketCreationFailed;
+        const addr = net.IpAddress.parseIp4(host, port) catch return error.SocketCreationFailed;
         var socket = try Socket.create(io_ctx, .inet, .stream);
         
         const options = SocketOptions{
