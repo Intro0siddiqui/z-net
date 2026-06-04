@@ -168,25 +168,26 @@ fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
         pos += skipped;
 
         if s.starts_with("return ") {
-            let after = s["return ".len()..].trim();
+            let semi = body[pos..].find(';').unwrap_or(body[pos..].len());
+            let stmt = &body[pos..pos + semi];
+            let after = stmt["return ".len()..].trim();
             let v = after.trim_matches('"');
             last_return = Some(v.to_string());
-            if let Some(semi) = body[pos..].find(';') {
-                pos += semi + 1;
-            } else {
-                break;
-            }
+            pos += semi + 1;
         } else if s.starts_with("if ") {
-            let cond_end = body[pos..].find('{')?;
+            let cond_end = s.find('{')?;
             let cond = s["if ".len()..cond_end].trim();
             let matched = eval_cond(cond, url, host);
-            pos += cond_end;
+            pos += skipped + cond_end;
             let block_with_brace = &body[pos..];
             let close = match_brace(block_with_brace)?;
             if matched {
                 let block = &block_with_brace[1..close];
                 if let Some(ret_off) = block.find("return ") {
-                    let v = block[ret_off + "return ".len()..].trim().trim_matches('"');
+                    let ret_stmt = &block[ret_off..];
+                    let semi = ret_stmt.find(';').unwrap_or(ret_stmt.len());
+                    let stmt = &ret_stmt[..semi];
+                    let v = stmt["return ".len()..].trim().trim_matches('"');
                     last_return = Some(v.to_string());
                 }
             }
