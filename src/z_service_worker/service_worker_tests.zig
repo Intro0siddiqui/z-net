@@ -20,15 +20,15 @@ const worker_messaging = @import("worker_messaging.zig");
 const scope_routing = @import("scope_routing.zig");
 const service_worker_main = @import("service_worker_main.zig");
 
-usingnamespace worker_registry;
-usingnamespace lifecycle_manager;
-usingnamespace fetch_interceptor;
-usingnamespace cache_manager;
-usingnamespace push_notifications;
-usingnamespace background_sync;
-usingnamespace worker_messaging;
-usingnamespace scope_routing;
-usingnamespace service_worker_main;
+// usingnamespace worker_registry;
+// usingnamespace lifecycle_manager;
+// usingnamespace fetch_interceptor;
+// usingnamespace cache_manager;
+// usingnamespace push_notifications;
+// usingnamespace background_sync;
+// usingnamespace worker_messaging;
+// usingnamespace scope_routing;
+// usingnamespace service_worker_main;
 
 test "Service Worker Registration" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

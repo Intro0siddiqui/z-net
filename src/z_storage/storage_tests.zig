@@ -13,11 +13,11 @@ const policy_engine = @import("z_policy/policy_engine.zig");
 const policy = @import("z_policy/policy.zig");
 const event_loop = @import("z_event_loop/event_loop.zig");
 
-usingnamespace storage_bridge;
-usingnamespace storage_apis;
-usingnamespace storage_main;
-usingnamespace policy_engine;
-usingnamespace event_loop;
+// usingnamespace storage_bridge;
+// usingnamespace storage_apis;
+// usingnamespace storage_main;
+// usingnamespace policy_engine;
+// usingnamespace event_loop;
 
 test "storage bridge basic operations" {
     const allocator = std.testing.allocator;

@@ -450,6 +450,7 @@ pub const HttpCache = struct {
     }
 
     fn shouldVaryOn(self: *Self, header_name: []const u8) bool {
+        _ = self;
         // Common headers that affect cache variations
         const vary_headers = &[_][]const u8{
             "Accept",
@@ -505,7 +506,7 @@ pub const DnsCache = struct {
             .domain = e.key,
             .record_type = record_type,
             .records = e.value,
-            .ttl = @intCast(u32, e.expires_at - std.time.timestamp()),
+            .ttl = @intCast(e.expires_at - std.time.timestamp()),
             .created_at = e.created_at,
         } else null;
     }
@@ -687,12 +688,13 @@ fn parseHeadersFromEntry(entry: *const CacheEntry) ![]HttpHeader {
     const headers_len = std.mem.readInt(u32, entry.value[2..6], .big);
     const headers_json = entry.value[6..6 + headers_len];
     
-    var parsed = std.json.parseFromSlice([]HttpHeader, std.heap.page_allocator, headers_json, .{}) catch return error.DeserializationError;
+    const parsed = std.json.parseFromSlice([]HttpHeader, std.heap.page_allocator, headers_json, .{}) catch return error.DeserializationError;
     return parsed.value;
 }
 
 // Cookie serialization functions
 fn parseCookieEntries(data: []const u8) []CookieEntry {
+    _ = data;
     // Simplified cookie parsing
     // In practice would parse proper cookie format
     return &[_]CookieEntry{};

@@ -537,7 +537,7 @@ test "policy engine init" {
 const network_bridge = @import("z_network_bridge.zig");
 
 /// Pre-request validation result
-pub const ValidationResult = enum(i32) {
+pub const PreRequestValidationResult = enum(i32) {
     Allowed = 0,
     Blocked = 1,
     Invalid = 2,

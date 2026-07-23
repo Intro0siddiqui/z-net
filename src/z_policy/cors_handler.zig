@@ -9,7 +9,7 @@ const StringHashMap = std.StringHashMap;
 const ArrayList = std.ArrayList;
 const policy_engine = @import("policy_engine");
 
-usingnamespace policy_engine;
+// usingnamespace policy_engine;
 
 pub const CORSMethod = enum {
     GET,

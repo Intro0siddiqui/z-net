@@ -8,22 +8,23 @@ Make sure you have these installed:
 
 ```bash
 # Check your versions
-zig version      # Should be 0.12+
+zig version      # Should be 0.16.0+
 rustc --version  # Latest
 ```
 
 ## 1. Clone & Build
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Intro0siddiqui/z-net
 cd z-net
 
-# Build everything using the Zig build system
-zig build
+# Build libznet.a static library and tools using Zig 0.16.0
+zig build -Doptimize=ReleaseFast
 ```
-# Or use the helper script
-./build.sh build
-```
+
+Build outputs:
+- Static C-ABI Library: `zig-out/lib/libznet.a` (for Go / CGO interop)
+- Monitor Executable: `zig-out/bin/znet-monitor`
 
 ## 2. Your First Request (Zig)
 

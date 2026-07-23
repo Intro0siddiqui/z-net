@@ -15,10 +15,10 @@ const event_loop = @import("z_event_loop/event_loop.zig");
 const fetch_api = @import("z_fetch/fetch_api.zig");
 const cache_manager = @import("cache_manager.zig");
 
-usingnamespace worker_registry;
-usingnamespace policy_engine;
-usingnamespace event_loop;
-usingnamespace fetch_api;
+// usingnamespace worker_registry;
+// usingnamespace policy_engine;
+// usingnamespace event_loop;
+// usingnamespace fetch_api;
 
 // Fetch event result types
 pub const FetchEventResult = enum {

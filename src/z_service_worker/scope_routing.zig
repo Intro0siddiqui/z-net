@@ -13,9 +13,9 @@ const policy_engine = @import("z_policy/policy_engine.zig");
 const event_loop = @import("z_event_loop/event_loop.zig");
 const storage_bridge = @import("z_storage/storage_bridge.zig");
 
-usingnamespace policy_engine;
-usingnamespace event_loop;
-usingnamespace storage_bridge;
+// usingnamespace policy_engine;
+// usingnamespace event_loop;
+// usingnamespace storage_bridge;
 
 // Service Worker scope
 pub const WorkerScope = struct {

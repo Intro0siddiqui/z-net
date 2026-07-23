@@ -13,9 +13,9 @@ const policy_engine = @import("z_policy/policy_engine.zig");
 const storage_bridge = @import("z_storage/storage_bridge.zig");
 const lifecycle_manager = @import("lifecycle_manager.zig");
 
-usingnamespace policy_engine;
-usingnamespace storage_bridge;
-usingnamespace lifecycle_manager;
+// usingnamespace policy_engine;
+// usingnamespace storage_bridge;
+// usingnamespace lifecycle_manager;
 
 // Cache match options
 pub const CacheMatchOptions = struct {

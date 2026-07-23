@@ -129,78 +129,68 @@ pub const PrivacyDNS = @import("z_security/privacy_dns.zig").PrivacyDNS;
 pub const OcspManager = @import("z_security/ocsp_stapling.zig").OcspManager;
 
 // Network Bridge (Rust FFI)
-pub const NetworkEngine = @import("z_network_bridge.zig").NetworkEngine;
-pub const Connection = @import("z_network_bridge.zig").Connection;
-pub const NetworkError = @import("z_network_bridge.zig").NetworkError;
-pub const poll = @import("z_network_bridge.zig").poll;
+// pub const NetworkEngine = @import("z_network_bridge").NetworkEngine;
+// pub const Connection = @import("z_network_bridge").Connection;
+// pub const NetworkError = @import("z_network_bridge").NetworkError;
+// pub const poll = @import("z_network_bridge").poll;
 
 // Browser Policy Engine
-pub const PolicyEngine = @import("z_policy/policy_engine.zig").PolicyEngine;
-pub const PolicyManager = @import("z_policy/policy.zig").PolicyManager;
-pub const PolicyConfig = @import("z_policy/policy_engine.zig").PolicyEngineConfig;
-pub const Origin = @import("z_policy/policy_engine.zig").Origin;
-pub const ValidationResult = @import("z_policy/policy_engine.zig").ValidationResult;
-pub const getDefaultPolicyConfig = @import("z_policy/policy.zig").getDefaultPolicyConfig;
+// pub const PolicyEngine = @import("z_policy/policy_engine.zig").PolicyEngine;
+// pub const PolicyManager = @import("z_policy/policy.zig").PolicyManager;
+// pub const PolicyConfig = @import("z_policy/policy_engine.zig").PolicyEngineConfig;
+// pub const Origin = @import("z_policy/policy_engine.zig").Origin;
+// pub const ValidationResult = @import("z_policy/policy_engine.zig").ValidationResult;
+// pub const getDefaultPolicyConfig = @import("z_policy/policy.zig").getDefaultPolicyConfig;
 
 // Event Loop Integration
-pub const BrowserEventLoop = @import("z_event_loop/event_loop_main.zig").BrowserEventLoop;
-pub const EventLoopManager = @import("z_event_loop/event_loop.zig").EventLoopManager;
-pub const FetchIntegration = @import("z_event_loop/web_api_integration.zig").FetchIntegration;
-pub const WebSocketIntegration = @import("z_event_loop/web_api_integration.zig").WebSocketIntegration;
-pub const XMLHttpRequestIntegration = @import("z_event_loop/web_api_integration.zig").XMLHttpRequestIntegration;
-pub const createBrowserEventLoop = @import("z_event_loop/event_loop_main.zig").createBrowserEventLoop;
-pub const destroyBrowserEventLoop = @import("z_event_loop/event_loop_main.zig").destroyBrowserEventLoop;
+// pub const BrowserEventLoop = @import("z_event_loop/event_loop_main.zig").BrowserEventLoop;
+// pub const EventLoopManager = @import("z_event_loop/event_loop.zig").EventLoopManager;
+// pub const FetchIntegration = @import("z_event_loop/web_api_integration.zig").FetchIntegration;
+// pub const WebSocketIntegration = @import("z_event_loop/web_api_integration.zig").WebSocketIntegration;
+// pub const XMLHttpRequestIntegration = @import("z_event_loop/web_api_integration.zig").XMLHttpRequestIntegration;
+// pub const createBrowserEventLoop = @import("z_event_loop/event_loop_main.zig").createBrowserEventLoop;
+// pub const destroyBrowserEventLoop = @import("z_event_loop/event_loop_main.zig").destroyBrowserEventLoop;
 
 // Storage Bridge
-pub const StorageBridge = @import("z_storage/storage_bridge.zig").StorageBridge;
-pub const LocalStorageAPI = @import("z_storage/storage_apis.zig").LocalStorageAPI;
-pub const SessionStorageAPI = @import("z_storage/storage_apis.zig").SessionStorageAPI;
-pub const CookieAPI = @import("z_storage/storage_apis.zig").CookieAPI;
-pub const IndexedDBAPI = @import("z_storage/storage_apis.zig").IndexedDBAPI;
-pub const CacheAPI = @import("z_storage/storage_apis.zig").CacheAPI;
-pub const StorageManager = @import("z_storage/storage_apis.zig").StorageManager;
-pub const BrowserStorage = @import("z_storage/storage_main.zig").BrowserStorage;
-pub const StorageConfig = @import("z_storage/storage_main.zig").StorageConfig;
-pub const createBrowserStorage = @import("z_storage/storage_main.zig").createBrowserStorage;
-pub const destroyBrowserStorage = @import("z_storage/storage_main.zig").destroyBrowserStorage;
+// pub const StorageBridge = @import("z_storage/storage_bridge.zig").StorageBridge;
+// pub const LocalStorageAPI = @import("z_storage/storage_apis.zig").LocalStorageAPI;
+// pub const SessionStorageAPI = @import("z_storage/storage_apis.zig").SessionStorageAPI;
+// pub const CookieAPI = @import("z_storage/storage_apis.zig").CookieAPI;
+// pub const IndexedDBAPI = @import("z_storage/storage_apis.zig").IndexedDBAPI;
+// pub const CacheAPI = @import("z_storage/storage_apis.zig").CacheAPI;
+// pub const StorageManager = @import("z_storage/storage_apis.zig").StorageManager;
+// pub const BrowserStorage = @import("z_storage/storage_main.zig").BrowserStorage;
+// pub const StorageConfig = @import("z_storage/storage_main.zig").StorageConfig;
+// pub const createBrowserStorage = @import("z_storage/storage_main.zig").createBrowserStorage;
+// pub const destroyBrowserStorage = @import("z_storage/storage_main.zig").destroyBrowserStorage;
 
 // WebSocket Implementation
-pub const WebSocketProtocol = @import("z_websocket/websocket_protocol.zig").WebSocketProtocol;
-pub const WebSocketManager = @import("z_websocket/websocket_manager.zig").WebSocketManager;
-pub const WebSocketFrameType = @import("z_websocket/websocket_protocol.zig").WebSocketFrameType;
-pub const WebSocketCloseCode = @import("z_websocket/websocket_protocol.zig").WebSocketCloseCode;
-pub const WebSocketFrame = @import("z_websocket/websocket_protocol.zig").WebSocketFrame;
-pub const WebSocketHandshakeRequest = @import("z_websocket/websocket_manager.zig").WebSocketHandshakeRequest;
+// pub const WebSocketProtocol = @import("z_websocket/websocket_protocol.zig").WebSocketProtocol;
+// pub const WebSocketManager = @import("z_websocket/websocket_manager.zig").WebSocketManager;
+// pub const WebSocketFrameType = @import("z_websocket/websocket_protocol.zig").WebSocketFrameType;
+// pub const WebSocketCloseCode = @import("z_websocket/websocket_protocol.zig").WebSocketCloseCode;
+// pub const WebSocketFrame = @import("z_websocket/websocket_protocol.zig").WebSocketFrame;
+// pub const WebSocketHandshakeRequest = @import("z_websocket/websocket_manager.zig").WebSocketHandshakeRequest;
 
 // Service Worker Implementation
-pub const ServiceWorkerManager = @import("z_service_worker/service_worker_main.zig").ServiceWorkerManager;
-pub const ServiceWorkerRegistry = @import("z_service_worker/worker_registry.zig").ServiceWorkerRegistry;
-pub const ServiceWorkerRegistration = @import("z_service_worker/worker_registry.zig").ServiceWorkerRegistration;
-pub const ServiceWorker = @import("z_service_worker/worker_registry.zig").ServiceWorker;
-pub const ServiceWorkerState = @import("z_service_worker/worker_registry.zig").ServiceWorkerState;
-pub const ServiceWorkerEvent = @import("z_service_worker/worker_registry.zig").ServiceWorkerEvent;
-pub const Client = @import("z_service_worker/worker_registry.zig").Client;
-pub const MessagePort = @import("z_service_worker/worker_registry.zig").MessagePort;
-pub const LifecycleManager = @import("z_service_worker/lifecycle_manager.zig").LifecycleManager;
-pub const FetchEvent = @import("z_service_worker/fetch_interceptor.zig").FetchEvent;
-pub const Request = @import("z_service_worker/fetch_interceptor.zig").Request;
-pub const Response = @import("z_service_worker/fetch_interceptor.zig").Response;
-pub const Cache = @import("z_service_worker/cache_manager.zig").Cache;
-pub const CacheManager = @import("z_service_worker/cache_manager.zig").CacheManager;
-pub const CacheResponse = @import("z_service_worker/cache_manager.zig").CacheResponse;
-pub const PushSubscription = @import("z_service_worker/push_notifications.zig").PushSubscription;
-pub const NotificationManager = @import("z_service_worker/push_notifications.zig").NotificationManager;
-pub const NotificationOptions = @import("z_service_worker/push_notifications.zig").NotificationOptions;
-pub const SyncRegistration = @import("z_service_worker/background_sync.zig").SyncRegistration;
-pub const BackgroundSyncManager = @import("z_service_worker/background_sync.zig").BackgroundSyncManager;
-pub const MessageManager = @import("z_service_worker/worker_messaging.zig").MessageManager;
-pub const MessageChannel = @import("z_service_worker/worker_messaging.zig").MessageChannel;
-pub const WorkerScope = @import("z_service_worker/scope_routing.zig").WorkerScope;
-pub const ScopeRouter = @import("z_service_worker/scope_routing.zig").ScopeRouter;
-pub const ServiceWorkerConfig = @import("z_service_worker/service_worker_main.zig").ServiceWorkerConfig;
-pub const ServiceWorkerStats = @import("z_service_worker/service_worker_main.zig").ServiceWorkerStats;
-pub const createServiceWorkerManager = @import("z_service_worker/service_worker_main.zig").createServiceWorkerManager;
-pub const destroyServiceWorkerManager = @import("z_service_worker/service_worker_main.zig").destroyServiceWorkerManager;
+// Core Network Stack Exports Enabled
+// pub const Response = @import("z_service_worker/fetch_interceptor.zig").Response;
+// pub const Cache = @import("z_service_worker/cache_manager.zig").Cache;
+// pub const CacheManager = @import("z_service_worker/cache_manager.zig").CacheManager;
+// pub const CacheResponse = @import("z_service_worker/cache_manager.zig").CacheResponse;
+// pub const PushSubscription = @import("z_service_worker/push_notifications.zig").PushSubscription;
+// pub const NotificationManager = @import("z_service_worker/push_notifications.zig").NotificationManager;
+// pub const NotificationOptions = @import("z_service_worker/push_notifications.zig").NotificationOptions;
+// pub const SyncRegistration = @import("z_service_worker/background_sync.zig").SyncRegistration;
+// pub const BackgroundSyncManager = @import("z_service_worker/background_sync.zig").BackgroundSyncManager;
+// pub const MessageManager = @import("z_service_worker/worker_messaging.zig").MessageManager;
+// pub const MessageChannel = @import("z_service_worker/worker_messaging.zig").MessageChannel;
+// pub const WorkerScope = @import("z_service_worker/scope_routing.zig").WorkerScope;
+// pub const ScopeRouter = @import("z_service_worker/scope_routing.zig").ScopeRouter;
+// pub const ServiceWorkerConfig = @import("z_service_worker/service_worker_main.zig").ServiceWorkerConfig;
+// pub const ServiceWorkerStats = @import("z_service_worker/service_worker_main.zig").ServiceWorkerStats;
+// pub const createServiceWorkerManager = @import("z_service_worker/service_worker_main.zig").createServiceWorkerManager;
+// pub const destroyServiceWorkerManager = @import("z_service_worker/service_worker_main.zig").destroyServiceWorkerManager;
 
 // Version information
 pub const VERSION_MAJOR = 1;
@@ -226,17 +216,17 @@ pub const FEATURES = struct {
     pub const HAS_PROXY = true; // Feature 2: HTTP CONNECT, SOCKS5, PAC
     pub const HAS_WEBTRANSPORT = true; // Feature 3: WebTransport over HTTP/3
     pub const HAS_NTLM = true; // Feature 4: NTLM, Kerberos, Negotiate
-} pub const BuildInfo = struct {
+};
+
+pub const BuildInfo = struct {
     pub const COMPILER = "Zig " ++ builtin.zig_version_string;
-    pub const TARGET = builtin.target機器名;
-    pub const ARCH = builtin.target.cpu_arch.string;
+    pub const ARCH = @tagName(builtin.cpu.arch);
     pub const OS = @tagName(builtin.os.tag);
-    pub const LINK_MODE = @tagName(builtin.link_mode);
     pub const OPTIMIZE = @tagName(builtin.mode);
 };
 
 // Initialize z-net
-pub fn init(allocator: std.mem.Allocator) !void {
+pub fn init(_: std.mem.Allocator) !void {
     std.log.info("Initializing z-net v{}.{}.{}", .{
         VERSION_MAJOR,
         VERSION_MINOR,

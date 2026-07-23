@@ -68,5 +68,5 @@ fn resolveHost(host: []const u8, port: u16) SocketError!net.IpAddress {
 test "tunneled connection shortcut keeps proxy null working" {
     // Compile-time check: the helper exposes the no-proxy branch even
     // when the proxy module is empty.
-    const _ = connectTunneled;
+    _ = connectTunneled;
 }

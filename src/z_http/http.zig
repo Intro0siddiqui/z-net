@@ -67,7 +67,7 @@ pub const HttpClient = struct {
                         // This integration logic would be deeper in the actual fetch implementation
                     }
                 }
-            } catch |err| {
+            } else |err| {
                 if (err == cache.CacheError.RevalidationRequired) {
                     // Add conditional headers
                     // ...

@@ -110,6 +110,7 @@ pub const DnsResolver = struct {
         // DNS over HTTPS implementation
         const doh_server = "https://dns.cloudflare.com/dns-query";
         const dns_query = try encodeDnsQuery(query);
+        _ = dns_query;
         
         // Create HTTP request
         var http_req = http.HttpRequest.init(self.allocator);
@@ -193,6 +194,7 @@ pub const DnsResolver = struct {
             defer socket_conn.close(self.io_ctx);
 
             const addr = std.Io.net.IpAddress.parseIp4(host, port) catch continue;
+            _ = addr;
 
             // Send DNS query
             const dns_query = try encodeDnsQuery(query);
@@ -220,7 +222,7 @@ pub const DnsCache = struct {
     const CacheEntry = struct {
         answers: []DnsAnswer,
         expires_at: i64,
-    },
+    };
 
     const Self = @This();
 
@@ -232,7 +234,7 @@ pub const DnsCache = struct {
     }
 
     pub fn get(self: *Self, name: []const u8, record_type: DnsRecordType) ?[]DnsAnswer {
-        const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ name, @intFromEnum(record_type) });
+        const key = std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ name, @intFromEnum(record_type) }) catch return null;
         defer self.allocator.free(key);
 
         if (self.entries.get(key)) |entry| {
@@ -276,7 +278,7 @@ pub const DnsCache = struct {
         }
 
         for (keys_to_remove.items) |key| {
-            self.entries.remove(key);
+            _ = self.entries.swapRemove(key);
         }
     }
 
@@ -294,7 +296,7 @@ fn encodeDnsQuery(query: DnsQuery) ![]u8 {
     defer buffer.deinit();
 
     // DNS header
-    const id = @as(u16, @bitCast(u16, std.crypto.random.int(u16)));
+    const id = std.crypto.random.int(u16);
     const flags = 0x0100; // Standard query, recursion desired
 
     buffer.appendSlice(&std.mem.toBytes(id));
@@ -305,9 +307,9 @@ fn encodeDnsQuery(query: DnsQuery) ![]u8 {
     buffer.appendSlice(&std.mem.toBytes(@as(u16, 0))); // Additional: 0
 
     // Question section
-    const labels = std.mem.split(u8, query.name, ".");
+    var labels = std.mem.split(u8, query.name, ".");
     while (labels.next()) |label| {
-        buffer.append(@intCast(u8, label.len));
+        buffer.append(@intCast(label.len));
         buffer.appendSlice(label);
     }
     buffer.append(0); // End of name
@@ -319,15 +321,18 @@ fn encodeDnsQuery(query: DnsQuery) ![]u8 {
 }
 
 fn parseDnsResponse(data: []const u8, query: DnsQuery, allocator: std.mem.Allocator) DnsError![]DnsAnswer {
+    _ = query;
     if (data.len < 12) return error.ParseError;
 
     var offset: usize = 0;
 
     // Parse header
     const id = std.mem.readInt(u16, data[offset..offset + 2], .big);
+    _ = id;
     offset += 2;
 
     const flags = std.mem.readInt(u16, data[offset..offset + 2], .big);
+    _ = flags;
     offset += 2;
 
     const questions = std.mem.readInt(u16, data[offset..offset + 2], .big);
@@ -359,6 +364,7 @@ fn parseDnsResponse(data: []const u8, query: DnsQuery, allocator: std.mem.Alloca
         offset += 2;
 
         const answer_class = std.mem.readInt(u16, data[offset..offset + 2], .big);
+        _ = answer_class;
         offset += 2;
 
         const ttl = std.mem.readInt(u32, data[offset..offset + 4], .big);
@@ -382,6 +388,7 @@ fn parseDnsResponse(data: []const u8, query: DnsQuery, allocator: std.mem.Alloca
 }
 
 fn parseDoHResponse(json_response: std.json.Value, query: DnsQuery, allocator: std.mem.Allocator) DnsError![]DnsAnswer {
+    _ = query;
     var answer_list = std.ArrayList(DnsAnswer).init(allocator);
 
     if (json_response.Object.get("Answer")) |answers_array| {
@@ -389,7 +396,7 @@ fn parseDoHResponse(json_response: std.json.Value, query: DnsQuery, allocator: s
             for (answers.items) |answer| {
                 if (answer.Object) |answer_obj| {
                     const name = try allocator.dupe(u8, answer_obj.get("name").?.String);
-                    const record_type = @enumFromInt(std.fmt.parseInt(u16, answer_obj.get("type").?.String, 10) catch 1);
+                    const record_type: DnsRecordType = @enumFromInt(std.fmt.parseInt(u16, answer_obj.get("type").?.String, 10) catch 1);
                     const ttl = std.fmt.parseInt(u32, answer_obj.get("TTL").?.String, 10) catch 300;
                     const data = try allocator.dupe(u8, answer_obj.get("data").?.String);
 

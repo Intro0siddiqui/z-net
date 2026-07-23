@@ -12,9 +12,9 @@ const web_api = @import("web_api_integration.zig");
 const policy_engine = @import("z_policy/policy_engine.zig");
 const policy = @import("z_policy/policy.zig");
 
-usingnamespace event_loop;
-usingnamespace web_api;
-usingnamespace policy_engine;
+// usingnamespace event_loop;
+// usingnamespace web_api;
+// usingnamespace policy_engine;
 
 pub const BrowserEventLoop = struct {
     allocator: Allocator,

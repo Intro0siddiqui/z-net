@@ -20,17 +20,17 @@ const policy_engine = @import("z_policy/policy_engine.zig");
 const event_loop = @import("z_event_loop/event_loop.zig");
 const storage_bridge = @import("z_storage/storage_bridge.zig");
 
-usingnamespace worker_registry;
-usingnamespace lifecycle_manager;
-usingnamespace fetch_interceptor;
-usingnamespace cache_manager;
-usingnamespace push_notifications;
-usingnamespace background_sync;
-usingnamespace worker_messaging;
-usingnamespace scope_routing;
-usingnamespace policy_engine;
-usingnamespace event_loop;
-usingnamespace storage_bridge;
+// usingnamespace worker_registry;
+// usingnamespace lifecycle_manager;
+// usingnamespace fetch_interceptor;
+// usingnamespace cache_manager;
+// usingnamespace push_notifications;
+// usingnamespace background_sync;
+// usingnamespace worker_messaging;
+// usingnamespace scope_routing;
+// usingnamespace policy_engine;
+// usingnamespace event_loop;
+// usingnamespace storage_bridge;
 
 // Service Worker main configuration
 pub const ServiceWorkerConfig = struct {

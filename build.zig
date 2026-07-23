@@ -96,12 +96,13 @@ pub fn build(b: *std.Build) void {
     z_tls.addImport("z_proxy", z_proxy);
     z_quic.addImport("z_socket", z_socket);
     z_quic.addImport("z_tls", z_tls);
-    z_webtransport.addImport("z_quic", z_quic);
-    z_webtransport.addImport("z_http3", b.createModule(.{
+    const z_http3 = b.addModule("z_http3", .{
         .root_source_file = b.path("src/z_http3/http3.zig"),
         .target = target,
         .optimize = optimize,
-    }));
+    });
+    z_webtransport.addImport("z_quic", z_quic);
+    z_webtransport.addImport("z_http3", z_http3);
 
     // Root module
     const znet = b.addModule("znet", .{
@@ -109,28 +110,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    znet.addImport("z_socket", z_socket);
-    znet.addImport("z_network_bridge", z_network_bridge);
-    znet.addImport("z_config", z_config);
-    znet.addImport("z_health", z_health);
-    znet.addImport("z_monitoring", z_monitoring);
-    znet.addImport("z_compression", z_compression);
-    znet.addImport("z_proxy", z_proxy);
-    znet.addImport("z_webtransport", z_webtransport);
 
-    // Monitor Executable
-    const monitor_exe = b.addExecutable(.{
-        .name = "znet-monitor",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/z_monitoring/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    // C-ABI Static Library for Go / CGO interop
+    const libznet = b.addLibrary(.{
+        .name = "znet",
+        .linkage = .static,
+        .root_module = znet,
     });
-    monitor_exe.root_module.addImport("dashboard", z_monitoring);
-    monitor_exe.root_module.addImport("z_config", z_config);
-    monitor_exe.root_module.addImport("z_health", z_health);
-    b.installArtifact(monitor_exe);
+    b.installArtifact(libznet);
 
     // Tests
     const test_step = b.step("test", "Run all tests");

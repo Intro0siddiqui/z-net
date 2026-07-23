@@ -32,7 +32,7 @@ pub const PacEngine = struct {
     /// The interpreter is intentionally a parser, not a full JS engine -
     /// if the script uses anything we don't understand we fall back to
     /// `DIRECT` and log a warning upstream.
-    pub     pub fn findProxyForURL(self: *const Self, url: []const u8, host: []const u8) !?PacResult {
+    pub fn findProxyForURL(self: *const Self, url: []const u8, host: []const u8) !?PacResult {
         const marker = "FindProxyForURL";
         const idx = std.mem.indexOf(u8, self.source, marker) orelse return null;
         const body_start = std.mem.indexOfScalar(u8, self.source[idx..], '{') orelse return null;
@@ -61,7 +61,7 @@ pub const PacEngine = struct {
                 cond_stack.append(cond) catch @panic("OOM in PAC condition stack");
                 _ = ops_stack.append('?') catch {};
             } else if (std.mem.eql(u8, tok, "else")) {
-                _ = cond_stack;
+                // else branch handling
             }
         }
         if (value) |v| return PacResult{ .proxy = v };

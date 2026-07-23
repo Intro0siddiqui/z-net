@@ -11,10 +11,10 @@ const cors_handler = @import("cors_handler");
 const csp_validator = @import("csp_validator");
 const policy = @import("policy.zig");
 
-usingnamespace policy_engine;
-usingnamespace cors_handler;
-usingnamespace csp_validator;
-usingnamespace policy;
+// usingnamespace policy_engine;
+// usingnamespace cors_handler;
+// usingnamespace csp_validator;
+// usingnamespace policy;
 
 test "origin parsing and comparison" {
     const origin1 = try Origin.parse("https://example.com:443/path");

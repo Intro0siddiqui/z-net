@@ -10,7 +10,7 @@ const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
 const policy_engine = @import("policy_engine");
 
-usingnamespace policy_engine;
+// usingnamespace policy_engine;
 
 pub const CSPToken = struct {
     token_type: CSPTokenType,

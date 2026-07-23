@@ -14,10 +14,10 @@ const policy_engine = @import("z_policy/policy_engine.zig");
 const event_loop = @import("z_event_loop/event_loop.zig");
 const storage_bridge = @import("z_storage/storage_bridge.zig");
 
-usingnamespace worker_registry;
-usingnamespace policy_engine;
-usingnamespace event_loop;
-usingnamespace storage_bridge;
+// usingnamespace worker_registry;
+// usingnamespace policy_engine;
+// usingnamespace event_loop;
+// usingnamespace storage_bridge;
 
 // Lifecycle state transition result
 pub const LifecycleResult = enum {

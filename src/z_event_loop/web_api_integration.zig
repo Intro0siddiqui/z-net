@@ -13,8 +13,8 @@ const event_loop = @import("event_loop.zig");
 const policy_engine = @import("z_policy/policy_engine.zig");
 const policy = @import("z_policy/policy.zig");
 
-usingnamespace event_loop;
-usingnamespace policy_engine;
+// usingnamespace event_loop;
+// usingnamespace policy_engine;
 
 pub const FetchIntegration = struct {
     allocator: Allocator,

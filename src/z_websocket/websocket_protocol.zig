@@ -15,8 +15,8 @@ const policy_engine = @import("z_policy/policy_engine.zig");
 const policy = @import("z_policy/policy.zig");
 const event_loop = @import("z_event_loop/event_loop.zig");
 
-usingnamespace policy_engine;
-usingnamespace event_loop;
+// usingnamespace policy_engine;
+// usingnamespace event_loop;
 
 // WebSocket frame types
 pub const WebSocketFrameType = enum(u3) {

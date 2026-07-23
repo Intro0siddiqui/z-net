@@ -11,10 +11,10 @@ const web_api = @import("web_api_integration.zig");
 const main = @import("event_loop_main.zig");
 const policy = @import("z_policy/policy.zig");
 
-usingnamespace event_loop;
-usingnamespace web_api;
-usingnamespace main;
-usingnamespace policy;
+// usingnamespace event_loop;
+// usingnamespace web_api;
+// usingnamespace main;
+// usingnamespace policy;
 
 test "event loop manager basic operations" {
     const allocator = testing.allocator;
