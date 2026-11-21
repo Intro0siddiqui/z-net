@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -170,11 +170,17 @@ impl HttpClientEngine {
         } else {
             let addr_str = format!("{}:{}", host, port);
             let mut resolved_stream = None;
-            let addrs = addr_str.to_socket_addrs()
-                .map_err(|e| format!("DNS resolution failed for {}: {}", addr_str, e))?;
+            let mut addrs: Vec<SocketAddr> = addr_str
+                .to_socket_addrs()
+                .map_err(|e| format!("DNS resolution failed for {}: {}", addr_str, e))?
+                .collect();
+
+            // Prioritize IPv4 addresses over IPv6 to prevent black-hole stalls on dual-stack networks
+            addrs.sort_by_key(|addr| !addr.is_ipv4());
 
             for addr in addrs {
-                if let Ok(s) = TcpStream::connect_timeout(&addr, options.timeout) {
+                let connect_timeout = std::cmp::min(options.timeout, std::time::Duration::from_secs(3));
+                if let Ok(s) = TcpStream::connect_timeout(&addr, connect_timeout) {
                     let _ = s.set_nodelay(true);
                     let _ = s.set_read_timeout(Some(options.timeout));
                     let _ = s.set_write_timeout(Some(options.timeout));
@@ -688,5 +694,24 @@ mod tests {
         assert!(jar_header.contains("theme=dark"));
 
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_ipv4_prioritization() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let mut addrs = vec![
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 80),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 80),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)), 80),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 80),
+        ];
+
+        addrs.sort_by_key(|addr| !addr.is_ipv4());
+
+        assert!(addrs[0].is_ipv4());
+        assert!(addrs[1].is_ipv4());
+        assert!(addrs[2].is_ipv6());
+        assert!(addrs[3].is_ipv6());
     }
 }
