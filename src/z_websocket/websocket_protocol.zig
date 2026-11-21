@@ -11,15 +11,8 @@ const StringHashMap = std.StringHashMap;
 const ArrayList = std.ArrayList;
 const Base64 = std.base64;
 
-const policy_engine = @import("z_policy/policy_engine.zig");
-const policy = @import("z_policy/policy.zig");
-const event_loop = @import("z_event_loop/event_loop.zig");
-
-// usingnamespace policy_engine;
-// usingnamespace event_loop;
-
 // WebSocket frame types
-pub const WebSocketFrameType = enum(u3) {
+pub const WebSocketFrameType = enum(u4) {
     CONTINUATION = 0x0,
     TEXT = 0x1,
     BINARY = 0x2,
@@ -86,6 +79,7 @@ pub const WebSocketFrame = struct {
     payload: []const u8,
     
     pub fn init(allocator: Allocator, opcode: WebSocketFrameType, payload: []const u8) WebSocketFrame {
+        _ = allocator;
         return WebSocketFrame{
             .fin = true,
             .opcode = opcode,
@@ -94,6 +88,10 @@ pub const WebSocketFrame = struct {
             .masking_key = [4]u8{ 0, 0, 0, 0 },
             .payload = payload,
         };
+    }
+    
+    pub fn deinit(self: *WebSocketFrame) void {
+        _ = self;
     }
     
     pub fn setMasking(self: *WebSocketFrame, masked: bool, key: [4]u8) void {
@@ -160,12 +158,12 @@ pub const WebSocketFrame = struct {
         const first_byte = data[0];
         self.fin = (first_byte & 0x80) != 0;
         const opcode_value = first_byte & 0x0F;
-        self.opcode = @enumFromInt(WebSocketFrameType, opcode_value);
+        self.opcode = @enumFromInt(opcode_value);
         
         // Parse second byte
         const second_byte = data[1];
         self.masked = (second_byte & 0x80) != 0;
-        let payload_len_field = second_byte & 0x7F;
+        const payload_len_field = second_byte & 0x7F;
         
         // Parse payload length
         var offset: usize = 2;
@@ -438,9 +436,6 @@ pub const WebSocketConnection = struct {
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
-        
-        // Send frame (would integrate with actual socket)
-        _ = frame_data; // Placeholder for actual send
     }
     
     pub fn sendBinary(self: *WebSocketConnection, binary_data: []const u8, allocator: Allocator) !void {
@@ -456,9 +451,6 @@ pub const WebSocketConnection = struct {
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
-        
-        // Send frame (would integrate with actual socket)
-        _ = frame_data; // Placeholder for actual send
     }
     
     pub fn sendPing(self: *WebSocketConnection, allocator: Allocator) !void {
@@ -479,8 +471,6 @@ pub const WebSocketConnection = struct {
         
         // Track ping for pong response
         self.ping_queue.append(getCurrentTimestamp()) catch {};
-        
-        _ = frame_data; // Placeholder for actual send
     }
     
     pub fn sendPong(self: *WebSocketConnection, ping_data: []const u8, allocator: Allocator) !void {
@@ -495,8 +485,6 @@ pub const WebSocketConnection = struct {
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
-        
-        _ = frame_data; // Placeholder for actual send
     }
     
     pub fn sendClose(self: *WebSocketConnection, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
@@ -517,8 +505,6 @@ pub const WebSocketConnection = struct {
         defer allocator.free(frame_data);
         
         self.state = .CLOSING;
-        
-        _ = frame_data; // Placeholder for actual send
     }
     
     pub fn processFrame(self: *WebSocketConnection, frame_data: []const u8, allocator: Allocator) !void {
@@ -578,6 +564,7 @@ pub const WebSocketConnection = struct {
     }
     
     fn processContinuationFrame(self: *WebSocketConnection, frame: *WebSocketFrame, allocator: Allocator) !void {
+        _ = allocator;
         if (self.current_message == null) {
             return error.UnexpectedContinuation;
         }

@@ -15,6 +15,9 @@ version = "0.23"
 default-features = false
 features = ["tls12", "std"]
 
+[dependencies.webpki-roots]
+version = "1.0"
+
 [dependencies.log]
 version = "0.4"
 default-features = false
@@ -27,6 +30,9 @@ version = "0.2"
 
 [dependencies.httparse]
 version = "1.8"
+
+[dependencies.http]
+version = "1.0"
 
 [dependencies.h2]
 version = "0.4"

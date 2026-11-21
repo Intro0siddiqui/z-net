@@ -128,3 +128,88 @@ pub extern "C" fn znet_zstd_decoder_free(handle: *mut c_void) {
         }
     }
 }
+
+// ----- Gzip / Deflate -------------------------------------------------------
+
+use flate2::read::{GzDecoder, ZlibDecoder};
+
+#[no_mangle]
+pub extern "C" fn znet_gzip_decompress(
+    input: *const c_uchar,
+    input_len: usize,
+    out_buf: *mut c_uchar,
+    out_cap: usize,
+    out_produced: *mut usize,
+) -> c_int {
+    if input.is_null() || out_buf.is_null() || out_produced.is_null() {
+        return -1;
+    }
+    unsafe {
+        let in_slice = std::slice::from_raw_parts(input, input_len);
+        let out_slice = std::slice::from_raw_parts_mut(out_buf, out_cap);
+        let mut gz = GzDecoder::new(in_slice);
+        match gz.read(out_slice) {
+            Ok(n) => {
+                *out_produced = n;
+                0
+            }
+            Err(_) => -2,
+        }
+    }
+}
+
+/// Helper function to decompress bytes based on Content-Encoding header.
+pub fn decompress_payload(encoding: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    match encoding.to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => {
+            let mut decoder = GzDecoder::new(data);
+            decoder.read_to_end(&mut out).map_err(|e| format!("Gzip decode error: {}", e))?;
+        }
+        "deflate" => {
+            let mut decoder = ZlibDecoder::new(data);
+            decoder.read_to_end(&mut out).map_err(|e| format!("Deflate decode error: {}", e))?;
+        }
+        "br" => {
+            let mut decoder = BrotliReader::new(data, 4096);
+            decoder.read_to_end(&mut out).map_err(|e| format!("Brotli decode error: {}", e))?;
+        }
+        "zstd" => {
+            let mut decoder = ZstdReaderInner::new(data).map_err(|e| format!("Zstd init error: {}", e))?;
+            decoder.read_to_end(&mut out).map_err(|e| format!("Zstd decode error: {}", e))?;
+        }
+        "identity" | "" => {
+            out.extend_from_slice(data);
+        }
+        unknown => {
+            return Err(format!("Unsupported content encoding: {}", unknown));
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    #[test]
+    fn test_decompress_gzip() {
+        let original = b"Hello, Zawra Browser Compression Pipeline!";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_payload("gzip", &compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_identity() {
+        let original = b"Plain uncompressed text";
+        let out = decompress_payload("identity", original).unwrap();
+        assert_eq!(out, original);
+    }
+}

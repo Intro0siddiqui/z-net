@@ -102,6 +102,42 @@ pub struct BodyRingDescriptor {
     pub is_closed: AtomicBool,
 }
 
+impl BodyRingDescriptor {
+    pub fn available_write(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        let used = head.wrapping_sub(tail) as usize;
+        if used >= self.capacity { 0 } else { self.capacity - used }
+    }
+
+    pub fn available_read(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        head.wrapping_sub(tail) as usize
+    }
+
+    pub fn write_slice(&self, data: &[u8]) -> usize {
+        let avail = self.available_write();
+        let to_write = data.len().min(avail);
+        if to_write == 0 {
+            return 0;
+        }
+        let head = self.head.load(Ordering::Acquire);
+        let head_idx = (head % self.capacity as u64) as usize;
+        let first_chunk = to_write.min(self.capacity - head_idx);
+        let second_chunk = to_write - first_chunk;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.buffer_ptr.add(head_idx), first_chunk);
+            if second_chunk > 0 {
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(first_chunk), self.buffer_ptr, second_chunk);
+            }
+        }
+        self.head.fetch_add(to_write as u64, Ordering::Release);
+        to_write
+    }
+}
+
 // ============================================================
 // State Machines
 // ============================================================
@@ -155,7 +191,7 @@ pub struct TlsState {
 }
 
 impl TlsState {
-    fn new(host: String, port: u16) -> Result<Self, NetError> {
+    fn new(host: String, port: u16, config: Arc<ClientConfig>) -> Result<Self, NetError> {
         let addrs = match format!("{}:{}", host, port).to_socket_addrs() {
             Ok(a) => a,
             Err(_) => return Err(NetError::IoError),
@@ -174,20 +210,14 @@ impl TlsState {
         };
         let _ = stream.set_nodelay(true);
 
-        // Build a per-connection ClientConfig with a process-wide default
-        // root cert store. We clone the engine's config in the public FFI
-        // path; here we just build a default one for standalone usage.
-        let root_store = RootCertStore::empty();
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
+        // Reuse the engine's client config so the trust anchors and the
+        // resumption session store are shared across connections.
         let server_name = match rustls::pki_types::ServerName::try_from(host.as_str()) {
             Ok(name) => name.to_owned(),
             Err(_) => return Err(NetError::TlsError),
         };
 
-        let tls = match ClientConnection::new(Arc::new(config), server_name) {
+        let tls = match ClientConnection::new(config, server_name) {
             Ok(c) => c,
             Err(_) => return Err(NetError::TlsError),
         };
@@ -211,6 +241,7 @@ pub struct NetEngine {
     tls_states: HashMap<usize, Box<TlsState>>,
     next_conn_id: usize,
     tls_config: Arc<ClientConfig>,
+    pub http_engine: protocols::http::client::HttpClientEngine,
     body_rings: HashMap<u64, *mut BodyRingDescriptor>,
     conn_body_rings: HashMap<usize, u64>,
     /// QUIC endpoints keyed by the engine-level `conn_id` returned from
@@ -248,6 +279,44 @@ struct QuicConnectionEntry {
     remote: std::net::SocketAddr,
 }
 
+/// Helper to parse PEM certificates from a file on disk (e.g. system CA bundle).
+fn load_pem_certs(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    let mut certs = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let mut in_cert = false;
+        let mut b64 = String::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line == "-----BEGIN CERTIFICATE-----" {
+                in_cert = true;
+                b64.clear();
+            } else if line == "-----END CERTIFICATE-----" {
+                if in_cert {
+                    use base64::Engine;
+                    if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(&b64) {
+                        certs.push(rustls::pki_types::CertificateDer::from(der));
+                    }
+                    in_cert = false;
+                }
+            } else if in_cert {
+                b64.push_str(line);
+            }
+        }
+    }
+    certs
+}
+
+/// Build the client trust store from Mozilla's compiled-in root bundle
+/// supplemented by the host system's root certificates (/etc/ssl/certs/ca-certificates.crt).
+fn root_store() -> RootCertStore {
+    let mut store = RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in load_pem_certs("/etc/ssl/certs/ca-certificates.crt") {
+        let _ = store.add(cert);
+    }
+    store
+}
+
 impl NetEngine {
     fn new() -> Result<Self, NetError> {
         let poll = Poll::new().map_err(|_| NetError::IoError)?;
@@ -257,13 +326,14 @@ impl NetEngine {
         #[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
         
-        // Setup default TLS config
-        let root_store = RootCertStore::empty();
-        // Note: In production, you'd load system root certs here.
-        
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
+        // Setup default TLS config with ALPN for HTTP/2 and HTTP/1.1
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(root_store())
             .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            
+        let tls_cfg = Arc::new(config);
+        let http_engine = protocols::http::client::HttpClientEngine::new(tls_cfg.clone());
             
         Ok(Self {
             poll,
@@ -272,7 +342,8 @@ impl NetEngine {
             next_tls_id: 1,
             tls_states: HashMap::new(),
             next_conn_id: 1,
-            tls_config: Arc::new(config),
+            tls_config: tls_cfg,
+            http_engine,
             body_rings: HashMap::new(),
             conn_body_rings: HashMap::new(),
             quic_endpoints: HashMap::new(),
@@ -345,14 +416,15 @@ pub extern "C" fn net_engine_destroy(handle: NetEngineHandle) {
     }
 }
 
-/// Connect to a host
+/// Connect to a host with explicit TLS option (allowing TLS on custom ports like 8443)
 #[no_mangle]
-pub extern "C" fn net_connect(
+pub extern "C" fn net_connect_tls(
     engine_handle: NetEngineHandle,
     host: *const c_char,
     port: u16,
+    use_tls: bool,
 ) -> ConnectionHandle {
-    if engine_handle.is_null() {
+    if engine_handle.is_null() || host.is_null() {
         return null_mut();
     }
     
@@ -399,8 +471,8 @@ pub extern "C" fn net_connect(
     
     let mut conn = Connection::new(stream, host_str, port);
     
-    // Initialize TLS only if port is 443
-    if port == 443 {
+    // Initialize TLS if explicitly requested
+    if use_tls {
         if let Ok(server_name) = rustls::pki_types::ServerName::try_from(conn.host.as_str()) {
             if let Ok(tls) = ClientConnection::new(engine.tls_config.clone(), server_name.to_owned()) {
                 conn.tlsconn = Some(tls);
@@ -410,6 +482,46 @@ pub extern "C" fn net_connect(
     
     engine.connections.insert(conn_id, conn);
     conn_id as ConnectionHandle
+}
+
+/// Connect to a host (defaults to TLS if port == 443)
+#[no_mangle]
+pub extern "C" fn net_connect(
+    engine_handle: NetEngineHandle,
+    host: *const c_char,
+    port: u16,
+) -> ConnectionHandle {
+    net_connect_tls(engine_handle, host, port, port == 443)
+}
+
+/// Query the ALPN protocol negotiated on a connection (e.g. "h2", "http/1.1", or empty if none)
+#[no_mangle]
+pub extern "C" fn net_conn_alpn_protocol(
+    engine_handle: NetEngineHandle,
+    conn_handle: ConnectionHandle,
+    out_buf: *mut u8,
+    out_buf_len: usize,
+    out_actual_len: *mut usize,
+) -> i32 {
+    if engine_handle.is_null() || conn_handle.is_null() || out_buf.is_null() || out_actual_len.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
+    let conn_id = conn_handle as usize;
+    if let Some(conn) = engine.connections.get(&conn_id) {
+        if let Some(ref tls) = conn.tlsconn {
+            if let Some(alpn) = tls.alpn_protocol() {
+                let to_copy = alpn.len().min(out_buf_len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(alpn.as_ptr(), out_buf, to_copy);
+                    *out_actual_len = to_copy;
+                }
+                return NS_OK;
+            }
+        }
+    }
+    unsafe { *out_actual_len = 0; }
+    NS_OK
 }
 
 /// Close a connection
@@ -647,6 +759,335 @@ pub extern "C" fn net_conn_state(
 // Plan Extensions
 // ============================================================
 
+// ============================================================
+// HTTP Client C ABI Interface (High-level Engine API)
+// ============================================================
+
+#[repr(C)]
+pub struct ZNetHttpRawResponse {
+    pub status: u16,
+    pub reason: *mut c_char,
+    pub header_names: *mut *mut c_char,
+    pub header_values: *mut *mut c_char,
+    pub header_count: usize,
+    pub body_data: *mut u8,
+    pub body_len: usize,
+}
+
+#[no_mangle]
+pub extern "C" fn net_http_execute(
+    engine_handle: NetEngineHandle,
+    session_id: u64,
+    method: *const c_char,
+    url: *const c_char,
+    header_names: *const *const c_char,
+    header_values: *const *const c_char,
+    header_count: usize,
+    body: *const u8,
+    body_len: usize,
+    transparent_decompression: bool,
+    out_response: *mut *mut ZNetHttpRawResponse,
+) -> i32 {
+    if engine_handle.is_null() || method.is_null() || url.is_null() || out_response.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+
+    let method_str = unsafe { std::ffi::CStr::from_ptr(method).to_string_lossy().into_owned() };
+    let url_str = unsafe { std::ffi::CStr::from_ptr(url).to_string_lossy().into_owned() };
+
+    let mut opts = protocols::http::client::HttpRequestOptions::new(&method_str, &url_str)
+        .with_session(session_id);
+    opts.transparent_decompression = transparent_decompression;
+
+    if !body.is_null() && body_len > 0 {
+        let body_slice = unsafe { std::slice::from_raw_parts(body, body_len) };
+        opts.body = Some(body_slice.to_vec());
+    }
+
+    if !header_names.is_null() && !header_values.is_null() && header_count > 0 {
+        for i in 0..header_count {
+            unsafe {
+                let name_ptr = *header_names.add(i);
+                let val_ptr = *header_values.add(i);
+                if !name_ptr.is_null() && !val_ptr.is_null() {
+                    let k = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                    let v = std::ffi::CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
+                    opts.headers.push((k, v));
+                }
+            }
+        }
+    }
+
+    match engine.http_engine.execute(&opts) {
+        Ok(resp) => {
+            let reason_c = std::ffi::CString::new(resp.reason).unwrap_or_default().into_raw();
+            let count = resp.headers.len();
+            let mut name_ptrs: Vec<*mut c_char> = Vec::with_capacity(count);
+            let mut val_ptrs: Vec<*mut c_char> = Vec::with_capacity(count);
+
+            for (k, v) in resp.headers {
+                name_ptrs.push(std::ffi::CString::new(k).unwrap_or_default().into_raw());
+                val_ptrs.push(std::ffi::CString::new(v).unwrap_or_default().into_raw());
+            }
+
+            let mut body_vec = resp.body;
+            let body_len = body_vec.len();
+            let body_ptr = if body_len > 0 {
+                let p = body_vec.as_mut_ptr();
+                std::mem::forget(body_vec);
+                p
+            } else {
+                std::ptr::null_mut()
+            };
+
+            let names_slice = name_ptrs.leak();
+            let vals_slice = val_ptrs.leak();
+
+            let raw = Box::into_raw(Box::new(ZNetHttpRawResponse {
+                status: resp.status,
+                reason: reason_c,
+                header_names: names_slice.as_mut_ptr(),
+                header_values: vals_slice.as_mut_ptr(),
+                header_count: count,
+                body_data: body_ptr,
+                body_len,
+            }));
+
+            unsafe {
+                *out_response = raw;
+            }
+            NS_OK
+        }
+        Err(_) => NS_ERROR_FAILURE,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_http_response_free(response: *mut ZNetHttpRawResponse) {
+    if response.is_null() {
+        return;
+    }
+    unsafe {
+        let resp = Box::from_raw(response);
+        if !resp.reason.is_null() {
+            let _ = std::ffi::CString::from_raw(resp.reason);
+        }
+        if !resp.header_names.is_null() && !resp.header_values.is_null() {
+            let names = Vec::from_raw_parts(resp.header_names, resp.header_count, resp.header_count);
+            let values = Vec::from_raw_parts(resp.header_values, resp.header_count, resp.header_count);
+            for p in names {
+                if !p.is_null() {
+                    let _ = std::ffi::CString::from_raw(p);
+                }
+            }
+            for p in values {
+                if !p.is_null() {
+                    let _ = std::ffi::CString::from_raw(p);
+                }
+            }
+        }
+        if !resp.body_data.is_null() && resp.body_len > 0 {
+            let _ = Vec::from_raw_parts(resp.body_data, resp.body_len, resp.body_len);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_pool_clear_session(engine_handle: NetEngineHandle, session_id: u64) -> i32 {
+    if engine_handle.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    engine.http_engine.clear_session(session_id);
+    NS_OK
+}
+
+#[repr(C)]
+pub struct ZNetHttpStreamCallbacks {
+    pub user_data: *mut c_void,
+    pub on_headers: Option<extern "C" fn(status: u16, reason: *const c_char, header_count: usize, header_names: *const *const c_char, header_values: *const *const c_char, user_data: *mut c_void)>,
+    pub on_data: Option<extern "C" fn(chunk: *const u8, chunk_len: usize, user_data: *mut c_void)>,
+    pub on_complete: Option<extern "C" fn(keep_alive: bool, user_data: *mut c_void)>,
+}
+
+#[no_mangle]
+pub extern "C" fn net_http_execute_streaming(
+    engine_handle: NetEngineHandle,
+    session_id: u64,
+    method: *const c_char,
+    url: *const c_char,
+    header_names: *const *const c_char,
+    header_values: *const *const c_char,
+    header_count: usize,
+    body: *const u8,
+    body_len: usize,
+    body_ring_id: u64,
+    callbacks: *const ZNetHttpStreamCallbacks,
+) -> i32 {
+    if engine_handle.is_null() || method.is_null() || url.is_null() || callbacks.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let cb = unsafe { &*callbacks };
+
+    let method_str = unsafe { std::ffi::CStr::from_ptr(method).to_string_lossy().into_owned() };
+    let url_str = unsafe { std::ffi::CStr::from_ptr(url).to_string_lossy().into_owned() };
+
+    let mut opts = protocols::http::client::HttpRequestOptions::new(&method_str, &url_str)
+        .with_session(session_id);
+
+    if !body.is_null() && body_len > 0 {
+        let body_slice = unsafe { std::slice::from_raw_parts(body, body_len) };
+        opts.body = Some(body_slice.to_vec());
+    }
+
+    if !header_names.is_null() && !header_values.is_null() && header_count > 0 {
+        for i in 0..header_count {
+            unsafe {
+                let name_ptr = *header_names.add(i);
+                let val_ptr = *header_values.add(i);
+                if !name_ptr.is_null() && !val_ptr.is_null() {
+                    let k = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                    let v = std::ffi::CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
+                    opts.headers.push((k, v));
+                }
+            }
+        }
+    }
+
+    let ring_opt = if body_ring_id > 0 {
+        engine.body_rings.get(&body_ring_id).map(|&ptr| unsafe { &*ptr })
+    } else {
+        None
+    };
+
+    let user_data = cb.user_data;
+    let on_headers_fn = cb.on_headers;
+    let on_data_fn = cb.on_data;
+    let on_complete_fn = cb.on_complete;
+
+    let res = engine.http_engine.execute_streaming(
+        &opts,
+        ring_opt,
+        |status, reason, headers| {
+            if let Some(f) = on_headers_fn {
+                let reason_c = std::ffi::CString::new(reason).unwrap_or_default();
+                let count = headers.len();
+                let mut name_cstrings = Vec::with_capacity(count);
+                let mut val_cstrings = Vec::with_capacity(count);
+                let mut name_ptrs = Vec::with_capacity(count);
+                let mut val_ptrs = Vec::with_capacity(count);
+
+                for (k, v) in headers {
+                    let c_k = std::ffi::CString::new(k.as_str()).unwrap_or_default();
+                    let c_v = std::ffi::CString::new(v.as_str()).unwrap_or_default();
+                    name_ptrs.push(c_k.as_ptr());
+                    val_ptrs.push(c_v.as_ptr());
+                    name_cstrings.push(c_k);
+                    val_cstrings.push(c_v);
+                }
+
+                f(
+                    status,
+                    reason_c.as_ptr(),
+                    count,
+                    name_ptrs.as_ptr(),
+                    val_ptrs.as_ptr(),
+                    user_data,
+                );
+            }
+        },
+        |chunk| {
+            if let Some(f) = on_data_fn {
+                f(chunk.as_ptr(), chunk.len(), user_data);
+            }
+        },
+        |keep_alive| {
+            if let Some(f) = on_complete_fn {
+                f(keep_alive, user_data);
+            }
+        },
+    );
+
+    match res {
+        Ok(_) => NS_OK,
+        Err(_) => NS_ERROR_FAILURE,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_cookie_jar_store(
+    engine_handle: NetEngineHandle,
+    session_id: u64,
+    url: *const c_char,
+    set_cookie_str: *const c_char,
+) -> i32 {
+    if engine_handle.is_null() || url.is_null() || set_cookie_str.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let url_str = unsafe { std::ffi::CStr::from_ptr(url).to_string_lossy() };
+    let cookie_str = unsafe { std::ffi::CStr::from_ptr(set_cookie_str).to_string_lossy() };
+
+    let parsed_url = match url::Url::parse(&url_str) {
+        Ok(u) => u,
+        Err(_) => return NS_ERROR_FAILURE,
+    };
+
+    if engine.http_engine.cookie_jar.process_set_cookie(session_id, &parsed_url, &cookie_str) {
+        NS_OK
+    } else {
+        NS_ERROR_FAILURE
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_cookie_jar_get_header(
+    engine_handle: NetEngineHandle,
+    session_id: u64,
+    url: *const c_char,
+    out_buf: *mut c_char,
+    max_len: usize,
+) -> i32 {
+    if engine_handle.is_null() || url.is_null() || out_buf.is_null() || max_len == 0 {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let url_str = unsafe { std::ffi::CStr::from_ptr(url).to_string_lossy() };
+
+    let parsed_url = match url::Url::parse(&url_str) {
+        Ok(u) => u,
+        Err(_) => return NS_ERROR_FAILURE,
+    };
+
+    if let Some(header_val) = engine.http_engine.cookie_jar.get_cookie_header(session_id, &parsed_url) {
+        let bytes = header_val.as_bytes();
+        let copy_len = bytes.len().min(max_len - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, copy_len);
+            *out_buf.add(copy_len) = 0;
+        }
+        NS_OK
+    } else {
+        unsafe {
+            *out_buf = 0;
+        }
+        NS_OK
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_cookie_jar_clear(
+    engine_handle: NetEngineHandle,
+    session_id: u64,
+) {
+    if !engine_handle.is_null() {
+        let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+        engine.http_engine.cookie_jar.clear_session(session_id);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn net_fetch_create(_url: *const c_char, _options: *const FetchOptions) -> FetchHandle {
     // Scaffolding implementation
@@ -875,7 +1316,7 @@ pub extern "C" fn net_tls_create(
         }
     };
 
-    let mut state = match TlsState::new(host_str, port) {
+    let mut state = match TlsState::new(host_str, port, engine.tls_config.clone()) {
         Ok(s) => s,
         Err(_) => return null_mut(),
     };
@@ -1256,4 +1697,204 @@ pub extern "C" fn net_http3_close(engine_handle: NetEngineHandle, conn_handle: C
         let _ = engine.poll.registry().deregister(&mut endpoint_entry.socket);
     }
     NS_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_store_contains_trust_anchors() {
+        let store = root_store();
+        assert!(!store.is_empty(), "trust store must contain roots");
+        assert!(store.len() >= webpki_roots::TLS_SERVER_ROOTS.len());
+    }
+
+    #[test]
+    fn engine_configures_alpn_for_h2_and_http11() {
+        let engine = NetEngine::new().expect("engine must initialize");
+        assert_eq!(
+            engine.tls_config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "ALPN must negotiate h2 then http/1.1"
+        );
+    }
+
+    #[test]
+    fn test_load_pem_certs_parses_valid_cert() {
+        let pem_sample = "\
+-----BEGIN CERTIFICATE-----
+MIIBdDCCARugAwIBAgIQBwX1Iqjr8MdCPXLI8fgISjAKBggqhkjOPQQDAjAZMRcw
+FQYDVQQDEw5hbnRpZ3Jhdml0eSBDQTAeFw0yNjExMjEwNTUzMDlaFw0zNjExMjEw
+NTUzMDlaMBkxFzAVBgNVBAMTDmFudGlncmF2aXR5IENBMFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEl8B2nNIkTR4D1wul5vwunM97rfZXNAO8iUmvTgrYcsAI277f
+IyPh6m6bXqasXnKFL62EptHqz4weaRM8i+QmUaNFMEMwDgYDVR0PAQH/BAQDAgIE
+MBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFB7Bz8ieNJXYG22erK9B1IYY
+Np1AMAoGCCqGSM49BAMCA0cAMEQCIBN6PxS/+aMaOIoywLaD3/WKP0QVoZkcwGka
+J0wGoFpdAiB7n+1noxTxqbLQQ/aSI9vGSov/GskEh1Zpn4xh3kNtOg==
+-----END CERTIFICATE-----
+";
+        let temp_path = std::env::temp_dir().join("test_cert.pem");
+        std::fs::write(&temp_path, pem_sample).expect("write temp pem");
+        let certs = load_pem_certs(temp_path.to_str().unwrap());
+        let _ = std::fs::remove_file(temp_path);
+        assert_eq!(certs.len(), 1);
+        assert!(!certs[0].is_empty());
+    }
+
+    #[test]
+    fn test_c_abi_net_http_execute_roundtrip() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"status\":\"ready\"}";
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let engine = net_engine_create();
+        assert!(!engine.is_null());
+
+        let method = std::ffi::CString::new("GET").unwrap();
+        let url = std::ffi::CString::new(format!("http://127.0.0.1:{}/status", port)).unwrap();
+
+        let mut raw_resp: *mut ZNetHttpRawResponse = std::ptr::null_mut();
+        let res = net_http_execute(
+            engine,
+            0,
+            method.as_ptr(),
+            url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            true,
+            &mut raw_resp,
+        );
+
+        server_thread.join().unwrap();
+        assert_eq!(res, NS_OK);
+        assert!(!raw_resp.is_null());
+
+        unsafe {
+            assert_eq!((*raw_resp).status, 200);
+            assert_eq!((*raw_resp).body_len, 18);
+            let body = std::slice::from_raw_parts((*raw_resp).body_data, (*raw_resp).body_len);
+            assert_eq!(body, b"{\"status\":\"ready\"}");
+        }
+
+        net_http_response_free(raw_resp);
+        net_engine_destroy(engine);
+    }
+
+    #[test]
+    fn test_c_abi_net_http_execute_streaming_and_cookie_jar() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\n0123456789";
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let engine = net_engine_create();
+        assert!(!engine.is_null());
+
+        struct Context {
+            status: u16,
+            body: Vec<u8>,
+            done: bool,
+        }
+
+        let mut ctx = Context {
+            status: 0,
+            body: Vec::new(),
+            done: false,
+        };
+
+        extern "C" fn on_headers(
+            status: u16,
+            _reason: *const c_char,
+            _count: usize,
+            _names: *const *const c_char,
+            _vals: *const *const c_char,
+            user_data: *mut c_void,
+        ) {
+            let ctx = unsafe { &mut *(user_data as *mut Context) };
+            ctx.status = status;
+        }
+
+        extern "C" fn on_data(chunk: *const u8, len: usize, user_data: *mut c_void) {
+            let ctx = unsafe { &mut *(user_data as *mut Context) };
+            let slice = unsafe { std::slice::from_raw_parts(chunk, len) };
+            ctx.body.extend_from_slice(slice);
+        }
+
+        extern "C" fn on_complete(_keep_alive: bool, user_data: *mut c_void) {
+            let ctx = unsafe { &mut *(user_data as *mut Context) };
+            ctx.done = true;
+        }
+
+        let callbacks = ZNetHttpStreamCallbacks {
+            user_data: &mut ctx as *mut _ as *mut c_void,
+            on_headers: Some(on_headers),
+            on_data: Some(on_data),
+            on_complete: Some(on_complete),
+        };
+
+        let method = std::ffi::CString::new("GET").unwrap();
+        let url = std::ffi::CString::new(format!("http://127.0.0.1:{}/stream", port)).unwrap();
+
+        let res = net_http_execute_streaming(
+            engine,
+            0,
+            method.as_ptr(),
+            url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+            &callbacks,
+        );
+
+        server_thread.join().unwrap();
+        assert_eq!(res, NS_OK);
+        assert_eq!(ctx.status, 200);
+        assert_eq!(ctx.body, b"0123456789");
+        assert!(ctx.done);
+
+        // Test cookie jar C ABI
+        let cookie_val = std::ffi::CString::new("pref=dark; Path=/").unwrap();
+        let store_res = net_cookie_jar_store(engine, 1, url.as_ptr(), cookie_val.as_ptr());
+        assert_eq!(store_res, NS_OK);
+
+        let mut out_header = [0 as c_char; 256];
+        let get_res = net_cookie_jar_get_header(engine, 1, url.as_ptr(), out_header.as_mut_ptr(), out_header.len());
+        assert_eq!(get_res, NS_OK);
+        let header_str = unsafe { std::ffi::CStr::from_ptr(out_header.as_ptr()).to_string_lossy() };
+        assert!(header_str.contains("pref=dark"));
+
+        net_cookie_jar_clear(engine, 1);
+        let _ = net_cookie_jar_get_header(engine, 1, url.as_ptr(), out_header.as_mut_ptr(), out_header.len());
+        assert_eq!(out_header[0], 0);
+
+        net_engine_destroy(engine);
+    }
 }
