@@ -431,7 +431,7 @@ pub extern "C" fn net_connect_tls(
         }
     }
     
-    let mut stream = match stream {
+    let stream = match stream {
         Some(s) => s,
         None => return null_mut(),
     };

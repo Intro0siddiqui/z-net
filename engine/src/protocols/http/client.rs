@@ -126,7 +126,7 @@ impl HttpClientEngine {
         on_complete: C,
     ) -> Result<bool, String>
     where
-        H: FnMut(u16, &str, &HashMap<String, String>),
+        H: FnMut(u16, &str, &[(String, String)]),
         D: FnMut(&[u8]),
         C: FnMut(bool),
     {
@@ -144,7 +144,7 @@ impl HttpClientEngine {
         mut is_cancelled: K,
     ) -> Result<bool, String>
     where
-        H: FnMut(u16, &str, &HashMap<String, String>),
+        H: FnMut(u16, &str, &[(String, String)]),
         D: FnMut(&[u8]),
         C: FnMut(bool),
         K: FnMut() -> bool,
@@ -210,28 +210,49 @@ impl HttpClientEngine {
         }
 
         let mut req_builder = Http1RequestBuilder::new(&options.method, &path_and_query);
-        let mut has_cookie_header = false;
         let mut has_range_header = false;
         let mut has_accept_encoding = false;
 
-        for (k, v) in &options.headers {
-            if k.eq_ignore_ascii_case("cookie") {
-                has_cookie_header = true;
+        let mut cookie_map: HashMap<String, String> = HashMap::new();
+
+        // 1. Preload matching cookies from RFC 6265 CookieJar (HttpOnly, cross-domain, session cookies)
+        if let Some(cookie_val) = self.cookie_jar.get_cookie_header(options.session_id, &parsed_url) {
+            for part in cookie_val.split(';') {
+                let trimmed = part.trim();
+                if let Some((ck, cv)) = trimmed.split_once('=') {
+                    cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                }
             }
-            if k.eq_ignore_ascii_case("range") {
-                has_range_header = true;
-            }
-            if k.eq_ignore_ascii_case("accept-encoding") {
-                has_accept_encoding = true;
-            }
-            req_builder = req_builder.header(k, v);
         }
 
-        // Automatic RFC 6265 Cookie Header injection if not manually provided
-        if !has_cookie_header {
-            if let Some(cookie_val) = self.cookie_jar.get_cookie_header(options.session_id, &parsed_url) {
-                req_builder = req_builder.header("Cookie", &cookie_val);
+        // 2. Process caller headers: merge any Cookie header with jar cookies, track range/encoding
+        for (k, v) in &options.headers {
+            if k.eq_ignore_ascii_case("cookie") {
+                for part in v.split(';') {
+                    let trimmed = part.trim();
+                    if let Some((ck, cv)) = trimmed.split_once('=') {
+                        cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                    }
+                }
+            } else {
+                if k.eq_ignore_ascii_case("range") {
+                    has_range_header = true;
+                }
+                if k.eq_ignore_ascii_case("accept-encoding") {
+                    has_accept_encoding = true;
+                }
+                req_builder = req_builder.header(k, v);
             }
+        }
+
+        // 3. Inject unified merged Cookie header if any cookies exist
+        if !cookie_map.is_empty() {
+            let mut cookie_pairs: Vec<String> = cookie_map
+                .into_iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            cookie_pairs.sort();
+            req_builder = req_builder.header("Cookie", &cookie_pairs.join("; "));
         }
 
         // Range requests must not request transparent compression because partial slices cannot
@@ -286,15 +307,13 @@ impl HttpClientEngine {
                     for ev in results {
                         match ev {
                             Http1FeedResult::HeadersParsed { status_code, reason, headers, .. } => {
-                                let mut resp_headers = HashMap::new();
                                 for (k, v) in &headers {
-                                    resp_headers.insert(k.to_ascii_lowercase(), v.clone());
-                                    // Automatic Set-Cookie processing
+                                    // Automatic Set-Cookie processing into RFC 6265 CookieJar
                                     if k.eq_ignore_ascii_case("set-cookie") {
                                         self.cookie_jar.process_set_cookie(options.session_id, &parsed_url, v);
                                     }
                                 }
-                                on_headers(status_code, &reason, &resp_headers);
+                                on_headers(status_code, &reason, &headers);
                                 headers_dispatched = true;
                             }
                             Http1FeedResult::BodyData(chunk) => {
@@ -343,7 +362,9 @@ impl HttpClientEngine {
             |code, reason, headers| {
                 status_code = code;
                 reason_phrase = reason.to_string();
-                resp_headers = headers.clone();
+                for (k, v) in headers {
+                    resp_headers.insert(k.to_ascii_lowercase(), v.clone());
+                }
             },
             |chunk| {
                 raw_body.extend_from_slice(chunk);
@@ -351,9 +372,9 @@ impl HttpClientEngine {
             |_keep_alive| {},
         )?;
 
-        // Handle content decompression if requested, unless Range header was specified
+        // Handle content decompression if requested, unless Range header was specified or status is 206
         let has_range_header = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
-        let final_body = if options.transparent_decompression && !has_range_header {
+        let final_body = if options.transparent_decompression && !has_range_header && status_code != 206 {
             if let Some(encoding) = resp_headers.get("content-encoding") {
                 decompress_payload(encoding, &raw_body).unwrap_or(raw_body)
             } else {
@@ -576,6 +597,96 @@ mod tests {
 
         assert!(res.is_ok());
         assert!(headers_got);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_cookie_merging() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+
+                // Verify Cookie header contains merged values
+                assert!(req_str.contains("Cookie:"));
+                assert!(req_str.contains("jar_cookie=val1"));
+                assert!(req_str.contains("webkit_cookie=val2"));
+
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/cookie_test", port);
+        let parsed_url = Url::parse(&url).unwrap();
+
+        // 1. Preload jar with session cookie
+        assert!(client.cookie_jar.process_set_cookie(1, &parsed_url, "jar_cookie=val1; Path=/; HttpOnly"));
+
+        // 2. Caller passes WebKit DOM cookie
+        let opts = HttpRequestOptions::new("GET", &url)
+            .with_session(1)
+            .header("Cookie", "webkit_cookie=val2");
+
+        let resp = client.execute(&opts).expect("execute with merged cookies");
+        assert_eq!(resp.status, 200);
+
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_multiple_set_cookie_preservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                let response = b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc123xyz; Path=/; HttpOnly\r\nSet-Cookie: theme=dark; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/multi_cookie", port);
+        let parsed_url = Url::parse(&url).unwrap();
+
+        let mut received_set_cookie_count = 0;
+        let opts = HttpRequestOptions::new("GET", &url).with_session(1);
+
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_code, _reason, headers| {
+                for (k, _v) in headers {
+                    if k.eq_ignore_ascii_case("set-cookie") {
+                        received_set_cookie_count += 1;
+                    }
+                }
+            },
+            |_data| {},
+            |_keep_alive| {},
+        );
+
+        assert!(res.is_ok());
+        assert_eq!(received_set_cookie_count, 2, "Both Set-Cookie headers must be preserved");
+
+        // Verify jar stored both cookies
+        let jar_header = client.cookie_jar.get_cookie_header(1, &parsed_url).expect("cookie header in jar");
+        assert!(jar_header.contains("sid=abc123xyz"));
+        assert!(jar_header.contains("theme=dark"));
+
         server_thread.join().unwrap();
     }
 }
