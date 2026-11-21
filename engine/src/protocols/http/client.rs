@@ -121,14 +121,33 @@ impl HttpClientEngine {
         &mut self,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
-        mut on_headers: H,
-        mut on_data_chunk: D,
-        mut on_complete: C,
+        on_headers: H,
+        on_data_chunk: D,
+        on_complete: C,
     ) -> Result<bool, String>
     where
         H: FnMut(u16, &str, &HashMap<String, String>),
         D: FnMut(&[u8]),
         C: FnMut(bool),
+    {
+        self.execute_streaming_with_cancel(options, body_ring, on_headers, on_data_chunk, on_complete, || false)
+    }
+
+    /// Execute an HTTP request with progressive streaming, zero-copy BodyRing, and early cancellation check.
+    pub fn execute_streaming_with_cancel<H, D, C, K>(
+        &mut self,
+        options: &HttpRequestOptions,
+        body_ring: Option<&BodyRingDescriptor>,
+        mut on_headers: H,
+        mut on_data_chunk: D,
+        mut on_complete: C,
+        mut is_cancelled: K,
+    ) -> Result<bool, String>
+    where
+        H: FnMut(u16, &str, &HashMap<String, String>),
+        D: FnMut(&[u8]),
+        C: FnMut(bool),
+        K: FnMut() -> bool,
     {
         let parsed_url = Url::parse(&options.url)
             .map_err(|e| format!("Invalid URL: {}", e))?;
@@ -192,10 +211,18 @@ impl HttpClientEngine {
 
         let mut req_builder = Http1RequestBuilder::new(&options.method, &path_and_query);
         let mut has_cookie_header = false;
+        let mut has_range_header = false;
+        let mut has_accept_encoding = false;
 
         for (k, v) in &options.headers {
             if k.eq_ignore_ascii_case("cookie") {
                 has_cookie_header = true;
+            }
+            if k.eq_ignore_ascii_case("range") {
+                has_range_header = true;
+            }
+            if k.eq_ignore_ascii_case("accept-encoding") {
+                has_accept_encoding = true;
             }
             req_builder = req_builder.header(k, v);
         }
@@ -207,7 +234,9 @@ impl HttpClientEngine {
             }
         }
 
-        if options.transparent_decompression {
+        // Range requests must not request transparent compression because partial slices cannot
+        // be decompressed independently and WebKit expects raw byte ranges for media streaming.
+        if options.transparent_decompression && !has_range_header && !has_accept_encoding {
             req_builder = req_builder.header("Accept-Encoding", "gzip, deflate, br, zstd");
         }
 
@@ -231,6 +260,10 @@ impl HttpClientEngine {
         let mut is_completed = false;
 
         while !is_completed {
+            if is_cancelled() {
+                return Ok(headers_dispatched);
+            }
+
             match stream.read(&mut read_buf) {
                 Ok(0) => {
                     // EOF on stream
@@ -318,8 +351,9 @@ impl HttpClientEngine {
             |_keep_alive| {},
         )?;
 
-        // Handle content decompression if requested
-        let final_body = if options.transparent_decompression {
+        // Handle content decompression if requested, unless Range header was specified
+        let has_range_header = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let final_body = if options.transparent_decompression && !has_range_header {
             if let Some(encoding) = resp_headers.get("content-encoding") {
                 decompress_payload(encoding, &raw_body).unwrap_or(raw_body)
             } else {
@@ -465,6 +499,83 @@ mod tests {
         let resp2 = client.execute(&opts).expect("second call");
         assert_eq!(resp2.status, 200);
 
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_range_request_omits_compression() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                // Range header must be present
+                assert!(req_str.contains("Range: bytes=0-1023") || req_str.contains("range: bytes=0-1023"));
+                // Accept-Encoding must NOT be present
+                assert!(!req_str.to_ascii_lowercase().contains("accept-encoding:"));
+
+                let response = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1023/2048\r\nContent-Length: 4\r\nConnection: close\r\n\r\nPART";
+                let _ = stream.write_all(response);
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/video.mp4", port);
+        let opts = HttpRequestOptions::new("GET", &url)
+            .header("Range", "bytes=0-1023");
+
+        let resp = client.execute(&opts).expect("range request");
+        assert_eq!(resp.status, 206);
+        assert_eq!(resp.body, b"PART");
+
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_early_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+                let _ = stream.write_all(response);
+                // Send some data then hold socket open
+                let _ = stream.write_all(b"initial chunk");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/stream", port);
+        let opts = HttpRequestOptions::new("GET", &url);
+
+        let cancelled = AtomicBool::new(false);
+        let mut headers_got = false;
+
+        let res = client.execute_streaming_with_cancel(
+            &opts,
+            None,
+            |_code, _reason, _hdrs| {
+                headers_got = true;
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            |_data| {},
+            |_keep_alive| {},
+            || cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        );
+
+        assert!(res.is_ok());
+        assert!(headers_got);
         server_thread.join().unwrap();
     }
 }

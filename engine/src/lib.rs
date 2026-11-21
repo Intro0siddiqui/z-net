@@ -255,6 +255,7 @@ pub struct NetEngine {
     /// exposes one.
     quic_conns: HashMap<usize, QuicConnectionEntry>,
     next_quic_id: usize,
+    pub last_error: std::sync::Mutex<Option<String>>,
 }
 
 /// Owned state for a single QUIC endpoint. We keep the `mio::net::UdpSocket`
@@ -326,11 +327,12 @@ impl NetEngine {
         #[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
         
-        // Setup default TLS config with ALPN for HTTP/2 and HTTP/1.1
+        // Setup default TLS config with ALPN for HTTP/1.1 streaming
+        // Note: HTTP/1.1 is pinned until full HTTP/2 multiplexed streaming is wired into execute_streaming
         let mut config = ClientConfig::builder()
             .with_root_certificates(root_store())
             .with_no_client_auth();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
             
         let tls_cfg = Arc::new(config);
         let http_engine = protocols::http::client::HttpClientEngine::new(tls_cfg.clone());
@@ -349,6 +351,7 @@ impl NetEngine {
             quic_endpoints: HashMap::new(),
             quic_conns: HashMap::new(),
             next_quic_id: 1,
+            last_error: std::sync::Mutex::new(None),
         })
     }
     
@@ -859,7 +862,14 @@ pub extern "C" fn net_http_execute(
             }
             NS_OK
         }
-        Err(_) => NS_ERROR_FAILURE,
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            eprintln!("[z-net] net_http_execute failed: {}", err_msg);
+            if let Ok(mut lock) = engine.last_error.lock() {
+                *lock = Some(err_msg);
+            }
+            NS_ERROR_FAILURE
+        }
     }
 }
 
@@ -909,6 +919,34 @@ pub struct ZNetHttpStreamCallbacks {
     pub on_headers: Option<extern "C" fn(status: u16, reason: *const c_char, header_count: usize, header_names: *const *const c_char, header_values: *const *const c_char, user_data: *mut c_void)>,
     pub on_data: Option<extern "C" fn(chunk: *const u8, chunk_len: usize, user_data: *mut c_void)>,
     pub on_complete: Option<extern "C" fn(keep_alive: bool, user_data: *mut c_void)>,
+    pub is_cancelled: Option<extern "C" fn(user_data: *mut c_void) -> bool>,
+}
+
+#[no_mangle]
+pub extern "C" fn net_get_last_error(
+    engine_handle: NetEngineHandle,
+    out_buf: *mut c_char,
+    max_len: usize,
+) -> i32 {
+    if engine_handle.is_null() || out_buf.is_null() || max_len == 0 {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
+    if let Ok(lock) = engine.last_error.lock() {
+        if let Some(ref err) = *lock {
+            let bytes = err.as_bytes();
+            let copy_len = std::cmp::min(bytes.len(), max_len - 1);
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out_buf, copy_len);
+                *out_buf.add(copy_len) = 0;
+            }
+            return NS_OK;
+        }
+    }
+    unsafe {
+        *out_buf = 0;
+    }
+    NS_OK
 }
 
 #[no_mangle]
@@ -966,8 +1004,9 @@ pub extern "C" fn net_http_execute_streaming(
     let on_headers_fn = cb.on_headers;
     let on_data_fn = cb.on_data;
     let on_complete_fn = cb.on_complete;
+    let is_cancelled_fn = cb.is_cancelled;
 
-    let res = engine.http_engine.execute_streaming(
+    let res = engine.http_engine.execute_streaming_with_cancel(
         &opts,
         ring_opt,
         |status, reason, headers| {
@@ -1008,11 +1047,25 @@ pub extern "C" fn net_http_execute_streaming(
                 f(keep_alive, user_data);
             }
         },
+        || {
+            if let Some(f) = is_cancelled_fn {
+                f(user_data)
+            } else {
+                false
+            }
+        },
     );
 
     match res {
         Ok(_) => NS_OK,
-        Err(_) => NS_ERROR_FAILURE,
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            eprintln!("[z-net] net_http_execute_streaming failed: {}", err_msg);
+            if let Ok(mut lock) = engine.last_error.lock() {
+                *lock = Some(err_msg);
+            }
+            NS_ERROR_FAILURE
+        }
     }
 }
 
@@ -1711,12 +1764,12 @@ mod tests {
     }
 
     #[test]
-    fn engine_configures_alpn_for_h2_and_http11() {
+    fn engine_configures_alpn_for_http11() {
         let engine = NetEngine::new().expect("engine must initialize");
         assert_eq!(
             engine.tls_config.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            "ALPN must negotiate h2 then http/1.1"
+            vec![b"http/1.1".to_vec()],
+            "ALPN must negotiate http/1.1 for streaming engine"
         );
     }
 
@@ -1855,6 +1908,7 @@ J0wGoFpdAiB7n+1noxTxqbLQQ/aSI9vGSov/GskEh1Zpn4xh3kNtOg==
             on_headers: Some(on_headers),
             on_data: Some(on_data),
             on_complete: Some(on_complete),
+            is_cancelled: None,
         };
 
         let method = std::ffi::CString::new("GET").unwrap();
