@@ -12,7 +12,7 @@
 //! streaming use case (incremental chunks arriving off the wire).
 
 use std::ffi::{c_int, c_uchar, c_void};
-use std::io::Read;
+use std::io::{Read, Write};
 
 use brotli::Decompressor as BrotliReader;
 use zstd::stream::Decoder as ZstdReaderInner;
@@ -188,6 +188,97 @@ pub fn decompress_payload(encoding: &str, data: &[u8]) -> Result<Vec<u8>, String
     Ok(out)
 }
 
+/// Progressive streaming decompressor supporting gzip, deflate, br, and zstd.
+pub enum StreamDecompressor {
+    Gzip(flate2::write::MultiGzDecoder<Vec<u8>>),
+    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
+    Brotli(brotli::DecompressorWriter<Vec<u8>>),
+    Zstd(zstd::stream::write::Decoder<'static, Vec<u8>>),
+}
+
+impl StreamDecompressor {
+    /// Create a decompressor instance for the given encoding string.
+    pub fn new(encoding: &str) -> Option<Self> {
+        match encoding.trim().to_ascii_lowercase().as_str() {
+            "gzip" | "x-gzip" => Some(StreamDecompressor::Gzip(flate2::write::MultiGzDecoder::new(Vec::new()))),
+            "deflate" => Some(StreamDecompressor::Deflate(flate2::write::ZlibDecoder::new(Vec::new()))),
+            "br" => Some(StreamDecompressor::Brotli(brotli::DecompressorWriter::new(Vec::new(), 4096))),
+            "zstd" => {
+                let decoder = zstd::stream::write::Decoder::new(Vec::new()).ok()?;
+                Some(StreamDecompressor::Zstd(decoder))
+            }
+            _ => None,
+        }
+    }
+
+    /// Feed a compressed chunk into the decompressor, invoking `on_output` with any decompressed bytes.
+    pub fn feed<F: FnMut(&[u8])>(&mut self, chunk: &[u8], mut on_output: F) -> Result<(), String> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        match self {
+            StreamDecompressor::Gzip(d) => {
+                d.write_all(chunk).map_err(|e| format!("Gzip streaming decompression error: {}", e))?;
+                let buf = d.get_mut();
+                if !buf.is_empty() {
+                    on_output(buf);
+                    buf.clear();
+                }
+            }
+            StreamDecompressor::Deflate(d) => {
+                d.write_all(chunk).map_err(|e| format!("Deflate streaming decompression error: {}", e))?;
+                let buf = d.get_mut();
+                if !buf.is_empty() {
+                    on_output(buf);
+                    buf.clear();
+                }
+            }
+            StreamDecompressor::Brotli(d) => {
+                d.write_all(chunk).map_err(|e| format!("Brotli streaming decompression error: {}", e))?;
+                let buf = d.get_mut();
+                if !buf.is_empty() {
+                    on_output(buf);
+                    buf.clear();
+                }
+            }
+            StreamDecompressor::Zstd(d) => {
+                d.write_all(chunk).map_err(|e| format!("Zstd streaming decompression error: {}", e))?;
+                d.flush().map_err(|e| format!("Zstd flush error: {}", e))?;
+                let buf = d.get_mut();
+                if !buf.is_empty() {
+                    on_output(buf);
+                    buf.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete decompression, flushing any remaining buffered bytes.
+    pub fn finish<F: FnMut(&[u8])>(self, mut on_output: F) -> Result<(), String> {
+        let remaining = match self {
+            StreamDecompressor::Gzip(d) => {
+                d.finish().map_err(|e| format!("Gzip finish error: {}", e))?
+            }
+            StreamDecompressor::Deflate(d) => {
+                d.finish().map_err(|e| format!("Deflate finish error: {}", e))?
+            }
+            StreamDecompressor::Brotli(mut d) => {
+                let _ = d.close();
+                d.into_inner().map_err(|_| "Brotli close/finish error".to_string())?
+            }
+            StreamDecompressor::Zstd(mut d) => {
+                let _ = d.flush();
+                d.into_inner()
+            }
+        };
+        if !remaining.is_empty() {
+            on_output(&remaining);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +302,100 @@ mod tests {
         let original = b"Plain uncompressed text";
         let out = decompress_payload("identity", original).unwrap();
         assert_eq!(out, original);
+    }
+
+    #[test]
+    fn test_streaming_decompress_gzip_chunks() {
+        let original = b"Chunked progressive streaming gzip test payload with lots of repetitive text for good compression ratios! ".repeat(50);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut decompressor = StreamDecompressor::new("gzip").expect("create gzip decompressor");
+        let mut output = Vec::new();
+
+        // Feed in small arbitrary chunk sizes (e.g. 17 bytes)
+        for chunk in compressed.chunks(17) {
+            decompressor.feed(chunk, |decompressed| {
+                output.extend_from_slice(decompressed);
+            }).expect("feed chunk");
+        }
+
+        decompressor.finish(|decompressed| {
+            output.extend_from_slice(decompressed);
+        }).expect("finish gzip decompressor");
+
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_streaming_decompress_deflate_chunks() {
+        use flate2::write::ZlibEncoder;
+        let original = b"Chunked progressive streaming deflate test payload! ".repeat(40);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut decompressor = StreamDecompressor::new("deflate").expect("create deflate decompressor");
+        let mut output = Vec::new();
+
+        for chunk in compressed.chunks(13) {
+            decompressor.feed(chunk, |decompressed| {
+                output.extend_from_slice(decompressed);
+            }).expect("feed chunk");
+        }
+
+        decompressor.finish(|decompressed| {
+            output.extend_from_slice(decompressed);
+        }).expect("finish deflate decompressor");
+
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_streaming_decompress_brotli_chunks() {
+        use brotli::CompressorWriter;
+        let original = b"Chunked progressive streaming brotli test payload! ".repeat(40);
+        let mut compressed = Vec::new();
+        {
+            let mut writer = CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            writer.write_all(&original).unwrap();
+        }
+
+        let mut decompressor = StreamDecompressor::new("br").expect("create br decompressor");
+        let mut output = Vec::new();
+
+        for chunk in compressed.chunks(11) {
+            decompressor.feed(chunk, |decompressed| {
+                output.extend_from_slice(decompressed);
+            }).expect("feed chunk");
+        }
+
+        decompressor.finish(|decompressed| {
+            output.extend_from_slice(decompressed);
+        }).expect("finish br decompressor");
+
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_streaming_decompress_zstd_chunks() {
+        let original = b"Chunked progressive streaming zstd test payload! ".repeat(40);
+        let compressed = zstd::encode_all(&original[..], 3).unwrap();
+
+        let mut decompressor = StreamDecompressor::new("zstd").expect("create zstd decompressor");
+        let mut output = Vec::new();
+
+        for chunk in compressed.chunks(19) {
+            decompressor.feed(chunk, |decompressed| {
+                output.extend_from_slice(decompressed);
+            }).expect("feed chunk");
+        }
+
+        decompressor.finish(|decompressed| {
+            output.extend_from_slice(decompressed);
+        }).expect("finish zstd decompressor");
+
+        assert_eq!(output, original);
     }
 }

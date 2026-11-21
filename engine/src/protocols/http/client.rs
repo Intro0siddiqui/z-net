@@ -11,7 +11,7 @@ use url::Url;
 use super::cookie_jar::CookieJar;
 use super::h1::{Http1FeedResult, Http1RequestBuilder, Http1ResponseParser};
 use super::pool::{ConnectionPool, PoolKey};
-use crate::protocols::compression::decompress_payload;
+use crate::protocols::compression::{decompress_payload, StreamDecompressor};
 use crate::BodyRingDescriptor;
 
 /// A parsed HTTP response representation.
@@ -285,6 +285,7 @@ impl HttpClientEngine {
         let mut headers_dispatched = false;
         let mut can_keep_alive = false;
         let mut is_completed = false;
+        let mut decompressor: Option<StreamDecompressor> = None;
 
         while !is_completed {
             if is_cancelled() {
@@ -297,11 +298,30 @@ impl HttpClientEngine {
                     let eof_results = parser.on_eof();
                     for ev in eof_results {
                         if let Http1FeedResult::BodyData(chunk) = ev {
-                            if let Some(ring) = body_ring {
-                                ring.write_slice(&chunk);
+                            if let Some(ref mut dec) = decompressor {
+                                dec.feed(&chunk, |decompressed_slice| {
+                                    if let Some(ring) = body_ring {
+                                        ring.write_slice(decompressed_slice);
+                                    }
+                                    on_data_chunk(decompressed_slice);
+                                })
+                                .map_err(|e| format!("Decompression error: {}", e))?;
+                            } else {
+                                if let Some(ring) = body_ring {
+                                    ring.write_slice(&chunk);
+                                }
+                                on_data_chunk(&chunk);
                             }
-                            on_data_chunk(&chunk);
                         }
+                    }
+                    if let Some(dec) = decompressor.take() {
+                        dec.finish(|decompressed_slice| {
+                            if let Some(ring) = body_ring {
+                                ring.write_slice(decompressed_slice);
+                            }
+                            on_data_chunk(decompressed_slice);
+                        })
+                        .map_err(|e| format!("Decompression finish error: {}", e))?;
                     }
                     on_complete(false);
                     break;
@@ -319,18 +339,66 @@ impl HttpClientEngine {
                                         self.cookie_jar.process_set_cookie(options.session_id, &parsed_url, v);
                                     }
                                 }
-                                on_headers(status_code, &reason, &headers);
+
+                                let should_decompress = options.transparent_decompression
+                                    && !has_range_header
+                                    && status_code != 206;
+
+                                let mut is_decompressing = false;
+                                if should_decompress {
+                                    if let Some((_, enc)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-encoding")) {
+                                        if let Some(dec) = StreamDecompressor::new(enc) {
+                                            decompressor = Some(dec);
+                                            is_decompressing = true;
+                                        }
+                                    }
+                                }
+
+                                if is_decompressing {
+                                    // Filter out Content-Encoding and Content-Length so downstream consumers
+                                    // (like WebKit's NetworkProcess) receive clean uncompressed data and know
+                                    // the stream length corresponds to the decoded body.
+                                    let filtered_headers: Vec<(String, String)> = headers
+                                        .into_iter()
+                                        .filter(|(k, _)| {
+                                            !k.eq_ignore_ascii_case("content-encoding")
+                                                && !k.eq_ignore_ascii_case("content-length")
+                                        })
+                                        .collect();
+                                    on_headers(status_code, &reason, &filtered_headers);
+                                } else {
+                                    on_headers(status_code, &reason, &headers);
+                                }
                                 headers_dispatched = true;
                             }
                             Http1FeedResult::BodyData(chunk) => {
-                                // Progressive zero-copy write directly to BodyRing
-                                if let Some(ring) = body_ring {
-                                    ring.write_slice(&chunk);
+                                if let Some(ref mut dec) = decompressor {
+                                    dec.feed(&chunk, |decompressed_slice| {
+                                        if let Some(ring) = body_ring {
+                                            ring.write_slice(decompressed_slice);
+                                        }
+                                        on_data_chunk(decompressed_slice);
+                                    })
+                                    .map_err(|e| format!("Decompression error: {}", e))?;
+                                } else {
+                                    // Progressive zero-copy write directly to BodyRing
+                                    if let Some(ring) = body_ring {
+                                        ring.write_slice(&chunk);
+                                    }
+                                    // Invoke callback with borrowed slice
+                                    on_data_chunk(&chunk);
                                 }
-                                // Invoke callback with borrowed slice
-                                on_data_chunk(&chunk);
                             }
                             Http1FeedResult::Complete { keep_alive } => {
+                                if let Some(dec) = decompressor.take() {
+                                    dec.finish(|decompressed_slice| {
+                                        if let Some(ring) = body_ring {
+                                            ring.write_slice(decompressed_slice);
+                                        }
+                                        on_data_chunk(decompressed_slice);
+                                    })
+                                    .map_err(|e| format!("Decompression finish error: {}", e))?;
+                                }
                                 can_keep_alive = keep_alive;
                                 is_completed = true;
                                 on_complete(keep_alive);
@@ -713,5 +781,130 @@ mod tests {
         assert!(addrs[1].is_ipv4());
         assert!(addrs[2].is_ipv6());
         assert!(addrs[3].is_ipv6());
+    }
+
+    #[test]
+    fn test_streaming_transparent_decompression_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let original_body = b"<!DOCTYPE html><html><body><h1>Streaming Decompression Test</h1></body></html>";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original_body).unwrap();
+        let gzip_body = encoder.finish().unwrap();
+
+        let gzip_body_clone = gzip_body.clone();
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    gzip_body_clone.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                // Send body in two chunks
+                let mid = gzip_body_clone.len() / 2;
+                let _ = stream.write_all(&gzip_body_clone[..mid]);
+                let _ = stream.write_all(&gzip_body_clone[mid..]);
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/gzip_stream", port);
+        let opts = HttpRequestOptions::new("GET", &url);
+
+        let mut received_headers = Vec::new();
+        let mut received_body = Vec::new();
+
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_code, _reason, headers| {
+                received_headers = headers.to_vec();
+            },
+            |chunk| {
+                received_body.extend_from_slice(chunk);
+            },
+            |_keep_alive| {},
+        );
+
+        assert!(res.is_ok());
+
+        // Verify Content-Encoding and Content-Length were stripped
+        assert!(!received_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")));
+        assert!(!received_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length")));
+
+        // Verify body received in on_data_chunk was decompressed
+        assert_eq!(received_body, original_body);
+
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decompression_disabled_when_flag_false() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let original_body = b"Raw binary payload";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original_body).unwrap();
+        let gzip_body = encoder.finish().unwrap();
+
+        let gzip_body_clone = gzip_body.clone();
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    gzip_body_clone.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&gzip_body_clone);
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/raw_gzip", port);
+        let mut opts = HttpRequestOptions::new("GET", &url);
+        opts.transparent_decompression = false;
+
+        let mut received_headers = Vec::new();
+        let mut received_body = Vec::new();
+
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_code, _reason, headers| {
+                received_headers = headers.to_vec();
+            },
+            |chunk| {
+                received_body.extend_from_slice(chunk);
+            },
+            |_keep_alive| {},
+        );
+
+        assert!(res.is_ok());
+
+        // Verify Content-Encoding was preserved
+        assert!(received_headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-encoding") && v == "gzip"));
+
+        // Verify body received in on_data_chunk is raw gzip bytes
+        assert_eq!(received_body, gzip_body);
+
+        server_thread.join().unwrap();
     }
 }
