@@ -12,8 +12,8 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
-use mio::net::TcpStream;
-use mio::{Events, Interest, Poll, Token};
+use std::net::{TcpStream, UdpSocket};
+use compio_driver::{AsRawFd, Proactor};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 pub mod protocols {
@@ -234,8 +234,7 @@ impl TlsState {
 
 /// Network engine state
 pub struct NetEngine {
-    poll: Poll,
-    events: Events,
+    pub proactor: Proactor,
     connections: HashMap<usize, Connection>,
     next_tls_id: usize,
     tls_states: HashMap<usize, Box<TlsState>>,
@@ -244,27 +243,16 @@ pub struct NetEngine {
     pub http_engine: protocols::http::client::HttpClientEngine,
     body_rings: HashMap<u64, *mut BodyRingDescriptor>,
     conn_body_rings: HashMap<usize, u64>,
-    /// QUIC endpoints keyed by the engine-level `conn_id` returned from
-    /// `net_http3_connect`. Each entry owns a `quinn_proto::Endpoint`
-    /// plus a UDP socket (so the endpoint can be driven by the
-    /// existing mio loop).
     quic_endpoints: HashMap<usize, QuicEndpointEntry>,
-    /// Per-connection QUIC state. The keys are the same `conn_id` as
-    /// `quic_endpoints`; a single endpoint can hold multiple
-    /// connections in principle, but the current FFI surface only
-    /// exposes one.
     quic_conns: HashMap<usize, QuicConnectionEntry>,
     next_quic_id: usize,
     pub last_error: std::sync::Mutex<Option<String>>,
 }
 
-/// Owned state for a single QUIC endpoint. We keep the `mio::net::UdpSocket`
-/// here so the existing `net_poll` loop can read incoming datagrams and
-/// feed them to the `Endpoint`. The `Endpoint` itself is `!Sync`; we
-/// serialize access through the engine.
+/// Owned state for a single QUIC endpoint.
 #[allow(dead_code)]
 struct QuicEndpointEntry {
-    socket: mio::net::UdpSocket,
+    socket: UdpSocket,
     endpoint: std::sync::Mutex<quinn_proto::Endpoint>,
     server_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
@@ -320,8 +308,10 @@ fn root_store() -> RootCertStore {
 
 impl NetEngine {
     fn new() -> Result<Self, NetError> {
-        let poll = Poll::new().map_err(|_| NetError::IoError)?;
-        let events = Events::with_capacity(1024);
+        let proactor = Proactor::new().map_err(|e| {
+            eprintln!("[z-net] Proactor::new failed: {:?}", e);
+            NetError::IoError
+        })?;
         
         // Install default crypto provider for rustls 0.23
         #[cfg(feature = "ring")]
@@ -338,8 +328,7 @@ impl NetEngine {
         let http_engine = protocols::http::client::HttpClientEngine::new(tls_cfg.clone());
             
         Ok(Self {
-            poll,
-            events,
+            proactor,
             connections: HashMap::new(),
             next_tls_id: 1,
             tls_states: HashMap::new(),
@@ -364,12 +353,7 @@ impl NetEngine {
                         let ring = unsafe { &*ring_ptr };
                         let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
                         if available_read < (ring.capacity * 50 / 100) {
-                            // Resume polling
-                            let _ = self.poll.registry().register(
-                                &mut conn.stream,
-                                Token(*conn_id),
-                                Interest::READABLE | Interest::WRITABLE
-                            );
+                            let _ = self.proactor.attach(conn.stream.as_raw_fd());
                             conn.is_paused = false;
                         }
                     }
@@ -383,14 +367,8 @@ impl NetEngine {
             None
         };
         
-        match self.poll.poll(&mut self.events, timeout) {
-            Ok(_) => {
-                let mut count = 0;
-                for _ in self.events.iter() {
-                    count += 1;
-                }
-                count
-            }
+        match self.proactor.poll(timeout) {
+            Ok(_) => 0,
             Err(_) => -1,
         }
     }
@@ -464,11 +442,7 @@ pub extern "C" fn net_connect_tls(
     let conn_id = engine.next_conn_id;
     engine.next_conn_id += 1;
     
-    if engine.poll.registry().register(
-        &mut stream,
-        Token(conn_id),
-        Interest::READABLE | Interest::WRITABLE
-    ).is_err() {
+    if engine.proactor.attach(stream.as_raw_fd()).is_err() {
         return null_mut();
     }
     
@@ -600,7 +574,6 @@ pub extern "C" fn net_read(
                     // Backpressure: 95% High Watermark
                     let available_read = ring.head.load(Ordering::Acquire).wrapping_sub(ring.tail.load(Ordering::Acquire)) as usize;
                     if available_read > (ring.capacity * 95 / 100) {
-                        let _ = engine.poll.registry().deregister(&mut connection.stream);
                         connection.is_paused = true;
                     }
                     return NS_OK;
@@ -1190,23 +1163,12 @@ pub extern "C" fn net_http3_connect(
         Err(_) => return null_mut(),
     };
 
-    let mut udp_stream = match mio::net::UdpSocket::from_std(socket) {
-        s => s,
-    };
+    let udp_stream = socket;
 
     let conn_id = engine.next_quic_id;
     engine.next_quic_id += 1;
 
-    if engine
-        .poll
-        .registry()
-        .register(
-            &mut udp_stream,
-            Token(conn_id),
-            Interest::READABLE | Interest::WRITABLE,
-        )
-        .is_err()
-    {
+    if engine.proactor.attach(udp_stream.as_raw_fd()).is_err() {
         return null_mut();
     }
 
@@ -1746,8 +1708,7 @@ pub extern "C" fn net_http3_close(engine_handle: NetEngineHandle, conn_handle: C
             .connection
             .close(now, 0u32.into(), bytes::Bytes::from_static(b"client closed"));
     }
-    if let Some(mut endpoint_entry) = engine.quic_endpoints.remove(&conn_id) {
-        let _ = engine.poll.registry().deregister(&mut endpoint_entry.socket);
+    if let Some(_endpoint_entry) = engine.quic_endpoints.remove(&conn_id) {
     }
     NS_OK
 }

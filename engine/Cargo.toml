@@ -6,9 +6,9 @@ edition = "2021"
 [lib]
 crate-type = ["staticlib", "rlib"]
 
-[dependencies.mio]
-version = "1.0"
-features = ["os-poll", "net"]
+[dependencies]
+compio-buf = "0.8.3"
+compio-driver = { version = "0.12.5", features = ["io-uring", "polling"] }
 
 [dependencies.rustls]
 version = "0.23"
