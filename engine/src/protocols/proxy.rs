@@ -1,7 +1,6 @@
 //! Proxy support - Rust-side coordinator that reads system proxy
 //! settings, executes PAC scripts, and handles HTTP CONNECT and SOCKS5 tunneling.
 
-use std::collections::HashMap;
 use std::env;
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -287,7 +286,6 @@ pub fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
     let end = match_brace(body_with_brace)?;
     let body = &body_with_brace[1..end];
 
-    let mut last_return: Option<String> = None;
     let mut pos = 0;
     while pos < body.len() {
         let rest = &body[pos..];
@@ -295,50 +293,34 @@ pub fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
         let skipped = rest.len() - s.len();
         pos += skipped;
 
+        if s.is_empty() {
+            break;
+        }
+
         if s.starts_with("return ") {
             let return_len = "return ".len();
             let value_offset = return_len + (s[return_len..].len() - s[return_len..].trim_start().len());
             let after_start = &s[value_offset..];
-            let (v, consumed) = if after_start.starts_with('"') {
+            let v = if after_start.starts_with('"') {
                 if let Some(close_quote) = after_start[1..].find('"') {
-                    let val = &after_start[1..1 + close_quote];
-                    let after_quote = &after_start[1 + close_quote..];
-                    let mut semi_offset = after_quote.len();
-                    for (idx, c) in after_quote.char_indices() {
-                        if c == ';' {
-                            semi_offset = idx + 1;
-                            break;
-                        } else if c == '\n' || (!c.is_whitespace() && c != '\r') {
-                            semi_offset = idx;
-                            break;
-                        }
-                    }
-                    (val, value_offset + 1 + close_quote + semi_offset)
+                    &after_start[1..1 + close_quote]
                 } else {
-                    (after_start.trim_matches('"'), value_offset + after_start.len())
+                    after_start.trim_matches('"')
                 }
             } else {
-                let (val, semi_idx) = if let Some(nl_idx) = after_start.find('\n') {
-                    if let Some(semi_idx) = after_start[..nl_idx].find(';') {
-                        (after_start[..semi_idx].trim(), semi_idx + 1)
-                    } else {
-                        (after_start[..nl_idx].trim(), nl_idx + 1)
-                    }
-                } else if let Some(semi_idx) = after_start.find(';') {
-                    (after_start[..semi_idx].trim(), semi_idx + 1)
+                let line = after_start.split('\n').next().unwrap_or("");
+                if let Some(semi) = line.find(';') {
+                    line[..semi].trim()
                 } else {
-                    (after_start.trim(), after_start.len())
-                };
-                (val, value_offset + semi_idx)
+                    line.trim()
+                }
             };
-            last_return = Some(v.to_string());
-            pos += consumed;
-        } else if s.starts_with("if ") {
+            return Some(v.to_string());
+        } else if s.starts_with("if ") || s.starts_with("if(") {
             let cond_end = s.find('{')?;
-            let cond = s["if ".len()..cond_end].trim();
+            let cond = s["if".len()..cond_end].trim();
             let matched = eval_cond(cond, url, host);
-            pos += skipped + cond_end;
-            let block_with_brace = &body[pos..];
+            let block_with_brace = &s[cond_end..];
             let close = match_brace(block_with_brace)?;
             if matched {
                 let block = &block_with_brace[1..close];
@@ -359,10 +341,10 @@ pub fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
                             line.trim()
                         }
                     };
-                    last_return = Some(v.to_string());
+                    return Some(v.to_string());
                 }
             }
-            pos += close + 1;
+            pos += cond_end + close + 1;
         } else {
             if let Some(semi) = body[pos..].find(';') {
                 pos += semi + 1;
@@ -371,16 +353,60 @@ pub fn evaluate_minimal(src: &str, url: &str, host: &str) -> Option<String> {
             }
         }
     }
-    last_return
+    None
+}
+
+fn split_top_level<'a>(s: &'a str, delim: &str) -> Option<Vec<&'a str>> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut last = 0;
+    let delim_bytes = delim.as_bytes();
+    let s_bytes = s.as_bytes();
+    let len = s_bytes.len();
+    let dlen = delim_bytes.len();
+
+    let mut i = 0;
+    let mut found = false;
+    while i < len {
+        let b = s_bytes[i];
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            depth -= 1;
+        } else if depth == 0 && i + dlen <= len && &s_bytes[i..i + dlen] == delim_bytes {
+            parts.push(&s[last..i]);
+            i += dlen;
+            last = i;
+            found = true;
+            continue;
+        }
+        i += 1;
+    }
+
+    if !found {
+        None
+    } else {
+        parts.push(&s[last..]);
+        Some(parts)
+    }
 }
 
 /// Evaluates compound boolean conditions with `&&`, `||`, and `!` support.
-pub fn eval_cond(cond: &str, url: &str, host: &str) -> bool {
-    let cond = cond.trim().trim_end_matches('{').trim();
+pub fn eval_cond(mut cond: &str, url: &str, host: &str) -> bool {
+    cond = cond.trim().trim_end_matches('{').trim();
 
-    // 1. Disjunction (`||`)
-    if cond.contains("||") {
-        for part in cond.split("||") {
+    // Strip outer parentheses if present
+    while cond.starts_with('(') && cond.ends_with(')') {
+        if match_parentheses(cond) == Some(cond.len() - 1) {
+            cond = cond[1..cond.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+
+    // 1. Disjunction (`||`) at top-level
+    if let Some(parts) = split_top_level(cond, "||") {
+        for part in parts {
             if eval_cond(part.trim(), url, host) {
                 return true;
             }
@@ -388,9 +414,9 @@ pub fn eval_cond(cond: &str, url: &str, host: &str) -> bool {
         return false;
     }
 
-    // 2. Conjunction (`&&`)
-    if cond.contains("&&") {
-        for part in cond.split("&&") {
+    // 2. Conjunction (`&&`) at top-level
+    if let Some(parts) = split_top_level(cond, "&&") {
+        for part in parts {
             if !eval_cond(part.trim(), url, host) {
                 return false;
             }
@@ -403,19 +429,7 @@ pub fn eval_cond(cond: &str, url: &str, host: &str) -> bool {
         return !eval_cond(rest.trim(), url, host);
     }
 
-    // Strip outer parentheses if present
-    let inner = if cond.starts_with('(') && cond.ends_with(')') {
-        let candidate = &cond[1..cond.len() - 1];
-        if match_parentheses(cond) == Some(cond.len() - 1) {
-            candidate.trim()
-        } else {
-            cond
-        }
-    } else {
-        cond
-    };
-
-    eval_single_cond(inner, url, host)
+    eval_single_cond(cond, url, host)
 }
 
 fn eval_single_cond(cond: &str, url: &str, host: &str) -> bool {

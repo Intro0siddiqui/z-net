@@ -9,10 +9,15 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use url::Url;
 
+use super::alt_svc::AltSvcRegistry;
 use super::cookie_jar::CookieJar;
 use super::h1::{Http1FeedResult, Http1RequestBuilder, Http1ResponseParser};
 use super::pool::{ConnectionPool, PoolKey};
 use crate::protocols::compression::{decompress_payload, StreamDecompressor};
+use crate::protocols::http3::Http3Client;
+use crate::protocols::proxy::{
+    establish_http_connect_tunnel, establish_socks5_tunnel, ProxyConfig, ProxyRule, ProxyScheme,
+};
 use crate::BodyRingDescriptor;
 
 /// A parsed HTTP response representation.
@@ -100,6 +105,8 @@ pub struct HttpClientEngine {
     tls_config: Arc<ClientConfig>,
     pool: ConnectionPool<ActiveStream>,
     pub cookie_jar: Arc<CookieJar>,
+    pub proxy_config: Option<ProxyConfig>,
+    pub alt_svc_registry: Arc<AltSvcRegistry>,
 }
 
 impl HttpClientEngine {
@@ -108,7 +115,33 @@ impl HttpClientEngine {
             tls_config,
             pool: ConnectionPool::new(6, Duration::from_secs(60)),
             cookie_jar: Arc::new(CookieJar::new()),
+            proxy_config: Some(ProxyConfig::from_env()),
+            alt_svc_registry: Arc::new(AltSvcRegistry::new()),
         }
+    }
+
+    /// Helper to connect a TCP stream to `host:port` with IPv4 prioritization and timeout.
+    fn connect_tcp(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+        let addr_str = format!("{}:{}", host, port);
+        let mut addrs: Vec<SocketAddr> = addr_str
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS resolution failed for {}: {}", addr_str, e))?
+            .collect();
+
+        // Prioritize IPv4 addresses over IPv6 to prevent black-hole stalls on dual-stack networks
+        addrs.sort_by_key(|addr| !addr.is_ipv4());
+
+        let connect_timeout = std::cmp::min(timeout, Duration::from_secs(3));
+        for addr in addrs {
+            if let Ok(s) = TcpStream::connect_timeout(&addr, connect_timeout) {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(timeout));
+                let _ = s.set_write_timeout(Some(timeout));
+                return Ok(s);
+            }
+        }
+
+        Err(format!("Could not connect to {}:{}", host, port))
     }
 
     /// Clear pooled connections and cookies for a specific session.
@@ -163,34 +196,64 @@ impl HttpClientEngine {
         let host = parsed_url.host_str().ok_or("Missing host in URL")?.to_string();
         let port = parsed_url.port_or_known_default().unwrap_or(if is_tls { 443 } else { 80 });
 
+        // Resolve proxy configuration
+        let proxy_rule = self
+            .proxy_config
+            .as_ref()
+            .map(|pc| pc.resolve(&options.url, &host, is_tls))
+            .unwrap_or(ProxyRule {
+                scheme: ProxyScheme::Direct,
+                host: String::new(),
+                port: 0,
+            });
+
+        // Fast-path HTTP/3 execution if direct TLS connection and host advertised Alt-Svc
+        if is_tls && proxy_rule.scheme == ProxyScheme::Direct {
+            if let Some((h3_host, h3_port)) = self.alt_svc_registry.get_h3_target(&host, port) {
+                let h3_timeout = Duration::from_millis(250);
+                if let Ok(true) = Http3Client::execute_streaming(
+                    &h3_host,
+                    h3_port,
+                    options,
+                    body_ring,
+                    &mut on_headers,
+                    &mut on_data_chunk,
+                    &mut on_complete,
+                    &mut is_cancelled,
+                    h3_timeout,
+                ) {
+                    return Ok(true);
+                }
+                // Seamlessly fall back to TCP TLS streaming
+            }
+        }
+
         let pool_key = PoolKey::new(options.session_id, &host, port, is_tls);
 
         // 1. Check connection pool or establish new connection
         let mut stream = if let Some(pooled) = self.pool.get(&pool_key) {
             pooled.socket
         } else {
-            let addr_str = format!("{}:{}", host, port);
-            let mut resolved_stream = None;
-            let mut addrs: Vec<SocketAddr> = addr_str
-                .to_socket_addrs()
-                .map_err(|e| format!("DNS resolution failed for {}: {}", addr_str, e))?
-                .collect();
-
-            // Prioritize IPv4 addresses over IPv6 to prevent black-hole stalls on dual-stack networks
-            addrs.sort_by_key(|addr| !addr.is_ipv4());
-
-            for addr in addrs {
-                let connect_timeout = std::cmp::min(options.timeout, std::time::Duration::from_secs(3));
-                if let Ok(s) = TcpStream::connect_timeout(&addr, connect_timeout) {
-                    let _ = s.set_nodelay(true);
-                    let _ = s.set_read_timeout(Some(options.timeout));
-                    let _ = s.set_write_timeout(Some(options.timeout));
-                    resolved_stream = Some(s);
-                    break;
+            let tcp = match proxy_rule.scheme {
+                ProxyScheme::Direct => {
+                    Self::connect_tcp(&host, port, options.timeout)?
                 }
-            }
-
-            let tcp = resolved_stream.ok_or(format!("Could not connect to {}:{}", host, port))?;
+                ProxyScheme::Http => {
+                    let mut s = Self::connect_tcp(&proxy_rule.host, proxy_rule.port, options.timeout)?;
+                    establish_http_connect_tunnel(&mut s, &host, port)
+                        .map_err(|e| format!("HTTP CONNECT tunnel failed: {}", e))?;
+                    s
+                }
+                ProxyScheme::Socks5 => {
+                    let mut s = Self::connect_tcp(&proxy_rule.host, proxy_rule.port, options.timeout)?;
+                    establish_socks5_tunnel(&mut s, &host, port)
+                        .map_err(|e| format!("SOCKS5 tunnel failed: {}", e))?;
+                    s
+                }
+                ProxyScheme::Socks4 => {
+                    return Err("SOCKS4 proxy is not supported, configure SOCKS5 or HTTP proxy".to_string());
+                }
+            };
 
             if is_tls {
                 let server_name = ServerName::try_from(host.as_str())
@@ -347,6 +410,10 @@ impl HttpClientEngine {
                                     // Automatic Set-Cookie processing into RFC 6265 CookieJar
                                     if k.eq_ignore_ascii_case("set-cookie") {
                                         self.cookie_jar.process_set_cookie(options.session_id, &parsed_url, v);
+                                    }
+                                    // Automatic Alt-Svc discovery for HTTP/3
+                                    if k.eq_ignore_ascii_case("alt-svc") {
+                                        self.alt_svc_registry.insert(&host, port, v);
                                     }
                                 }
 
@@ -932,5 +999,173 @@ mod tests {
         assert_eq!(received_body, gzip_body);
 
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_alt_svc_discovery_and_caching() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"; ma=86400; persist=1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nOK!!",
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        let url = format!("http://127.0.0.1:{}/alt_svc_test", port);
+        let opts = HttpRequestOptions::new("GET", &url);
+
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_code, _reason, _headers| {},
+            |_chunk| {},
+            |_keep_alive| {},
+        );
+
+        assert!(res.is_ok());
+
+        // Verify that the registry discovered Alt-Svc
+        let h3_target = client.alt_svc_registry.get_h3_target("127.0.0.1", port);
+        assert_eq!(h3_target, Some(("127.0.0.1".to_string(), 443)));
+
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_proxy_tunneling_http_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock proxy");
+        let proxy_port = listener.local_addr().unwrap().port();
+
+        let proxy_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("CONNECT mock.origin:80 HTTP/1.1"));
+
+                // Send 200 Connection established
+                stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").unwrap();
+
+                // Read forwarded HTTP request
+                let n = stream.read(&mut buf).unwrap();
+                let inner_req = String::from_utf8_lossy(&buf[..n]);
+                assert!(inner_req.starts_with("GET /proxied HTTP/1.1"));
+
+                // Return response
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nPROXIED").unwrap();
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+
+        let mut cfg = ProxyConfig::new();
+        cfg.http_proxy = Some(ProxyRule {
+            scheme: ProxyScheme::Http,
+            host: "127.0.0.1".to_string(),
+            port: proxy_port,
+        });
+        client.proxy_config = Some(cfg);
+
+        let url = "http://mock.origin:80/proxied";
+        let opts = HttpRequestOptions::new("GET", url);
+
+        let mut received_body = Vec::new();
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_code, _reason, _headers| {},
+            |chunk| {
+                received_body.extend_from_slice(chunk);
+            },
+            |_keep_alive| {},
+        );
+
+        assert!(res.is_ok());
+        assert_eq!(received_body, b"PROXIED");
+
+        proxy_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_client_proxy_tunneling_socks5() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock socks5 proxy");
+        let proxy_port = listener.local_addr().unwrap().port();
+
+        let proxy_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // 1. Read greeting [0x05, 0x01, 0x00]
+                let mut greeting = [0u8; 3];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [0x05, 0x01, 0x00]);
+
+                // Send choice [0x05, 0x00] (No Auth)
+                stream.write_all(&[0x05, 0x00]).unwrap();
+
+                // 2. Read connect request
+                let mut req_header = [0u8; 5];
+                stream.read_exact(&mut req_header).unwrap();
+                assert_eq!(req_header[0..4], [0x05, 0x01, 0x00, 0x03]);
+                let domain_len = req_header[4] as usize;
+                let mut domain_buf = vec![0u8; domain_len + 2];
+                stream.read_exact(&mut domain_buf).unwrap();
+                let domain = String::from_utf8_lossy(&domain_buf[..domain_len]);
+                assert_eq!(domain, "mock.socks5.origin");
+
+                // Send success response
+                stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80]).unwrap();
+
+                // 3. Read forwarded HTTP request
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("GET /socks5_data HTTP/1.1"));
+
+                // Return response
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nSOCKS5").unwrap();
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let mut client = HttpClientEngine::new(tls_cfg);
+
+        let mut cfg = ProxyConfig::new();
+        cfg.http_proxy = Some(ProxyRule {
+            scheme: ProxyScheme::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: proxy_port,
+        });
+        client.proxy_config = Some(cfg);
+
+        let url = "http://mock.socks5.origin:80/socks5_data";
+        let opts = HttpRequestOptions::new("GET", url);
+
+        let mut received_body = Vec::new();
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_code, _reason, _headers| {},
+            |chunk| {
+                received_body.extend_from_slice(chunk);
+            },
+            |_keep_alive| {},
+        );
+
+        assert!(res.is_ok());
+        assert_eq!(received_body, b"SOCKS5");
+
+        proxy_thread.join().unwrap();
     }
 }
