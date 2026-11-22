@@ -496,7 +496,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
 
     #[test]
     fn test_http_client_request_options_builder() {

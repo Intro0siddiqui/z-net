@@ -378,12 +378,14 @@ impl NetEngine {
         #[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
         
-        // Setup default TLS config with ALPN for HTTP/1.1 streaming
+        // Setup default TLS config with ALPN for HTTP/1.1 streaming and full session resumption
         // Note: HTTP/1.1 is pinned until full HTTP/2 multiplexed streaming is wired into execute_streaming
         let mut config = ClientConfig::builder()
             .with_root_certificates(root_store())
             .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.resumption = rustls::client::Resumption::in_memory_sessions(1024);
+        config.enable_early_data = true;
             
         let tls_cfg = Arc::new(config);
         let http_engine = protocols::http::client::HttpClientEngine::new(tls_cfg.clone());

@@ -201,12 +201,12 @@ pub const VERSION_STRING = "1.1.0";
 // Feature flags
 pub const FEATURES = struct {
     pub const HAS_ZIG = true;
-    pub const HAS_TLS = builtin.os.tag == .linux or builtin.os.tag == .macos;
+    pub const HAS_TLS = builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .android;
     pub const HAS_DNS = true;
     pub const HAS_HTTP = true;
     pub const HAS_CACHE = true;
     pub const HAS_ASYNC = true;
-    pub const HAS_PIPELINE = builtin.os.tag == .linux or builtin.os.tag == .macos;
+    pub const HAS_PIPELINE = builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .android;
     pub const HAS_POLICY = true; // Browser Policy Engine (SOP/CORS/CSP)
     pub const HAS_EVENT_LOOP = true; // Web API Event Loop Integration
     pub const HAS_STORAGE = true; // Browser Storage Bridge (localStorage, sessionStorage, IndexedDB, Cache API)
@@ -286,8 +286,8 @@ pub fn checkCapabilities() !void {
     
     // Platform-specific checks
     switch (builtin.os.tag) {
-        .linux => {
-            std.log.info("✅ Linux detected - Full feature support", .{});
+        .linux, .android => {
+            std.log.info("✅ Linux/Android detected - Full feature support", .{});
         },
         .macos => {
             std.log.info("✅ macOS detected - Full feature support", .{});

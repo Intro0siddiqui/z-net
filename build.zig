@@ -7,12 +7,30 @@ pub fn build(b: *std.Build) void {
     // ============================================================
     // Phase 4.1: Automate Cargo Build Step
     // ============================================================
-    const cargo_build = b.addSystemCommand(&.{
-        "cargo", "build", "--release", "--lib",
-        "--manifest-path", "engine/Cargo.toml"
-    });
+    const target_triple: ?[]const u8 = if (target.result.abi.isAndroid()) switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .arm => "armv7-linux-androideabi",
+        .x86_64 => "x86_64-linux-android",
+        .x86 => "i686-linux-android",
+        else => null,
+    } else null;
 
-    const rust_lib_path = b.path("engine/target/release/libz_net_engine.a");
+    const cargo_build = if (target_triple) |triple|
+        b.addSystemCommand(&.{
+            "cargo", "build", "--release", "--lib",
+            "--manifest-path", "engine/Cargo.toml",
+            "--target", triple,
+        })
+    else
+        b.addSystemCommand(&.{
+            "cargo", "build", "--release", "--lib",
+            "--manifest-path", "engine/Cargo.toml",
+        });
+
+    const rust_lib_path = if (target_triple) |triple|
+        b.path(b.fmt("engine/target/{s}/release/libz_net_engine.a", .{triple}))
+    else
+        b.path("engine/target/release/libz_net_engine.a");
 
     // Module Definitions
     const z_socket = b.addModule("z_socket", .{

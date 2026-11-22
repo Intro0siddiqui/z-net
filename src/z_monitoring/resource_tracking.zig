@@ -234,7 +234,7 @@ pub const ResourceTracker = struct {
         
         // One API, 3 fast code paths with zero runtime cost
         switch (builtin.os.tag) {
-            .linux => try self.collectLinuxMetrics(),
+            .linux, .android => try self.collectLinuxMetrics(),
             .macos, .freebsd, .openbsd, .netbsd, .dragonfly => try self.collectBsdMetrics(),
             .windows => try self.collectWindowsMetrics(),
             else => return error.UnsupportedOS,
@@ -298,7 +298,7 @@ pub const ResourceTracker = struct {
 /// Public API: looks the same on every OS
 pub fn getRxBytes(allocator: std.mem.Allocator, ifname: []const u8) !u64 {
     return switch (builtin.os.tag) {
-       .linux => try getRxBytesLinux(ifname),
+       .linux, .android => try getRxBytesLinux(ifname),
        .macos,.freebsd,.openbsd,.netbsd => try getRxBytesBsd(allocator, ifname),
        .windows => try getRxBytesWindows(ifname),
         else => error.UnsupportedOs,
