@@ -8,7 +8,12 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 compio-buf = "0.8.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 compio-driver = { version = "0.12.5", features = ["io-uring", "polling"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+compio-driver = { version = "0.12.5", features = ["polling"] }
 
 [dependencies.rustls]
 version = "0.23"
