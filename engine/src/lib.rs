@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write, ErrorKind, IoSliceMut};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use std::net::{TcpStream, UdpSocket};
 use compio_driver::{AsRawFd, Proactor};
@@ -98,7 +98,9 @@ pub struct BodyRingDescriptor {
     pub head: AtomicU64,
     pub _pad2: [u8; 64],
     pub tail: AtomicU64,
-    pub _pad3: [u8; 64],
+    pub _pad3: [u8; 48],
+    pub pause_fd: AtomicI32,
+    pub futex_word: AtomicU32,
     pub is_closed: AtomicBool,
 }
 
@@ -114,6 +116,65 @@ impl BodyRingDescriptor {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         head.wrapping_sub(tail) as usize
+    }
+
+    pub fn should_stop_reading(&self) -> bool {
+        self.available_read() > (self.capacity * 95 / 100)
+    }
+
+    pub fn should_resume_reading(&self) -> bool {
+        self.available_read() < (self.capacity * 50 / 100)
+    }
+
+    pub fn signal_resume(&self) {
+        let pfd = self.pause_fd.load(Ordering::Acquire);
+        if pfd >= 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(pfd, &val as *const u64 as *const libc::c_void, 8);
+            }
+        }
+        self.futex_word.fetch_add(1, Ordering::Release);
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                &self.futex_word as *const AtomicU32,
+                libc::FUTEX_WAKE,
+                1,
+                std::ptr::null::<libc::timespec>(),
+            );
+        }
+    }
+
+    pub fn wait_drain(&self, timeout_ms: i32) {
+        let pfd = self.pause_fd.load(Ordering::Acquire);
+        if pfd >= 0 {
+            let mut pfd_poll = libc::pollfd {
+                fd: pfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut pfd_poll, 1, timeout_ms);
+                let mut val: u64 = 0;
+                libc::read(pfd, &mut val as *mut u64 as *mut libc::c_void, 8);
+            }
+        } else {
+            let cur = self.futex_word.load(Ordering::Acquire);
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: (timeout_ms as i64 * 1_000_000).min(10_000_000),
+            };
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &self.futex_word as *const AtomicU32,
+                    libc::FUTEX_WAIT,
+                    cur,
+                    &ts,
+                );
+            }
+        }
     }
 
     pub fn write_slice(&self, data: &[u8]) -> usize {

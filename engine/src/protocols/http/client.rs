@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -292,6 +293,15 @@ impl HttpClientEngine {
                 return Ok(headers_dispatched);
             }
 
+            if let Some(ring) = body_ring {
+                while ring.should_stop_reading() && !ring.is_closed.load(Ordering::Acquire) {
+                    if is_cancelled() {
+                        return Ok(headers_dispatched);
+                    }
+                    ring.wait_drain(5);
+                }
+            }
+
             match stream.read(&mut read_buf) {
                 Ok(0) => {
                     // EOF on stream
@@ -375,7 +385,14 @@ impl HttpClientEngine {
                                 if let Some(ref mut dec) = decompressor {
                                     dec.feed(&chunk, |decompressed_slice| {
                                         if let Some(ring) = body_ring {
-                                            ring.write_slice(decompressed_slice);
+                                            let mut offset = 0;
+                                            while offset < decompressed_slice.len() && !ring.is_closed.load(Ordering::Acquire) {
+                                                let written = ring.write_slice(&decompressed_slice[offset..]);
+                                                offset += written;
+                                                if offset < decompressed_slice.len() {
+                                                    ring.wait_drain(5);
+                                                }
+                                            }
                                         }
                                         on_data_chunk(decompressed_slice);
                                     })
@@ -383,7 +400,14 @@ impl HttpClientEngine {
                                 } else {
                                     // Progressive zero-copy write directly to BodyRing
                                     if let Some(ring) = body_ring {
-                                        ring.write_slice(&chunk);
+                                        let mut offset = 0;
+                                        while offset < chunk.len() && !ring.is_closed.load(Ordering::Acquire) {
+                                            let written = ring.write_slice(&chunk[offset..]);
+                                            offset += written;
+                                            if offset < chunk.len() {
+                                                ring.wait_drain(5);
+                                            }
+                                        }
                                     }
                                     // Invoke callback with borrowed slice
                                     on_data_chunk(&chunk);
@@ -519,7 +543,9 @@ mod tests {
             head: AtomicU64::new(0),
             _pad2: [0u8; 64],
             tail: AtomicU64::new(0),
-            _pad3: [0u8; 64],
+            _pad3: [0u8; 48],
+            pause_fd: AtomicI32::new(-1),
+            futex_word: AtomicU32::new(0),
             is_closed: AtomicBool::new(false),
         };
 

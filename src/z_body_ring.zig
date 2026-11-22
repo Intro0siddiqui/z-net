@@ -20,7 +20,9 @@ pub const BodyRingDescriptor = extern struct {
     head: std.atomic.Value(u64), // Producer (Zig) updates this
     _pad2: [64]u8,
     tail: std.atomic.Value(u64), // Consumer (Rust) updates this
-    _pad3: [64]u8,
+    _pad3: [48]u8,
+    pause_fd: std.atomic.Value(i32),
+    futex_word: std.atomic.Value(u32),
     is_closed: std.atomic.Value(bool),
 
     pub fn init(ptr: [*]u8, capacity: usize) BodyRingDescriptor {
@@ -32,6 +34,8 @@ pub const BodyRingDescriptor = extern struct {
             ._pad2 = undefined,
             .tail = std.atomic.Value(u64).init(0),
             ._pad3 = undefined,
+            .pause_fd = std.atomic.Value(i32).init(-1),
+            .futex_word = std.atomic.Value(u32).init(0),
             .is_closed = std.atomic.Value(bool).init(false),
         };
     }
@@ -92,6 +96,38 @@ pub const BodyRingDescriptor = extern struct {
     pub fn shouldResumeReading(self: *const BodyRingDescriptor) bool {
         // Low watermark: 50%
         return self.getAvailableRead() < (self.capacity * 50 / 100);
+    }
+
+    pub fn signalResume(self: *BodyRingDescriptor) void {
+        const pfd = self.pause_fd.load(.acquire);
+        if (pfd >= 0) {
+            const val: u64 = 1;
+            _ = std.os.linux.syscall3(.write, @as(usize, @intCast(pfd)), @intFromPtr(&val), 8);
+        }
+        _ = self.futex_word.fetchAdd(1, .release);
+        _ = std.os.linux.syscall3(.futex, @intFromPtr(&self.futex_word), std.os.linux.FUTEX.WAKE, 1);
+    }
+
+    pub fn waitDrain(self: *BodyRingDescriptor, timeout_ns: u64) void {
+        const pfd = self.pause_fd.load(.acquire);
+        if (pfd >= 0) {
+            var pfd_poll = [_]std.os.linux.pollfd{.{
+                .fd = pfd,
+                .events = std.os.linux.POLL.IN,
+                .revents = 0,
+            }};
+            const timeout_ms = @as(i32, @intCast(@min(timeout_ns / 1_000_000, 100)));
+            _ = std.os.linux.syscall3(.poll, @intFromPtr(&pfd_poll), 1, @as(usize, @intCast(timeout_ms)));
+            var val: u64 = 0;
+            _ = std.os.linux.syscall3(.read, @as(usize, @intCast(pfd)), @intFromPtr(&val), 8);
+        } else {
+            const cur = self.futex_word.load(.acquire);
+            const ts = std.os.linux.timespec{
+                .sec = 0,
+                .nsec = @as(isize, @intCast(@min(timeout_ns, 10_000_000))),
+            };
+            _ = std.os.linux.syscall4(.futex, @intFromPtr(&self.futex_word), std.os.linux.FUTEX.WAIT, cur, @intFromPtr(&ts));
+        }
     }
 };
 
