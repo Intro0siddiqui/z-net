@@ -142,7 +142,7 @@ pub fn build(b: *std.Build) void {
 
     const modules_to_test = [_]*std.Build.Module{
         z_socket, z_network_bridge, z_config, z_health, z_monitoring,
-        z_compression, z_proxy, z_tls, z_webtransport,
+        z_compression, z_proxy, z_tls, z_webtransport, z_quic,
     };
 
     for (modules_to_test) |mod| {

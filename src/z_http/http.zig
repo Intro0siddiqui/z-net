@@ -61,6 +61,8 @@ pub const HttpClient = struct {
         if (self.http_cache) |hcache| {
             if (hcache.getHttpResponse(url, headers)) |cached_entry| {
                 if (cached_entry) |entry| {
+                    var mut_entry = entry;
+                    defer mut_entry.deinit(hcache.cache.allocator);
                     if (entry.status_code == 200 or entry.status_code == 304) {
                         // Return cached response (Simplified: In a full stack, we'd return a handle that reads from cache)
                         // For now, we still return a fetch handle, but ideally we'd signal "from cache"

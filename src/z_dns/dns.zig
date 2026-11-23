@@ -14,6 +14,7 @@ pub const DnsError = error{
     NetworkError,
     InvalidQuery,
     UnsupportedRecord,
+    OutOfMemory,
 };
 
 pub const DnsRecordType = enum(u16) {
@@ -357,9 +358,19 @@ fn parseDnsResponse(data: []const u8, query: DnsQuery, allocator: std.mem.Alloca
     }
 
     // Parse answers
-    var answer_list = std.ArrayList(DnsAnswer).init(allocator);
+    var answer_list = std.ArrayList(DnsAnswer).empty;
+    errdefer {
+        for (answer_list.items) |ans| {
+            allocator.free(ans.name);
+        }
+        answer_list.deinit(allocator);
+    }
+
     for (0..answers) |_| {
         const name = try parseDomainName(data, &offset, allocator);
+        errdefer allocator.free(name);
+
+        if (offset + 10 > data.len) return error.MalformedDnsMessage;
         const answer_type = std.mem.readInt(u16, data[offset..offset + 2], .big);
         offset += 2;
 
@@ -373,10 +384,11 @@ fn parseDnsResponse(data: []const u8, query: DnsQuery, allocator: std.mem.Alloca
         const data_length = std.mem.readInt(u16, data[offset..offset + 2], .big);
         offset += 2;
 
+        if (offset + data_length > data.len) return error.MalformedDnsMessage;
         const answer_data = data[offset..offset + data_length];
         offset += data_length;
 
-        try answer_list.append(DnsAnswer{
+        try answer_list.append(allocator, DnsAnswer{
             .name = name,
             .record_type = @enumFromInt(answer_type),
             .ttl = ttl,
@@ -384,39 +396,83 @@ fn parseDnsResponse(data: []const u8, query: DnsQuery, allocator: std.mem.Alloca
         });
     }
 
-    return answer_list.toOwnedSlice();
+    return answer_list.toOwnedSlice(allocator);
 }
 
-fn parseDoHResponse(json_response: std.json.Value, query: DnsQuery, allocator: std.mem.Allocator) DnsError![]DnsAnswer {
+pub fn parseDoHResponse(json_response: std.json.Value, query: DnsQuery, allocator: std.mem.Allocator) DnsError![]DnsAnswer {
     _ = query;
-    var answer_list = std.ArrayList(DnsAnswer).init(allocator);
+    var answer_list = std.ArrayList(DnsAnswer).empty;
+    errdefer {
+        for (answer_list.items) |ans| {
+            allocator.free(ans.name);
+            allocator.free(ans.data);
+        }
+        answer_list.deinit(allocator);
+    }
 
-    if (json_response.Object.get("Answer")) |answers_array| {
-        if (answers_array.Array) |answers| {
-            for (answers.items) |answer| {
-                if (answer.Object) |answer_obj| {
-                    const name = try allocator.dupe(u8, answer_obj.get("name").?.String);
-                    const record_type: DnsRecordType = @enumFromInt(std.fmt.parseInt(u16, answer_obj.get("type").?.String, 10) catch 1);
-                    const ttl = std.fmt.parseInt(u32, answer_obj.get("TTL").?.String, 10) catch 300;
-                    const data = try allocator.dupe(u8, answer_obj.get("data").?.String);
+    if (json_response == .object) {
+        if (json_response.object.get("Answer")) |answers_val| {
+            if (answers_val == .array) {
+                for (answers_val.array.items) |answer| {
+                    if (answer == .object) {
+                        const name_val = answer.object.get("name") orelse continue;
+                        const data_val = answer.object.get("data") orelse continue;
 
-                    try answer_list.append(DnsAnswer{
-                        .name = name,
-                        .record_type = record_type,
-                        .ttl = ttl,
-                        .data = data,
-                    });
+                        const name_str = switch (name_val) {
+                            .string => |s| s,
+                            else => continue,
+                        };
+                        const data_str = switch (data_val) {
+                            .string => |s| s,
+                            else => continue,
+                        };
+
+                        const record_type: DnsRecordType = blk: {
+                            if (answer.object.get("type")) |t_val| {
+                                switch (t_val) {
+                                    .integer => |i| break :blk @enumFromInt(@as(u16, @truncate(@as(u64, @bitCast(i))))),
+                                    .string => |s| break :blk @enumFromInt(std.fmt.parseInt(u16, s, 10) catch 1),
+                                    else => break :blk .A,
+                                }
+                            }
+                            break :blk .A;
+                        };
+
+                        const ttl: u32 = blk: {
+                            if (answer.object.get("TTL")) |ttl_val| {
+                                switch (ttl_val) {
+                                    .integer => |i| break :blk @as(u32, @truncate(@as(u64, @bitCast(i)))),
+                                    .string => |s| break :blk std.fmt.parseInt(u32, s, 10) catch 300,
+                                    else => break :blk 300,
+                                }
+                            }
+                            break :blk 300;
+                        };
+
+                        const name = allocator.dupe(u8, name_str) catch return error.OutOfMemory;
+                        errdefer allocator.free(name);
+
+                        const data = allocator.dupe(u8, data_str) catch return error.OutOfMemory;
+                        errdefer allocator.free(data);
+
+                        answer_list.append(allocator, DnsAnswer{
+                            .name = name,
+                            .record_type = record_type,
+                            .ttl = ttl,
+                            .data = data,
+                        }) catch return error.OutOfMemory;
+                    }
                 }
             }
         }
     }
 
-    return answer_list.toOwnedSlice();
+    return answer_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 fn parseDomainName(data: []const u8, offset: *usize, allocator: std.mem.Allocator) ![]const u8 {
-    var labels = std.ArrayList(u8).init(allocator);
-    errdefer labels.deinit();
+    var labels = std.ArrayList(u8).empty;
+    errdefer labels.deinit(allocator);
 
     var current_offset = offset.*;
     var jumped = false;
@@ -448,11 +504,55 @@ fn parseDomainName(data: []const u8, offset: *usize, allocator: std.mem.Allocato
         current_offset += 1;
         if (current_offset + label_length > data.len) return error.MalformedDnsMessage;
 
-        if (labels.items.len > 0) try labels.append('.');
-        try labels.appendSlice(data[current_offset..current_offset + label_length]);
+        if (labels.items.len > 0) try labels.append(allocator, '.');
+        try labels.appendSlice(allocator, data[current_offset..current_offset + label_length]);
         current_offset += label_length;
     }
 
     offset.* = if (jumped) return_offset else current_offset;
-    return labels.toOwnedSlice();
+    return labels.toOwnedSlice(allocator);
+}
+
+test "parseDoHResponse memory safety and errdefer on OOM" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "Status": 0,
+        \\  "Answer": [
+        \\    {"name": "example.com", "type": 1, "TTL": 300, "data": "93.184.216.34"},
+        \\    {"name": "example.com", "type": 1, "TTL": 300, "data": "93.184.216.35"}
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const query = DnsQuery{
+        .name = "example.com",
+        .record_type = .A,
+    };
+
+    // 1. Success case with testing allocator (checks for leaks)
+    const answers = try parseDoHResponse(parsed.value, query, allocator);
+    defer {
+        for (answers) |ans| {
+            allocator.free(ans.name);
+            allocator.free(ans.data);
+        }
+        allocator.free(answers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqualStrings("example.com", answers[0].name);
+    try std.testing.expectEqualStrings("93.184.216.34", answers[0].data);
+    try std.testing.expectEqualStrings("example.com", answers[1].name);
+    try std.testing.expectEqualStrings("93.184.216.35", answers[1].data);
+
+    // 2. Induced OOM case with failing allocator to test errdefer cleanup
+    var failing_alloc_instance = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    const failing_alloc = failing_alloc_instance.allocator();
+    _ = parseDoHResponse(parsed.value, query, failing_alloc) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    };
 }

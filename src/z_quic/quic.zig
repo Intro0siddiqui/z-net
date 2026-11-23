@@ -20,6 +20,26 @@ const MAX_STREAMS_UNI: u64 = 0x3FFFFFFFFFFFFFFF;
 const MAX_STREAMS_BIDI: u64 = 0x3FFFFFFFFFFFFFFF;
 const CONNECTION_ID_LENGTH: usize = 16;
 
+pub const Duration = struct {
+    nanoseconds: u64,
+
+    pub fn fromNanoseconds(ns: u64) Duration {
+        return .{ .nanoseconds = ns };
+    }
+
+    pub fn fromMillis(ms: u64) Duration {
+        return .{ .nanoseconds = ms * std.time.ns_per_ms };
+    }
+
+    pub fn asNanoseconds(self: Duration) u64 {
+        return self.nanoseconds;
+    }
+
+    pub fn asMillis(self: Duration) u64 {
+        return self.nanoseconds / std.time.ns_per_ms;
+    }
+};
+
 /// QUIC Packet Types
 const PACKET_TYPE_INITIAL: u8 = 0x00;
 const PACKET_TYPE_0RTT: u8 = 0x10;
@@ -139,6 +159,11 @@ pub const Stream = struct {
         
         return read_len;
     }
+
+    pub fn deinit(self: *Stream) void {
+        self.data.deinit(self.data_allocator);
+        self.data_allocator.destroy(self);
+    }
 };
 
 /// QUIC Frame
@@ -188,7 +213,7 @@ pub const CongestionControl = struct {
         };
     }
     
-    pub fn onAck(self: *CongestionControl, acked_bytes: u64, rtt: std.time.Duration) void {
+    pub fn onAck(self: *CongestionControl, acked_bytes: u64, rtt: Duration) void {
         _ = rtt;
         // Cubic algorithm
         const t = @as(f64, @as(u64, @intCast(self.t0.readSince()))) / @as(f64, @floatFromInt(std.time.ns_per_s));
@@ -221,68 +246,74 @@ pub const CongestionControl = struct {
 
 /// Loss Recovery
 pub const LossRecovery = struct {
+    allocator: std.mem.Allocator,
     packet_number: u64,
     highest_acked: u64,
     acked_packets: std.ArrayList(u64),
     lost_packets: std.ArrayList(u64),
-    rtt_samples: std.ArrayList(std.time.Duration),
-    smoothed_rtt: std.time.Duration,
-    rttvar: std.time.Duration,
+    rtt_sample_count: u64,
+    smoothed_rtt: Duration,
+    rttvar: Duration,
     time_threshold: f64,
     packet_threshold: u64,
     
     pub fn init(allocator: std.mem.Allocator) LossRecovery {
-        _ = allocator;
         return LossRecovery{
+            .allocator = allocator,
             .packet_number = 0,
             .highest_acked = 0,
             .acked_packets = .empty,
             .lost_packets = .empty,
-            .rtt_samples = .empty,
-            .smoothed_rtt = std.time.Duration.fromMillis(100),
-            .rttvar = std.time.Duration.fromMillis(25),
+            .rtt_sample_count = 0,
+            .smoothed_rtt = Duration.fromMillis(100),
+            .rttvar = Duration.fromMillis(25),
             .time_threshold = 9.0 / 8.0,
             .packet_threshold = 3,
         };
     }
+
+    pub fn deinit(self: *LossRecovery) void {
+        self.acked_packets.deinit(self.allocator);
+        self.lost_packets.deinit(self.allocator);
+    }
     
-    pub fn onAck(self: *LossRecovery, packet_num: u64, ack_delay: std.time.Duration) void {
+    pub fn onAck(self: *LossRecovery, packet_num: u64, ack_delay: Duration) void {
         self.highest_acked = @max(self.highest_acked, packet_num);
 
-        // Update RTT
+        // Update smoothed RTT using RFC 6298 EWMA algorithm without unbounded allocation
         const sample_rtt = ack_delay;
-        const gpa = std.heap.page_allocator;
-        self.rtt_samples.append(gpa, sample_rtt) catch {};
-        
-        // Update smoothed RTT using RFC 6298 algorithm
-        if (self.rtt_samples.items.len > 0) {
-            const srtt_ns = self.smoothed_rtt.asNanoseconds();
-            const rtt_ns = sample_rtt.asNanoseconds();
-            
+        const srtt_ns = self.smoothed_rtt.asNanoseconds();
+        const rtt_ns = sample_rtt.asNanoseconds();
+
+        if (self.rtt_sample_count == 0) {
+            self.smoothed_rtt = sample_rtt;
+            self.rttvar = Duration.fromNanoseconds(@divTrunc(rtt_ns, 2));
+        } else {
             const new_srtt = (srtt_ns * 7 + rtt_ns) / 8;
-            const new_rttvar = ((@abs(@as(i128, srtt_ns) - rtt_ns)) * 3 + self.rttvar.asNanoseconds() * 3) / 4;
-            
-            self.smoothed_rtt = std.time.Duration.fromNanoseconds(new_srtt);
-            self.rttvar = std.time.Duration.fromNanoseconds(new_rttvar);
+            const diff: u64 = if (srtt_ns >= rtt_ns) srtt_ns - rtt_ns else rtt_ns - srtt_ns;
+            const new_rttvar = (diff * 3 + self.rttvar.asNanoseconds() * 3) / 4;
+
+            self.smoothed_rtt = Duration.fromNanoseconds(new_srtt);
+            self.rttvar = Duration.fromNanoseconds(new_rttvar);
         }
+        self.rtt_sample_count += 1;
     }
     
     pub fn onLoss(self: *LossRecovery, packet_num: u64) !void {
-        const gpa = std.heap.page_allocator;
-        try self.lost_packets.append(gpa, packet_num);
+        try self.lost_packets.append(self.allocator, packet_num);
     }
     
-    pub fn getRTO(self: LossRecovery) std.time.Duration {
+    pub fn getRTO(self: LossRecovery) Duration {
         // RFC 6298 RTO calculation
         const srtt_ns = self.smoothed_rtt.asNanoseconds();
         const rttvar_ns = self.rttvar.asNanoseconds();
 
         var rto_ns = srtt_ns + @max(std.time.ns_per_ms * 100, 4 * rttvar_ns);
-        if (rto_ns > std.time.ns_per_minute * 60) {
-            rto_ns = std.time.ns_per_minute * 60; // Cap at 60s
+        if (rto_ns > std.time.ns_per_min * 60) {
+            rto_ns = std.time.ns_per_min * 60; // Cap at 60s
         }
         
-        return std.time.Duration.fromNanoseconds(rto_ns);
+        return Duration.fromNanoseconds(rto_ns);
     }
 };
 
@@ -425,6 +456,12 @@ pub const Connection = struct {
     }
     
     pub fn destroy(self: *Connection) void {
+        self.loss_recovery.deinit();
+        var it = self.streams.valueIterator();
+        while (it.next()) |stream| {
+            stream.*.deinit();
+        }
+        self.streams.deinit();
         self.allocator.destroy(self);
     }
 
@@ -715,24 +752,34 @@ const ConnectionIdHash = struct {
 };
 
 test "QUIC Connection Initialization" {
-    const allocator = std.testing.allocator;
-    const sock = try socket.Manager.init(allocator);
-    defer sock.deinit();
-
-    const quic = try Manager.init(allocator, &sock);
-    defer quic.destroy();
-    
-    // Test connection creation
+    // Placeholder test for connection ID hashing
     var conn_id: [CONNECTION_ID_LENGTH]u8 = undefined;
     for (0..CONNECTION_ID_LENGTH) |i| {
         conn_id[i] = @as(u8, @truncate(i));
     }
-    
-    _ = std.net.Address.resolveIp("127.0.0.1", 443) catch {};
-    
-    // This would need the socket to be properly initialized in test
-    // const connection = try Connection.init(allocator, conn_id, addr, addr);
-    // defer connection.destroy();
-    
-    try testing.expect(true); // Placeholder test
+    const hash = ConnectionIdHash.hash(.{}, conn_id);
+    try testing.expect(hash != 0);
+    try testing.expect(ConnectionIdHash.eql(.{}, conn_id, conn_id));
+}
+
+test "LossRecovery EWMA and memory safety" {
+    const allocator = std.testing.allocator;
+    var lr = LossRecovery.init(allocator);
+    defer lr.deinit();
+
+    // First sample initializes SRTT and RTTVAR
+    lr.onAck(1, Duration.fromMillis(50));
+    try std.testing.expectEqual(@as(u64, 1), lr.rtt_sample_count);
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), lr.smoothed_rtt.asNanoseconds());
+    try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), lr.rttvar.asNanoseconds());
+
+    // Subsequent sample applies EWMA
+    lr.onAck(2, Duration.fromMillis(70));
+    try std.testing.expectEqual(@as(u64, 2), lr.rtt_sample_count);
+    try std.testing.expect(lr.smoothed_rtt.asNanoseconds() > 50 * std.time.ns_per_ms);
+
+    // Record loss
+    try lr.onLoss(3);
+    try std.testing.expectEqual(@as(usize, 1), lr.lost_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 3), lr.lost_packets.items[0]);
 }

@@ -4,6 +4,12 @@
 const std = @import("std");
 const browserdb = @import("browserdb");
 
+fn getTimestamp() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+    return ts.sec;
+}
+
 pub const HttpHeader = struct {
     name: []const u8,
     value: []const u8,
@@ -110,7 +116,7 @@ pub const Cache = struct {
         var entry = try deserializeCacheEntry(db_entry, self.allocator);
 
         // Check freshness according to RFC 7234
-        const now = std.time.timestamp();
+        const now = getTimestamp();
         if (now >= entry.expires_at) {
             // Entry is stale, but we keep it for revalidation
             self.stats.miss_count += 1;
@@ -136,7 +142,7 @@ pub const Cache = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const now = std.time.timestamp();
+        const now = getTimestamp();
         const expires_at = now + (ttl orelse self.config.default_ttl);
 
         // Compress if necessary
@@ -217,7 +223,7 @@ pub const Cache = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const now = std.time.timestamp();
+        const now = getTimestamp();
         const expired_keys = self.db.getExpiredEntries(now) catch return;
 
         for (expired_keys) |key| {
@@ -247,7 +253,7 @@ pub const Cache = struct {
 
         for (all_entries) |entry_data| {
             const entry = try deserializeCacheEntry(entry_data.value, self.allocator);
-            const score = @as(f64, @floatFromInt(entry.access_count)) / @as(f64, @floatFromInt(@as(i64, std.time.timestamp()) - entry.last_accessed + 1));
+            const score = @as(f64, @floatFromInt(entry.access_count)) / @as(f64, @floatFromInt(getTimestamp() - entry.last_accessed + 1));
             try entries.append(.{ .key = entry.key, .score = score });
         }
 
@@ -325,7 +331,7 @@ pub const HttpCache = struct {
 
         const entry_opt = self.cache.get(cache_key) catch return null;
         if (entry_opt) |e| {
-            const now = std.time.timestamp();
+            const now = getTimestamp();
             const is_expired = now >= e.expires_at;
 
             // RFC 7234 Freshness Check
@@ -338,7 +344,7 @@ pub const HttpCache = struct {
                             return HttpCacheEntry{
                                 .url = e.key,
                                 .status_code = 304,
-                                .headers = try parseHeadersFromEntry(&e),
+                                .headers = try parseHeadersFromEntry(self.cache.allocator, &e),
                                 .body = &.{},
                                 .metadata = e.metadata,
                                 .created_at = e.created_at,
@@ -354,7 +360,7 @@ pub const HttpCache = struct {
                 return HttpCacheEntry{
                     .url = e.key,
                     .status_code = 200,
-                    .headers = try parseHeadersFromEntry(&e),
+                    .headers = try parseHeadersFromEntry(self.cache.allocator, &e),
                     .body = e.value,
                     .metadata = e.metadata,
                     .created_at = e.created_at,
@@ -481,6 +487,17 @@ pub const HttpCacheEntry = struct {
     expires_at: i64,
     etag: ?[]const u8,
     last_modified: ?[]const u8,
+
+    pub fn deinit(self: *HttpCacheEntry, allocator: std.mem.Allocator) void {
+        for (self.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        if (self.headers.len > 0) {
+            allocator.free(self.headers);
+        }
+        self.headers = &.{};
+    }
 };
 
 // DNS Cache
@@ -506,7 +523,7 @@ pub const DnsCache = struct {
             .domain = e.key,
             .record_type = record_type,
             .records = e.value,
-            .ttl = @intCast(e.expires_at - std.time.timestamp()),
+            .ttl = @intCast(@max(0, e.expires_at - getTimestamp())),
             .created_at = e.created_at,
         } else null;
     }
@@ -657,39 +674,68 @@ fn deserializeCacheEntry(data: []const u8, allocator: std.mem.Allocator) !CacheE
 }
 
 // Helper functions for HTTP response serialization
-fn serializeHttpResponse(response: HttpResponse, allocator: std.mem.Allocator) ![]u8 {
-    // Simplified serialization - in practice would use a proper protocol
-    var buffer = std.ArrayList(u8).init(allocator);
+pub fn serializeHttpResponse(response: HttpResponse, allocator: std.mem.Allocator) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     
-    // Write status code and basic info
-    try buffer.appendSlice(&std.mem.toBytes(response.status_code));
+    // Write status code (big-endian)
+    var status_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &status_bytes, response.status_code, .big);
+    try buffer.appendSlice(allocator, &status_bytes);
     
     // Write headers as JSON
-    const headers_json = std.json.stringify(response.headers, .{}, allocator) catch return error.SerializationError;
+    const headers_json = std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response.headers, .{})}) catch return error.SerializationError;
     defer allocator.free(headers_json);
     
-    try buffer.appendSlice(&std.mem.toBytes(@as(u32, headers_json.len)));
-    try buffer.appendSlice(headers_json);
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @as(u32, @intCast(headers_json.len)), .big);
+    try buffer.appendSlice(allocator, &len_bytes);
+    try buffer.appendSlice(allocator, headers_json);
     
     // Write body
-    try buffer.appendSlice(&std.mem.toBytes(@as(u32, response.body.len)));
-    try buffer.appendSlice(response.body);
+    std.mem.writeInt(u32, &len_bytes, @as(u32, @intCast(response.body.len)), .big);
+    try buffer.appendSlice(allocator, &len_bytes);
+    try buffer.appendSlice(allocator, response.body);
     
-    return buffer.toOwnedSlice();
+    return buffer.toOwnedSlice(allocator);
 }
 
 fn parseStatusCodeFromEntry(entry: *const CacheEntry) !u16 {
-    // Parse status code from serialized entry
-    const status_code = std.mem.readInt(u16, entry.value[0..2], .big);
-    return status_code;
+    if (entry.value.len < 2) return error.DeserializationError;
+    return std.mem.readInt(u16, entry.value[0..2], .big);
 }
 
-fn parseHeadersFromEntry(entry: *const CacheEntry) ![]HttpHeader {
+pub fn parseHeadersFromEntry(allocator: std.mem.Allocator, entry: *const CacheEntry) CacheError![]HttpHeader {
+    if (entry.value.len < 6) return error.DeserializationError;
     const headers_len = std.mem.readInt(u32, entry.value[2..6], .big);
+    if (entry.value.len < 6 + headers_len) return error.DeserializationError;
     const headers_json = entry.value[6..6 + headers_len];
     
-    const parsed = std.json.parseFromSlice([]HttpHeader, std.heap.page_allocator, headers_json, .{}) catch return error.DeserializationError;
-    return parsed.value;
+    var parsed = std.json.parseFromSlice([]HttpHeader, allocator, headers_json, .{}) catch return error.DeserializationError;
+    defer parsed.deinit();
+
+    const headers = allocator.alloc(HttpHeader, parsed.value.len) catch return error.DeserializationError;
+    var count: usize = 0;
+    errdefer {
+        for (headers[0..count]) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(headers);
+    }
+
+    for (parsed.value) |h| {
+        const name_copy = allocator.dupe(u8, h.name) catch return error.DeserializationError;
+        errdefer allocator.free(name_copy);
+        const val_copy = allocator.dupe(u8, h.value) catch return error.DeserializationError;
+        headers[count] = HttpHeader{
+            .name = name_copy,
+            .value = val_copy,
+        };
+        count += 1;
+    }
+
+    return headers;
 }
 
 // Cookie serialization functions
@@ -702,5 +748,58 @@ fn parseCookieEntries(data: []const u8) []CookieEntry {
 
 fn serializeCookieEntries(cookies: []CookieEntry, allocator: std.mem.Allocator) ![]u8 {
     // Simplified cookie serialization
-    return try std.json.stringify(cookies, .{}, allocator);
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(cookies, .{})});
+}
+
+test "parseHeadersFromEntry memory safety without leaks" {
+    const allocator = std.testing.allocator;
+    var raw_headers = [_]HttpHeader{
+        .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        .{ .name = "cache-control", .value = "max-age=3600" },
+    };
+    const resp = HttpResponse{
+        .status_code = 200,
+        .headers = &raw_headers,
+        .body = "hello world",
+    };
+    const serialized = try serializeHttpResponse(resp, allocator);
+    defer allocator.free(serialized);
+
+    const dummy_entry = CacheEntry{
+        .key = "http://example.com",
+        .value = serialized,
+        .created_at = 0,
+        .expires_at = 100,
+        .access_count = 1,
+        .last_accessed = 0,
+        .metadata = .{
+            .content_type = null,
+            .content_encoding = null,
+            .etag = null,
+            .last_modified = null,
+            .vary_headers = null,
+            .size = serialized.len,
+            .compressed = false,
+        },
+    };
+
+    const parsed_headers = try parseHeadersFromEntry(allocator, &dummy_entry);
+    var dummy_cache_entry = HttpCacheEntry{
+        .url = dummy_entry.key,
+        .status_code = 200,
+        .headers = parsed_headers,
+        .body = dummy_entry.value,
+        .metadata = dummy_entry.metadata,
+        .created_at = dummy_entry.created_at,
+        .expires_at = dummy_entry.expires_at,
+        .etag = null,
+        .last_modified = null,
+    };
+    defer dummy_cache_entry.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), dummy_cache_entry.headers.len);
+    try std.testing.expectEqualStrings("content-type", dummy_cache_entry.headers[0].name);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", dummy_cache_entry.headers[0].value);
+    try std.testing.expectEqualStrings("cache-control", dummy_cache_entry.headers[1].name);
+    try std.testing.expectEqualStrings("max-age=3600", dummy_cache_entry.headers[1].value);
 }
