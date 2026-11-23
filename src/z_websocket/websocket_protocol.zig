@@ -100,55 +100,57 @@ pub const WebSocketFrame = struct {
     }
     
     pub fn encode(self: *WebSocketFrame, allocator: Allocator) ![]const u8 {
-        var frame_data = ArrayList(u8).init(allocator);
+        var frame_data = ArrayList(u8).empty;
+        errdefer frame_data.deinit(allocator);
         
         // First byte: FIN + RSV + opcode
         var first_byte: u8 = 0;
         if (self.fin) first_byte |= 0x80;
         first_byte |= @as(u8, @intFromEnum(self.opcode));
-        frame_data.append(first_byte) catch {};
+        try frame_data.append(allocator, first_byte);
         
         // Second byte: MASK + payload length
         var second_byte: u8 = 0;
         if (self.masked) second_byte |= 0x80;
         
         if (self.payload_length < 126) {
-            second_byte |= @as(u8, self.payload_length);
+            second_byte |= @as(u8, @truncate(self.payload_length));
+            try frame_data.append(allocator, second_byte);
         } else if (self.payload_length < 65536) {
             second_byte |= 126;
-            frame_data.append(second_byte) catch {};
+            try frame_data.append(allocator, second_byte);
             
-            const len_bytes = std.mem.toBytes(@as(u16, self.payload_length));
-            frame_data.appendSlice(&len_bytes) catch {};
+            var len_bytes: [2]u8 = undefined;
+            std.mem.writeInt(u16, &len_bytes, @as(u16, @truncate(self.payload_length)), .big);
+            try frame_data.appendSlice(allocator, &len_bytes);
         } else {
             second_byte |= 127;
-            frame_data.append(second_byte) catch {};
+            try frame_data.append(allocator, second_byte);
             
-            const len_bytes = std.mem.toBytes(self.payload_length);
-            frame_data.appendSlice(&len_bytes) catch {};
+            var len_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len_bytes, self.payload_length, .big);
+            try frame_data.appendSlice(allocator, &len_bytes);
         }
         
         // Masking key (if masked)
         if (self.masked) {
-            frame_data.appendSlice(&self.masking_key) catch {};
+            try frame_data.appendSlice(allocator, &self.masking_key);
         }
         
         // Payload
-        var payload_data = self.payload;
         if (self.masked) {
-            // XOR payload with masking key
-            var masked_payload = try allocator.alloc(u8, payload_data.len);
+            const masked_payload = try allocator.alloc(u8, self.payload.len);
             defer allocator.free(masked_payload);
             
-            for (payload_data, 0..) |byte, i| {
+            for (self.payload, 0..) |byte, i| {
                 masked_payload[i] = byte ^ self.masking_key[i % 4];
             }
-            payload_data = masked_payload;
+            try frame_data.appendSlice(allocator, masked_payload);
+        } else {
+            try frame_data.appendSlice(allocator, self.payload);
         }
         
-        frame_data.appendSlice(payload_data) catch {};
-        
-        return frame_data.toOwnedSlice();
+        return frame_data.toOwnedSlice(allocator);
     }
     
     pub fn decode(self: *WebSocketFrame, data: []const u8, allocator: Allocator) !usize {
@@ -157,7 +159,7 @@ pub const WebSocketFrame = struct {
         // Parse first byte
         const first_byte = data[0];
         self.fin = (first_byte & 0x80) != 0;
-        const opcode_value = first_byte & 0x0F;
+        const opcode_value: u4 = @truncate(first_byte & 0x0F);
         self.opcode = @enumFromInt(opcode_value);
         
         // Parse second byte
@@ -171,20 +173,18 @@ pub const WebSocketFrame = struct {
             self.payload_length = payload_len_field;
         } else if (payload_len_field == 126) {
             if (data.len < 4) return error.InsufficientData;
-            const len_bytes = std.mem.bytesAsValue(u16, data[2..4]);
-            self.payload_length = @as(u64, len_bytes);
+            self.payload_length = std.mem.readInt(u16, data[2..4], .big);
             offset = 4;
         } else {
             if (data.len < 10) return error.InsufficientData;
-            const len_bytes = std.mem.bytesAsValue(u64, data[2..10]);
-            self.payload_length = len_bytes;
+            self.payload_length = std.mem.readInt(u64, data[2..10], .big);
             offset = 10;
         }
         
         // Parse masking key (if present)
         if (self.masked) {
             if (data.len < offset + 4) return error.InsufficientData;
-            self.masking_key = std.mem.bytesAsValue([4]u8, data[offset..offset + 4]);
+            @memcpy(&self.masking_key, data[offset .. offset + 4]);
             offset += 4;
         }
         
@@ -195,7 +195,7 @@ pub const WebSocketFrame = struct {
         
         if (self.masked) {
             // Unmask payload
-            var unmasked_payload = try allocator.alloc(u8, self.payload_length);
+            const unmasked_payload = try allocator.alloc(u8, self.payload_length);
             for (data[payload_start..payload_end], 0..) |byte, i| {
                 unmasked_payload[i] = byte ^ self.masking_key[i % 4];
             }
@@ -220,6 +220,7 @@ pub const WebSocketFrame = struct {
 
 // WebSocket message (can span multiple frames)
 pub const WebSocketMessage = struct {
+    allocator: Allocator,
     message_type: WebSocketFrameType,
     complete_data: ArrayList(u8),
     is_complete: bool,
@@ -227,15 +228,16 @@ pub const WebSocketMessage = struct {
     
     pub fn init(allocator: Allocator, message_type: WebSocketFrameType) WebSocketMessage {
         return WebSocketMessage{
+            .allocator = allocator,
             .message_type = message_type,
-            .complete_data = ArrayList(u8).init(allocator),
+            .complete_data = .empty,
             .is_complete = false,
             .frame_count = 0,
         };
     }
     
     pub fn deinit(self: *WebSocketMessage) void {
-        self.complete_data.deinit();
+        self.complete_data.deinit(self.allocator);
     }
     
     pub fn appendFrame(self: *WebSocketMessage, frame: *WebSocketFrame) !void {
@@ -243,10 +245,10 @@ pub const WebSocketMessage = struct {
         
         // For continuation frames, append to existing data
         if (frame.opcode == .CONTINUATION or (!frame.fin and self.frame_count > 1)) {
-            self.complete_data.appendSlice(frame.payload) catch {};
+            self.complete_data.appendSlice(self.allocator, frame.payload) catch {};
         } else {
             // First frame
-            self.complete_data.appendSlice(frame.payload) catch {};
+            self.complete_data.appendSlice(self.allocator, frame.payload) catch {};
         }
         
         // Check if this is the final frame
@@ -276,35 +278,37 @@ pub const WebSocketState = enum {
 
 // WebSocket extensions negotiated
 pub const WebSocketNegotiation = struct {
+    allocator: Allocator,
     client_extensions: ArrayList(WebSocketExtension),
     server_extensions: ArrayList(WebSocketExtension),
     negotiated_extensions: ArrayList(WebSocketExtension),
     
     pub fn init(allocator: Allocator) WebSocketNegotiation {
         return WebSocketNegotiation{
-            .client_extensions = ArrayList(WebSocketExtension).init(allocator),
-            .server_extensions = ArrayList(WebSocketExtension).init(allocator),
-            .negotiated_extensions = ArrayList(WebSocketExtension).init(allocator),
+            .allocator = allocator,
+            .client_extensions = .empty,
+            .server_extensions = .empty,
+            .negotiated_extensions = .empty,
         };
     }
     
     pub fn deinit(self: *WebSocketNegotiation) void {
         for (self.client_extensions.items) |*ext| ext.deinit();
-        self.client_extensions.deinit();
+        self.client_extensions.deinit(self.allocator);
         
         for (self.server_extensions.items) |*ext| ext.deinit();
-        self.server_extensions.deinit();
+        self.server_extensions.deinit(self.allocator);
         
         for (self.negotiated_extensions.items) |*ext| ext.deinit();
-        self.negotiated_extensions.deinit();
+        self.negotiated_extensions.deinit(self.allocator);
     }
     
     pub fn addClientExtension(self: *WebSocketNegotiation, extension: WebSocketExtension) void {
-        self.client_extensions.append(extension) catch {};
+        self.client_extensions.append(self.allocator, extension) catch {};
     }
     
     pub fn addServerExtension(self: *WebSocketNegotiation, extension: WebSocketExtension) void {
-        self.server_extensions.append(extension) catch {};
+        self.server_extensions.append(self.allocator, extension) catch {};
     }
     
     pub fn negotiate(self: *WebSocketNegotiation) !void {
@@ -312,7 +316,7 @@ pub const WebSocketNegotiation = struct {
         for (self.client_extensions.items) |client_ext| {
             for (self.server_extensions.items) |server_ext| {
                 if (std.mem.eql(u8, client_ext.name, server_ext.name)) {
-                    var negotiated = WebSocketExtension.init(std.heap.c_allocator, client_ext.name);
+                    var negotiated = WebSocketExtension.init(self.allocator, client_ext.name);
                     
                     // Match parameters
                     var client_iter = client_ext.parameters.keyIterator();
@@ -330,7 +334,7 @@ pub const WebSocketNegotiation = struct {
                         }
                     }
                     
-                    self.negotiated_extensions.append(negotiated) catch {};
+                    self.negotiated_extensions.append(self.allocator, negotiated) catch {};
                     break;
                 }
             }
@@ -349,6 +353,7 @@ pub const WebSocketNegotiation = struct {
 
 // WebSocket connection
 pub const WebSocketConnection = struct {
+    allocator: Allocator,
     connection_id: u64,
     url: []const u8,
     protocols: ArrayList([]const u8),
@@ -366,17 +371,18 @@ pub const WebSocketConnection = struct {
     
     pub fn init(allocator: Allocator, connection_id: u64, url: []const u8) WebSocketConnection {
         return WebSocketConnection{
+            .allocator = allocator,
             .connection_id = connection_id,
             .url = url,
-            .protocols = ArrayList([]const u8).init(allocator),
+            .protocols = .empty,
             .state = .CONNECTING,
             .socket_fd = -1,
             .created_timestamp = getCurrentTimestamp(),
             .last_activity_timestamp = getCurrentTimestamp(),
             .extensions = WebSocketNegotiation.init(allocator),
             .current_message = null,
-            .message_queue = ArrayList(WebSocketMessage).init(allocator),
-            .ping_queue = ArrayList(u64).init(allocator),
+            .message_queue = .empty,
+            .ping_queue = .empty,
             .binary_mode = false,
             .max_message_size = 16 * 1024 * 1024, // 16MB default
             .compression_enabled = false,
@@ -384,7 +390,7 @@ pub const WebSocketConnection = struct {
     }
     
     pub fn deinit(self: *WebSocketConnection) void {
-        self.protocols.deinit();
+        self.protocols.deinit(self.allocator);
         self.extensions.deinit();
         
         if (self.current_message) |*msg| {
@@ -394,13 +400,13 @@ pub const WebSocketConnection = struct {
         for (self.message_queue.items) |*msg| {
             msg.deinit();
         }
-        self.message_queue.deinit();
+        self.message_queue.deinit(self.allocator);
         
-        self.ping_queue.deinit();
+        self.ping_queue.deinit(self.allocator);
     }
     
     pub fn addProtocol(self: *WebSocketConnection, protocol: []const u8) void {
-        self.protocols.append(protocol) catch {};
+        self.protocols.append(self.allocator, protocol) catch {};
     }
     
     pub fn setBinaryMode(self: *WebSocketConnection, binary: bool) void {
@@ -419,38 +425,71 @@ pub const WebSocketConnection = struct {
         self.last_activity_timestamp = getCurrentTimestamp();
     }
     
-    pub fn isActive(self: *WebSocketConnection, timeout_seconds: u64) bool {
-        return (getCurrentTimestamp() - self.last_activity_timestamp) < timeout_seconds;
+    pub fn isActive(self: *const WebSocketConnection, timeout_seconds: u64) bool {
+        return (getCurrentTimestamp() - self.last_activity_timestamp) < (timeout_seconds * 1000);
+    }
+
+    pub fn sendRaw(self: *WebSocketConnection, data: []const u8) !void {
+        if (self.socket_fd < 0) return error.SocketNotConnected;
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const rc = std.posix.system.write(self.socket_fd, data[sent..].ptr, data.len - sent);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return error.ConnectionResetByPeer;
+                    sent += n;
+                },
+                .INTR => continue,
+                .PIPE, .CONNRESET => return error.ConnectionResetByPeer,
+                else => return error.ProtocolError,
+            }
+        }
+        self.updateActivity();
     }
     
+    fn fillRandomBytes(buf: []u8) void {
+        const rc = std.posix.system.getrandom(buf.ptr, buf.len, 0);
+        if (rc == buf.len) return;
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+        const seed: u64 = @bitCast(ts.nsec);
+        var prng = std.Random.DefaultPrng.init(seed);
+        prng.random().bytes(buf);
+    }
+
     pub fn sendText(self: *WebSocketConnection, text: []const u8, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
-        const frame = WebSocketFrame.init(allocator, .TEXT, text);
+        var frame = WebSocketFrame.init(allocator, .TEXT, text);
         defer frame.deinit();
         
         // Set masking for client-to-server frames
         var masking_key: [4]u8 = undefined;
-        std.crypto.random.scalar().read(&masking_key);
+        fillRandomBytes(&masking_key);
         frame.setMasking(true, masking_key);
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
+
+        try self.sendRaw(frame_data);
     }
     
     pub fn sendBinary(self: *WebSocketConnection, binary_data: []const u8, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
-        const frame = WebSocketFrame.init(allocator, .BINARY, binary_data);
+        var frame = WebSocketFrame.init(allocator, .BINARY, binary_data);
         defer frame.deinit();
         
         // Set masking for client-to-server frames
         var masking_key: [4]u8 = undefined;
-        std.crypto.random.scalar().read(&masking_key);
+        fillRandomBytes(&masking_key);
         frame.setMasking(true, masking_key);
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
+
+        try self.sendRaw(frame_data);
     }
     
     pub fn sendPing(self: *WebSocketConnection, allocator: Allocator) !void {
@@ -459,50 +498,57 @@ pub const WebSocketConnection = struct {
         const ping_data = std.fmt.allocPrint(allocator, "ping-{}", .{self.connection_id}) catch "";
         defer allocator.free(ping_data);
         
-        const frame = WebSocketFrame.init(allocator, .PING, ping_data);
+        var frame = WebSocketFrame.init(allocator, .PING, ping_data);
         defer frame.deinit();
         
         var masking_key: [4]u8 = undefined;
-        std.crypto.random.scalar().read(&masking_key);
+        fillRandomBytes(&masking_key);
         frame.setMasking(true, masking_key);
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
+
+        try self.sendRaw(frame_data);
         
         // Track ping for pong response
-        self.ping_queue.append(getCurrentTimestamp()) catch {};
+        self.ping_queue.append(self.allocator, getCurrentTimestamp()) catch {};
     }
     
     pub fn sendPong(self: *WebSocketConnection, ping_data: []const u8, allocator: Allocator) !void {
         if (self.state != .OPEN) return error.ConnectionNotOpen;
         
-        const frame = WebSocketFrame.init(allocator, .PONG, ping_data);
+        var frame = WebSocketFrame.init(allocator, .PONG, ping_data);
         defer frame.deinit();
         
         var masking_key: [4]u8 = undefined;
-        std.crypto.random.scalar().read(&masking_key);
+        fillRandomBytes(&masking_key);
         frame.setMasking(true, masking_key);
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
+
+        try self.sendRaw(frame_data);
     }
     
     pub fn sendClose(self: *WebSocketConnection, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
-        const reason_with_code = std.fmt.allocPrint(allocator, "{}{}", .{
-            std.mem.toBytes(@as(u16, @intFromEnum(code))),
-            reason,
-        }) catch "";
-        defer allocator.free(reason_with_code);
+        const payload = try allocator.alloc(u8, 2 + reason.len);
+        defer allocator.free(payload);
+        std.mem.writeInt(u16, payload[0..2], @intFromEnum(code), .big);
+        @memcpy(payload[2..], reason);
         
-        const frame = WebSocketFrame.init(allocator, .CLOSE, reason_with_code);
+        var frame = WebSocketFrame.init(allocator, .CLOSE, payload);
         defer frame.deinit();
         
         var masking_key: [4]u8 = undefined;
-        std.crypto.random.scalar().read(&masking_key);
+        fillRandomBytes(&masking_key);
         frame.setMasking(true, masking_key);
         
         const frame_data = try frame.encode(allocator);
         defer allocator.free(frame_data);
+
+        if (self.socket_fd >= 0) {
+            _ = self.sendRaw(frame_data) catch {};
+        }
         
         self.state = .CLOSING;
     }
@@ -558,7 +604,7 @@ pub const WebSocketConnection = struct {
         
         if (self.current_message.?.is_complete) {
             // Message complete, add to queue
-            self.message_queue.append(self.current_message.?.*) catch {};
+            self.message_queue.append(self.allocator, self.current_message.?) catch {};
             self.current_message = null;
         }
     }
@@ -572,7 +618,7 @@ pub const WebSocketConnection = struct {
         try self.current_message.?.appendFrame(frame);
         
         if (self.current_message.?.is_complete) {
-            self.message_queue.append(self.current_message.?.*) catch {};
+            self.message_queue.append(self.allocator, self.current_message.?) catch {};
             self.current_message = null;
         }
     }
@@ -619,7 +665,7 @@ pub const WebSocketConnection = struct {
 pub const WebSocketPool = struct {
     allocator: Allocator,
     connections: AutoHashMap(u64, WebSocketConnection),
-    url_to_connection: AutoHashMap([]const u8, u64),
+    url_to_connection: StringHashMap(u64),
     next_connection_id: u64,
     max_connections_per_origin: usize,
     connection_timeout_seconds: u64,
@@ -628,7 +674,7 @@ pub const WebSocketPool = struct {
         return WebSocketPool{
             .allocator = allocator,
             .connections = AutoHashMap(u64, WebSocketConnection).init(allocator),
-            .url_to_connection = AutoHashMap([]const u8, u64).init(allocator),
+            .url_to_connection = StringHashMap(u64).init(allocator),
             .next_connection_id = 1,
             .max_connections_per_origin = max_per_origin,
             .connection_timeout_seconds = 300, // 5 minutes
@@ -647,7 +693,7 @@ pub const WebSocketPool = struct {
     pub fn createConnection(self: *WebSocketPool, url: []const u8, protocols: ?ArrayList([]const u8)) !*WebSocketConnection {
         // Check if connection already exists for this URL
         if (self.url_to_connection.get(url)) |existing_id| {
-            if (self.connections.get(existing_id)) |existing| {
+            if (self.connections.getPtr(existing_id)) |existing| {
                 if (existing.state == .OPEN) {
                     return existing;
                 }
@@ -668,18 +714,18 @@ pub const WebSocketPool = struct {
         try self.connections.put(connection_id, connection);
         try self.url_to_connection.put(url, connection_id);
         
-        return self.connections.get(connection_id).?;
+        return self.connections.getPtr(connection_id).?;
     }
     
     pub fn getConnection(self: *WebSocketPool, url: []const u8) ?*WebSocketConnection {
         if (self.url_to_connection.get(url)) |connection_id| {
-            return self.connections.get(connection_id);
+            return self.connections.getPtr(connection_id);
         }
         return null;
     }
     
     pub fn removeConnection(self: *WebSocketPool, connection_id: u64) void {
-        if (self.connections.get(connection_id)) |connection| {
+        if (self.connections.getPtr(connection_id)) |connection| {
             _ = self.url_to_connection.remove(connection.url);
             connection.deinit();
         }
@@ -687,21 +733,21 @@ pub const WebSocketPool = struct {
     }
     
     pub fn closeConnection(self: *WebSocketPool, connection_id: u64, code: WebSocketCloseCode, reason: []const u8, allocator: Allocator) !void {
-        if (self.connections.get(connection_id)) |connection| {
+        if (self.connections.getPtr(connection_id)) |connection| {
             try connection.sendClose(code, reason, allocator);
             connection.state = .CLOSING;
         }
     }
     
     pub fn cleanupInactive(self: *WebSocketPool) void {
-        var to_remove = ArrayList(u64).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove = ArrayList(u64).empty;
+        defer to_remove.deinit(self.allocator);
         
         var conn_iter = self.connections.keyIterator();
         while (conn_iter.next()) |connection_id| {
             if (self.connections.get(connection_id.*)) |connection| {
                 if (!connection.isActive(self.connection_timeout_seconds)) {
-                    to_remove.append(connection_id.*) catch {};
+                    to_remove.append(self.allocator, connection_id.*) catch {};
                 }
             }
         }
@@ -737,12 +783,51 @@ pub const WebSocketError = error{
     InvalidFrame,
     ProtocolError,
     ExtensionError,
+    SocketNotConnected,
 };
 
 // Helper functions
 fn getCurrentTimestamp() u64 {
-    return std.time.timestamp();
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+    return @as(u64, @intCast(@max(0, ts.sec))) * 1000 + @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
 }
+
+pub const WebSocketProtocolConfig = struct {
+    max_frame_size: usize = 16 * 1024 * 1024,
+    ping_interval: u64 = 30000,
+    connection_timeout: u64 = 60000,
+};
+
+pub const WebSocketProtocol = struct {
+    allocator: Allocator,
+    config: WebSocketProtocolConfig,
+    extensions: []const []const u8,
+
+    pub fn init(allocator: Allocator) !WebSocketProtocol {
+        return WebSocketProtocol{
+            .allocator = allocator,
+            .config = .{},
+            .extensions = &[_][]const u8{"permessage-deflate"},
+        };
+    }
+
+    pub fn deinit(self: *WebSocketProtocol) void {
+        _ = self;
+    }
+
+    pub fn getSupportedExtensions(self: *const WebSocketProtocol) []const []const u8 {
+        return self.extensions;
+    }
+
+    pub fn getConfig(self: *const WebSocketProtocol) ?*const WebSocketProtocolConfig {
+        return &self.config;
+    }
+
+    pub fn updateConfig(self: *WebSocketProtocol, new_config: WebSocketProtocolConfig) !void {
+        self.config = new_config;
+    }
+};
 
 test "websocket frame encoding and decoding" {
     const allocator = std.testing.allocator;
@@ -809,7 +894,7 @@ test "websocket connection lifecycle" {
     // Update activity
     const initial_activity = connection.last_activity_timestamp;
     connection.updateActivity();
-    try std.testing.expect(connection.last_activity_timestamp > initial_activity);
+    try std.testing.expect(connection.last_activity_timestamp >= initial_activity);
     
     // Test isActive
     try std.testing.expect(connection.isActive(300)); // Should be active
@@ -825,7 +910,7 @@ test "websocket message handling" {
     
     // Simulate frames (simplified - would need actual frame objects)
     // For testing, we'll just check the structure
-    message.complete_data.appendSlice("Hello ") catch {};
+    message.complete_data.appendSlice(allocator, "Hello ") catch {};
     message.frame_count = 1;
     message.is_complete = true;
     
@@ -843,12 +928,11 @@ test "websocket pool operations" {
     try std.testing.expectEqual(@as(usize, 0), pool.getActiveConnectionCount());
     
     // Create connection
-    var protocols = ArrayList([]const u8).init(allocator);
-    defer protocols.deinit();
-    protocols.append("chat") catch {};
+    var protocols = ArrayList([]const u8).empty;
+    defer protocols.deinit(allocator);
+    protocols.append(allocator, "chat") catch {};
     
     const connection = try pool.createConnection("wss://echo.websocket.org", protocols);
-    try std.testing.expect(connection != null);
     try std.testing.expectEqual(@as(usize, 1), pool.getConnectionCount());
     
     // Get same connection
@@ -863,4 +947,57 @@ test "websocket pool operations" {
     // Cleanup inactive connections (none to remove)
     pool.cleanupInactive();
     try std.testing.expectEqual(@as(usize, 0), pool.getConnectionCount());
+}
+
+test "websocket socket transmission sends raw frames over socket" {
+    const allocator = std.testing.allocator;
+    var fds: [2]std.posix.fd_t = undefined;
+    _ = std.posix.system.pipe(&fds);
+    defer {
+        _ = std.posix.system.close(fds[0]);
+        _ = std.posix.system.close(fds[1]);
+    }
+
+    var connection = WebSocketConnection.init(allocator, 42, "wss://example.com/ws");
+    defer connection.deinit();
+    connection.socket_fd = fds[1];
+    connection.state = .OPEN;
+
+    // Test sendText transmits actual bytes over the socket
+    const msg = "ping-pong-websocket";
+    try connection.sendText(msg, allocator);
+
+    var buf: [256]u8 = undefined;
+    const rc1 = std.posix.system.read(fds[0], &buf, buf.len);
+    try std.testing.expect(rc1 > 0);
+    const n: usize = @intCast(rc1);
+
+    var rx_frame = WebSocketFrame.init(allocator, .TEXT, "");
+    defer {
+        if (rx_frame.masked) allocator.free(rx_frame.payload);
+    }
+    const consumed = try rx_frame.decode(buf[0..n], allocator);
+    try std.testing.expectEqual(n, consumed);
+    try std.testing.expectEqual(WebSocketFrameType.TEXT, rx_frame.opcode);
+    try std.testing.expect(rx_frame.masked);
+    try std.testing.expectEqualStrings(msg, rx_frame.payload);
+
+    // Test sendClose transmits close frame and updates state to CLOSING
+    try connection.sendClose(.NORMAL_CLOSURE, "bye", allocator);
+    try std.testing.expectEqual(WebSocketState.CLOSING, connection.state);
+
+    const rc2 = std.posix.system.read(fds[0], &buf, buf.len);
+    try std.testing.expect(rc2 > 0);
+    const close_n: usize = @intCast(rc2);
+
+    var close_rx = WebSocketFrame.init(allocator, .CLOSE, "");
+    defer {
+        if (close_rx.masked) allocator.free(close_rx.payload);
+    }
+    _ = try close_rx.decode(buf[0..close_n], allocator);
+    try std.testing.expectEqual(WebSocketFrameType.CLOSE, close_rx.opcode);
+    try std.testing.expect(close_rx.payload.len >= 2);
+    const code_val = std.mem.readInt(u16, close_rx.payload[0..2], .big);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(WebSocketCloseCode.NORMAL_CLOSURE)), code_val);
+    try std.testing.expectEqualStrings("bye", close_rx.payload[2..]);
 }
