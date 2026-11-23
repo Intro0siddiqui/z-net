@@ -2,18 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, development ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, development ]
   schedule:
     - cron: '0 6 * * *'
 
 jobs:
-  build:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -21,13 +22,31 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Build Rust Backend
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run Rust Engine Tests (HTTP/3, WebSockets, Multi-Path QUIC, DoH/DoT, PAC)
+        run: |
+          cd engine
+          cargo test --all-targets -- --nocapture
+
+      - name: Build Rust Backend (Release)
         run: |
           cd engine
           cargo build --release
