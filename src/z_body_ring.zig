@@ -4,6 +4,7 @@
 //! body transfers between the networking stack and other processes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const BodyRingError = error{
     Full,
@@ -101,32 +102,44 @@ pub const BodyRingDescriptor = extern struct {
     pub fn signalResume(self: *BodyRingDescriptor) void {
         const pfd = self.pause_fd.load(.acquire);
         if (pfd >= 0) {
-            const val: u64 = 1;
-            _ = std.os.linux.syscall3(.write, @as(usize, @intCast(pfd)), @intFromPtr(&val), 8);
+            if (comptime builtin.os.tag == .linux) {
+                const val: u64 = 1;
+                _ = std.os.linux.syscall3(.write, @as(usize, @intCast(pfd)), @intFromPtr(&val), 8);
+            }
         }
         _ = self.futex_word.fetchAdd(1, .release);
-        _ = std.os.linux.syscall3(.futex, @intFromPtr(&self.futex_word), std.os.linux.FUTEX.WAKE, 1);
+        if (comptime builtin.os.tag == .linux) {
+            _ = std.os.linux.syscall3(.futex, @intFromPtr(&self.futex_word), std.os.linux.FUTEX.WAKE, 1);
+        }
     }
 
     pub fn waitDrain(self: *BodyRingDescriptor, timeout_ns: u64) void {
         const pfd = self.pause_fd.load(.acquire);
         if (pfd >= 0) {
-            var pfd_poll = [_]std.os.linux.pollfd{.{
-                .fd = pfd,
-                .events = std.os.linux.POLL.IN,
-                .revents = 0,
-            }};
-            const timeout_ms = @as(i32, @intCast(@min(timeout_ns / 1_000_000, 100)));
-            _ = std.os.linux.syscall3(.poll, @intFromPtr(&pfd_poll), 1, @as(usize, @intCast(timeout_ms)));
-            var val: u64 = 0;
-            _ = std.os.linux.syscall3(.read, @as(usize, @intCast(pfd)), @intFromPtr(&val), 8);
+            if (comptime builtin.os.tag == .linux) {
+                var pfd_poll = [_]std.os.linux.pollfd{.{
+                    .fd = pfd,
+                    .events = std.os.linux.POLL.IN,
+                    .revents = 0,
+                }};
+                const timeout_ms = @as(i32, @intCast(@min(timeout_ns / 1_000_000, 100)));
+                _ = std.os.linux.syscall3(.poll, @intFromPtr(&pfd_poll), 1, @as(usize, @intCast(timeout_ms)));
+                var val: u64 = 0;
+                _ = std.os.linux.syscall3(.read, @as(usize, @intCast(pfd)), @intFromPtr(&val), 8);
+            } else {
+                std.time.sleep(@min(timeout_ns, 10_000_000));
+            }
         } else {
-            const cur = self.futex_word.load(.acquire);
-            const ts = std.os.linux.timespec{
-                .sec = 0,
-                .nsec = @as(isize, @intCast(@min(timeout_ns, 10_000_000))),
-            };
-            _ = std.os.linux.syscall4(.futex, @intFromPtr(&self.futex_word), std.os.linux.FUTEX.WAIT, cur, @intFromPtr(&ts));
+            if (comptime builtin.os.tag == .linux) {
+                const cur = self.futex_word.load(.acquire);
+                const ts = std.os.linux.timespec{
+                    .sec = 0,
+                    .nsec = @as(isize, @intCast(@min(timeout_ns, 10_000_000))),
+                };
+                _ = std.os.linux.syscall4(.futex, @intFromPtr(&self.futex_word), std.os.linux.FUTEX.WAIT, cur, @intFromPtr(&ts));
+            } else {
+                std.time.sleep(@min(timeout_ns, 10_000_000));
+            }
         }
     }
 };

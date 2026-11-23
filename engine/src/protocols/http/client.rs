@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use super::cookie_jar::CookieJar;
 use super::h1::{Http1FeedResult, Http1RequestBuilder, Http1ResponseParser};
 use super::pool::{ConnectionPool, PoolKey};
 use crate::protocols::compression::{decompress_payload, StreamDecompressor};
+use crate::protocols::dns::{DnsResolver, DnsResolverConfig};
 use crate::protocols::http3::Http3Client;
 use crate::protocols::proxy::{
     establish_http_connect_tunnel, establish_socks5_tunnel, ProxyConfig, ProxyRule, ProxyScheme,
@@ -107,29 +108,33 @@ pub struct HttpClientEngine {
     pub cookie_jar: Arc<CookieJar>,
     pub proxy_config: Option<ProxyConfig>,
     pub alt_svc_registry: Arc<AltSvcRegistry>,
+    pub dns_resolver: Arc<DnsResolver>,
 }
 
 impl HttpClientEngine {
     pub fn new(tls_config: Arc<ClientConfig>) -> Self {
+        let dns_resolver = Arc::new(DnsResolver::new(
+            tls_config.clone(),
+            DnsResolverConfig::default(),
+        ));
         Self {
             tls_config,
             pool: ConnectionPool::new(6, Duration::from_secs(60)),
             cookie_jar: Arc::new(CookieJar::new()),
             proxy_config: Some(ProxyConfig::from_env()),
             alt_svc_registry: Arc::new(AltSvcRegistry::new()),
+            dns_resolver,
         }
     }
 
-    /// Helper to connect a TCP stream to `host:port` with IPv4 prioritization and timeout.
-    fn connect_tcp(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
-        let addr_str = format!("{}:{}", host, port);
-        let mut addrs: Vec<SocketAddr> = addr_str
-            .to_socket_addrs()
-            .map_err(|e| format!("DNS resolution failed for {}: {}", addr_str, e))?
-            .collect();
-
-        // Prioritize IPv4 addresses over IPv6 to prevent black-hole stalls on dual-stack networks
-        addrs.sort_by_key(|addr| !addr.is_ipv4());
+    /// Helper to connect a TCP stream to `host:port` with DNS resolution, IPv4 prioritization, and timeout.
+    fn connect_tcp(
+        dns_resolver: &DnsResolver,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<TcpStream, String> {
+        let addrs = dns_resolver.resolve(host, port)?;
 
         let connect_timeout = std::cmp::min(timeout, Duration::from_secs(3));
         for addr in addrs {
@@ -236,16 +241,16 @@ impl HttpClientEngine {
         } else {
             let tcp = match proxy_rule.scheme {
                 ProxyScheme::Direct => {
-                    Self::connect_tcp(&host, port, options.timeout)?
+                    Self::connect_tcp(&self.dns_resolver, &host, port, options.timeout)?
                 }
                 ProxyScheme::Http => {
-                    let mut s = Self::connect_tcp(&proxy_rule.host, proxy_rule.port, options.timeout)?;
+                    let mut s = Self::connect_tcp(&self.dns_resolver, &proxy_rule.host, proxy_rule.port, options.timeout)?;
                     establish_http_connect_tunnel(&mut s, &host, port)
                         .map_err(|e| format!("HTTP CONNECT tunnel failed: {}", e))?;
                     s
                 }
                 ProxyScheme::Socks5 => {
-                    let mut s = Self::connect_tcp(&proxy_rule.host, proxy_rule.port, options.timeout)?;
+                    let mut s = Self::connect_tcp(&self.dns_resolver, &proxy_rule.host, proxy_rule.port, options.timeout)?;
                     establish_socks5_tunnel(&mut s, &host, port)
                         .map_err(|e| format!("SOCKS5 tunnel failed: {}", e))?;
                     s
@@ -859,7 +864,7 @@ mod tests {
 
     #[test]
     fn test_ipv4_prioritization() {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
         let mut addrs = vec![
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 80),

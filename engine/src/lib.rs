@@ -25,6 +25,9 @@ pub mod protocols {
     pub mod proxy;
     pub mod webtransport;
     pub mod auth;
+    pub mod dns;
+    pub mod websocket;
+    pub mod quic;
 }
 
 pub mod security {
@@ -1776,6 +1779,57 @@ pub extern "C" fn net_http3_close(engine_handle: NetEngineHandle, conn_handle: C
     NS_OK
 }
 
+/// Migrate a live QUIC connection to a new local IP address and port (RFC 9000 Section 9).
+/// Rebinds the local socket without resetting the connection ID, TLS handshake, or active streams.
+#[no_mangle]
+pub extern "C" fn net_quic_migrate(
+    engine_handle: NetEngineHandle,
+    conn_handle: ConnHandle,
+    new_local_ip: *const c_char,
+    new_local_port: u16,
+) -> i32 {
+    if engine_handle.is_null() || conn_handle.is_null() || new_local_ip.is_null() {
+        return NS_ERROR_FAILURE;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let conn_id = conn_handle as usize;
+
+    let ip_str = unsafe { std::ffi::CStr::from_ptr(new_local_ip) }.to_string_lossy();
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return NS_ERROR_FAILURE,
+    };
+    let new_addr = std::net::SocketAddr::new(ip, new_local_port);
+
+    let endpoint_entry = match engine.quic_endpoints.get_mut(&conn_id) {
+        Some(e) => e,
+        None => return NS_ERROR_FAILURE,
+    };
+
+    let new_socket = match UdpSocket::bind(new_addr) {
+        Ok(s) => s,
+        Err(_) => return NS_ERROR_FAILURE,
+    };
+
+    if new_socket.set_nonblocking(true).is_err() {
+        return NS_ERROR_FAILURE;
+    }
+
+    if engine.proactor.attach(new_socket.as_raw_fd()).is_err() {
+        return NS_ERROR_FAILURE;
+    }
+
+    let actual_local = match new_socket.local_addr() {
+        Ok(a) => a,
+        Err(_) => new_addr,
+    };
+
+    endpoint_entry.socket = new_socket;
+    endpoint_entry.local_addr = actual_local;
+
+    NS_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1972,6 +2026,34 @@ J0wGoFpdAiB7n+1noxTxqbLQQ/aSI9vGSov/GskEh1Zpn4xh3kNtOg==
         net_cookie_jar_clear(engine, 1);
         let _ = net_cookie_jar_get_header(engine, 1, url.as_ptr(), out_header.as_mut_ptr(), out_header.len());
         assert_eq!(out_header[0], 0);
+
+        net_engine_destroy(engine);
+    }
+
+    #[test]
+    fn test_c_abi_quic_connection_migration() {
+        let engine = net_engine_create();
+        assert!(!engine.is_null());
+
+        let mock_server = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind mock udp server");
+        let server_port = mock_server.local_addr().unwrap().port();
+
+        let host = std::ffi::CString::new("127.0.0.1").unwrap();
+        let conn_handle = net_http3_connect(engine, host.as_ptr(), server_port);
+        assert!(!conn_handle.is_null());
+
+        // Migrate connection to a new local address
+        let new_ip = std::ffi::CString::new("127.0.0.1").unwrap();
+        let migrate_res = net_quic_migrate(engine, conn_handle, new_ip.as_ptr(), 0);
+        assert_eq!(migrate_res, NS_OK);
+
+        // Drive the connection state machine post-migration
+        let drive_res = net_http3_drive(engine, conn_handle);
+        assert!(drive_res >= 0);
+
+        // Close connection cleanly
+        let close_res = net_http3_close(engine, conn_handle);
+        assert_eq!(close_res, NS_OK);
 
         net_engine_destroy(engine);
     }
