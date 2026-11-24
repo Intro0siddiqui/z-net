@@ -8,62 +8,17 @@ const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
-const policy_engine = @import("policy_engine");
+const policy_engine = @import("policy_engine.zig");
 
-// usingnamespace policy_engine;
-
-pub const CSPToken = struct {
-    token_type: CSPTokenType,
-    value: []const u8,
-    is_keyword: bool,
-    
-    pub fn init(token_type: CSPTokenType, value: []const u8, is_keyword: bool) CSPToken {
-        return CSPToken{
-            .token_type = token_type,
-            .value = value,
-            .is_keyword = is_keyword,
-        };
-    }
-};
-
-pub const CSPTokenType = enum {
-    SOURCE_EXPRESSION,
-    NONCE,
-    HASH,
-    KEYWORD,
-    HOST_SOURCE,
-    SCHEME_SOURCE,
-    SELF_KEYWORD,
-    UNSAFE_INLINE_KEYWORD,
-    UNSAFE_EVAL_KEYWORD,
-    NONE_KEYWORD,
-};
-
-pub const CSPDirectiveRule = struct {
-    directive: []const u8,
-    sources: ArrayList(CSPToken),
-    allow_self: bool,
-    allow_unsafe_inline: bool,
-    allow_unsafe_eval: bool,
-    require_nonce: bool,
-    require_hash: bool,
-    
-    pub fn init(allocator: Allocator) CSPDirectiveRule {
-        return CSPDirectiveRule{
-            .directive = "",
-            .sources = ArrayList(CSPToken).init(allocator),
-            .allow_self = false,
-            .allow_unsafe_inline = false,
-            .allow_unsafe_eval = false,
-            .require_nonce = false,
-            .require_hash = false,
-        };
-    }
-    
-    pub fn deinit(self: *CSPDirectiveRule) void {
-        self.sources.deinit();
-    }
-};
+pub const Origin = policy_engine.Origin;
+pub const ContentSecurityPolicy = policy_engine.ContentSecurityPolicy;
+pub const CSPDirective = policy_engine.CSPDirective;
+pub const PolicyEngineConfig = policy_engine.PolicyEngineConfig;
+pub const ValidationResult = policy_engine.ValidationResult;
+pub const CSPTokenType = policy_engine.CSPTokenType;
+pub const CSPToken = policy_engine.CSPToken;
+pub const CSPDirectiveRule = CSPDirective;
+pub const OriginHashMap = policy_engine.OriginHashMap;
 
 pub const CSPViolation = struct {
     directive: []const u8,
@@ -109,7 +64,7 @@ pub const CSPValidationResult = struct {
     reason: []const u8,
     violation: ?CSPViolation,
     
-    pub fn allowed(reason: []const u8) CSPValidationResult {
+    pub fn initAllowed(reason: []const u8) CSPValidationResult {
         return CSPValidationResult{
             .allowed = true,
             .reason = reason,
@@ -117,7 +72,7 @@ pub const CSPValidationResult = struct {
         };
     }
     
-    pub fn blocked(reason: []const u8, violation: CSPViolation) CSPValidationResult {
+    pub fn initBlocked(reason: []const u8, violation: CSPViolation) CSPValidationResult {
         return CSPValidationResult{
             .allowed = false,
             .reason = reason,
@@ -129,16 +84,16 @@ pub const CSPValidationResult = struct {
 /// CSP Validator - Core Implementation
 pub const CSPValidator = struct {
     allocator: Allocator,
-    policies: AutoHashMap(Origin, ContentSecurityPolicy),
-    nonce_cache: AutoHashMap([]const u8, bool),
-    hash_cache: AutoHashMap([]const u8, bool),
+    policies: OriginHashMap(ContentSecurityPolicy),
+    nonce_cache: StringHashMap(bool),
+    hash_cache: StringHashMap(bool),
     
     pub fn init(allocator: Allocator) CSPValidator {
         return CSPValidator{
             .allocator = allocator,
-            .policies = AutoHashMap(Origin, ContentSecurityPolicy).init(allocator),
-            .nonce_cache = AutoHashMap([]const u8, bool).init(allocator),
-            .hash_cache = AutoHashMap([]const u8, bool).init(allocator),
+            .policies = OriginHashMap(ContentSecurityPolicy).init(allocator),
+            .nonce_cache = StringHashMap(bool).init(allocator),
+            .hash_cache = StringHashMap(bool).init(allocator),
         };
     }
     
@@ -157,48 +112,48 @@ pub const CSPValidator = struct {
         const origin = try Origin.parse(context.document_url);
         
         // Get CSP policy for document origin
-        const policy = self.policies.get(origin) orelse {
+        var policy = self.policies.get(origin) orelse {
             // No CSP policy, allow by default
-            return CSPValidationResult.allowed("No CSP policy defined");
+            return CSPValidationResult.initAllowed("No CSP policy defined");
         };
         
         // Find appropriate directive
         const directive_name = self.getDirectiveForResourceType(context.resource_type);
-        const directive = self.findDirective(policy, directive_name);
+        const directive = self.findDirective(&policy, directive_name);
         
         if (directive == null) {
             // No directive found, check default-src
-            const default_directive = self.findDirective(policy, "default-src");
+            const default_directive = self.findDirective(&policy, "default-src");
             if (default_directive) |default_src| {
-                return self.validateAgainstDirective(default_src, context);
+                return self.validateAgainstDirective(default_src.*, context);
             } else {
                 // No restrictions
-                return CSPValidationResult.allowed("No CSP restrictions");
+                return CSPValidationResult.initAllowed("No CSP restrictions");
             }
         }
         
-        return self.validateAgainstDirective(directive.?, context);
+        return self.validateAgainstDirective(directive.?.*, context);
     }
     
     /// Validate inline script
     pub fn validateInlineScript(self: *CSPValidator, script_content: []const u8, context: CSPValidationContext) !CSPValidationResult {
         const origin = try Origin.parse(context.document_url);
-        const policy = self.policies.get(origin) orelse {
-            return CSPValidationResult.allowed("No CSP policy defined");
+        var policy = self.policies.get(origin) orelse {
+            return CSPValidationResult.initAllowed("No CSP policy defined");
         };
         
         // Check script-src directive
-        const script_directive = self.findDirective(policy, "script-src");
+        const script_directive = self.findDirective(&policy, "script-src");
         if (script_directive) |directive| {
             // Check for 'unsafe-inline'
             if (directive.allow_unsafe_inline) {
-                return CSPValidationResult.allowed("unsafe-inline allowed");
+                return CSPValidationResult.initAllowed("unsafe-inline allowed");
             }
             
             // Check for nonce
             if (context.script_nonce) |nonce| {
                 if (self.isNonceValid(nonce)) {
-                    return CSPValidationResult.allowed("Valid nonce");
+                    return CSPValidationResult.initAllowed("Valid nonce");
                 }
             }
             
@@ -206,42 +161,44 @@ pub const CSPValidator = struct {
             if (context.script_hash) |hash| {
                 const computed_hash = self.computeContentHash(script_content);
                 if (std.mem.eql(u8, hash, computed_hash)) {
-                    return CSPValidationResult.allowed("Valid hash");
+                    return CSPValidationResult.initAllowed("Valid hash");
                 }
             }
             
             // Violation
-            const violation = CSPViolation.init("script-src", "<inline>", policy);
-            return CSPValidationResult.blocked("Inline script blocked by CSP", violation);
+            const violation = CSPViolation.init("script-src", "<inline>", "");
+            return CSPValidationResult.initBlocked("Inline script blocked by CSP", violation);
         }
         
         // Check default-src
-        const default_directive = self.findDirective(policy, "default-src");
+        const default_directive = self.findDirective(&policy, "default-src");
         if (default_directive) |default_src| {
             if (default_src.allow_unsafe_inline) {
-                return CSPValidationResult.allowed("unsafe-inline allowed by default-src");
+                return CSPValidationResult.initAllowed("unsafe-inline allowed by default-src");
             }
         }
         
         // No unsafe-inline allowed
-        const violation = CSPViolation.init("script-src", "<inline>", policy);
-        return CSPValidationResult.blocked("Inline script blocked by CSP", violation);
+        const violation = CSPViolation.init("script-src", "<inline>", "");
+        return CSPValidationResult.initBlocked("Inline script blocked by CSP", violation);
     }
     
     /// Parse CSP header value
     pub fn parseCSPHeader(self: *CSPValidator, header_value: []const u8, origin: Origin) !ContentSecurityPolicy {
         var policy = ContentSecurityPolicy.init(self.allocator);
-        var directives_iter = std.mem.split(u8, header_value, ";");
+        var directives_iter = std.mem.splitScalar(u8, header_value, ';');
         
         while (directives_iter.next()) |directive_str| {
             const trimmed = std.mem.trim(u8, directive_str, " \t\r\n");
             if (trimmed.len == 0) continue;
             
             var directive = CSPDirectiveRule.init(self.allocator);
-            defer directive.deinit();
+            errdefer directive.deinit(self.allocator);
             
             try self.parseDirective(trimmed, &directive);
-            policy.directives.append(directive) catch {};
+            policy.directives.append(self.allocator, directive) catch {
+                directive.deinit(self.allocator);
+            };
         }
         
         try self.policies.put(origin, policy);
@@ -287,30 +244,30 @@ pub const CSPValidator = struct {
     // Private helper functions
     fn validateAgainstDirective(self: *CSPValidator, directive: CSPDirectiveRule, context: CSPValidationContext) CSPValidationResult {
         const resource_origin = Origin.parse(context.resource_url) catch {
-            return CSPValidationResult.allowed("Invalid resource URL");
+            return CSPValidationResult.initAllowed("Invalid resource URL");
         };
         
         // Check allow_self
         if (directive.allow_self) {
             const doc_origin = Origin.parse(context.document_url) catch {
-                return CSPValidationResult.allowed("Invalid document URL");
+                return CSPValidationResult.initAllowed("Invalid document URL");
             };
             
             if (resource_origin.isSameOrigin(doc_origin)) {
-                return CSPValidationResult.allowed("Self origin allowed");
+                return CSPValidationResult.initAllowed("Self origin allowed");
             }
         }
         
         // Check each source
         for (directive.sources.items) |source| {
             if (self.matchSource(source, resource_origin, context)) {
-                return CSPValidationResult.allowed("Source matched");
+                return CSPValidationResult.initAllowed("Source matched");
             }
         }
         
         // No sources matched
         const violation = CSPViolation.init(directive.directive, context.resource_url, "");
-        return CSPValidationResult.blocked("No CSP sources matched", violation);
+        return CSPValidationResult.initBlocked("No CSP sources matched", violation);
     }
     
     fn matchSource(self: *CSPValidator, source: CSPToken, resource_origin: Origin, context: CSPValidationContext) bool {
@@ -346,6 +303,7 @@ pub const CSPValidator = struct {
     }
     
     fn matchHostSource(self: *CSPValidator, host_source: []const u8, resource_origin: Origin) bool {
+        _ = self;
         // Handle wildcards
         if (std.mem.indexOf(u8, host_source, "*") != null) {
             // Basic wildcard matching
@@ -363,23 +321,21 @@ pub const CSPValidator = struct {
     }
     
     fn getDirectiveForResourceType(self: *CSPValidator, resource_type: []const u8) []const u8 {
-        // Map resource types to CSP directives
-        const directive_map = std.ComptimeStringMap([]const u8, .{
-            .{ "script", "script-src" },
-            .{ "style", "style-src" },
-            .{ "img", "img-src" },
-            .{ "font", "font-src" },
-            .{ "media", "media-src" },
-            .{ "connect", "connect-src" },
-            .{ "frame", "frame-src" },
-            .{ "object", "object-src" },
-            .{ "worker", "worker-src" },
-        });
-        
-        return directive_map.get(resource_type) orelse "default-src";
+        _ = self;
+        if (std.mem.eql(u8, resource_type, "script")) return "script-src";
+        if (std.mem.eql(u8, resource_type, "style")) return "style-src";
+        if (std.mem.eql(u8, resource_type, "img")) return "img-src";
+        if (std.mem.eql(u8, resource_type, "font")) return "font-src";
+        if (std.mem.eql(u8, resource_type, "media")) return "media-src";
+        if (std.mem.eql(u8, resource_type, "connect")) return "connect-src";
+        if (std.mem.eql(u8, resource_type, "frame")) return "frame-src";
+        if (std.mem.eql(u8, resource_type, "object")) return "object-src";
+        if (std.mem.eql(u8, resource_type, "worker")) return "worker-src";
+        return "default-src";
     }
     
     fn findDirective(self: *CSPValidator, policy: *ContentSecurityPolicy, directive_name: []const u8) ?*CSPDirectiveRule {
+        _ = self;
         for (policy.directives.items) |*directive| {
             if (std.mem.eql(u8, directive.directive, directive_name)) {
                 return directive;
@@ -395,19 +351,23 @@ pub const CSPValidator = struct {
         
         if (first_space < directive_str.len) {
             const sources_str = directive_str[first_space + 1 ..];
-            var sources_iter = std.mem.split(u8, sources_str, " ");
+            var sources_iter = std.mem.splitScalar(u8, sources_str, ' ');
             
             while (sources_iter.next()) |source_str| {
                 const trimmed = std.mem.trim(u8, source_str, " \t");
                 if (trimmed.len == 0) continue;
                 
                 const token = try self.parseSourceToken(trimmed);
-                directive.sources.append(token) catch {};
+                if (token.token_type == .SELF_KEYWORD) directive.allow_self = true;
+                if (token.token_type == .UNSAFE_INLINE_KEYWORD) directive.allow_unsafe_inline = true;
+                if (token.token_type == .UNSAFE_EVAL_KEYWORD) directive.allow_unsafe_eval = true;
+                directive.sources.append(self.allocator, token) catch {};
             }
         }
     }
     
     fn parseSourceToken(self: *CSPValidator, source_str: []const u8) !CSPToken {
+        _ = self;
         // Handle keywords
         if (std.mem.eql(u8, source_str, "'self'")) {
             return CSPToken.init(.SELF_KEYWORD, source_str, true);
@@ -458,20 +418,20 @@ pub const CSPValidator = struct {
     
     /// Clear nonce cache
     pub fn clearNonceCache(self: *CSPValidator) void {
-        self.nonce_cache.clear();
+        self.nonce_cache.clearRetainingCapacity();
     }
     
     /// Clear hash cache
     pub fn clearHashCache(self: *CSPValidator) void {
-        self.hash_cache.clear();
+        self.hash_cache.clearRetainingCapacity();
     }
     
     /// Get statistics
     pub fn getStats(self: *CSPValidator) struct { policy_count: usize, nonce_cache_size: usize, hash_cache_size: usize } {
         return .{
             .policy_count = self.policies.count(),
-            .nonce_cache_size = self.nonce_cache.estimated_capacity,
-            .hash_cache_size = self.hash_cache.estimated_capacity,
+            .nonce_cache_size = self.nonce_cache.capacity(),
+            .hash_cache_size = self.hash_cache.capacity(),
         };
     }
 };
@@ -496,7 +456,7 @@ test "csp directive validation" {
     defer validator.deinit();
     
     // Create test context
-    var context = CSPValidationContext.init("https://example.com/script.js", "script", "https://example.com/page.html");
+    const context = CSPValidationContext.init("https://example.com/script.js", "script", "https://example.com/page.html");
     
     // Test with no policy (should allow)
     const result = validator.validateResource(context) catch {

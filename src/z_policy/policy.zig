@@ -8,13 +8,40 @@ const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.ArrayList;
 
-pub const policy_engine = @import("policy_engine");
-pub const cors_handler = @import("cors_handler");
-pub const csp_validator = @import("csp_validator");
+pub const policy_engine = @import("policy_engine.zig");
+pub const cors_handler = @import("cors_handler.zig");
+pub const csp_validator = @import("csp_validator.zig");
 
-// usingnamespace policy_engine;
-// usingnamespace cors_handler;
-// usingnamespace csp_validator;
+// Re-exports from policy_engine
+pub const Origin = policy_engine.Origin;
+pub const PolicyEngine = policy_engine.PolicyEngine;
+pub const PolicyEngineConfig = policy_engine.PolicyEngineConfig;
+pub const ValidationResult = policy_engine.ValidationResult;
+pub const CORSRequest = policy_engine.CORSRequest;
+pub const CORSResponse = policy_engine.CORSResponse;
+pub const CSPDirective = policy_engine.CSPDirective;
+pub const ContentSecurityPolicy = policy_engine.ContentSecurityPolicy;
+pub const PolicyRule = policy_engine.PolicyRule;
+pub const PolicyRuleType = policy_engine.PolicyRuleType;
+
+// Re-exports from cors_handler
+pub const CORSMethod = cors_handler.CORSMethod;
+pub const CORSHeader = cors_handler.CORSHeader;
+pub const CORSOptions = cors_handler.CORSOptions;
+pub const CORSPreflightRequest = cors_handler.CORSPreflightRequest;
+pub const CORSPreflightResponse = cors_handler.CORSPreflightResponse;
+pub const CORSHangler = cors_handler.CORSHangler;
+pub const CORSHandler = cors_handler.CORSHandler;
+pub const CORSError = cors_handler.CORSError;
+
+// Re-exports from csp_validator
+pub const CSPToken = csp_validator.CSPToken;
+pub const CSPTokenType = csp_validator.CSPTokenType;
+pub const CSPDirectiveRule = csp_validator.CSPDirectiveRule;
+pub const CSPViolation = csp_validator.CSPViolation;
+pub const CSPValidationContext = csp_validator.CSPValidationContext;
+pub const CSPValidationResult = csp_validator.CSPValidationResult;
+pub const CSPValidator = csp_validator.CSPValidator;
 
 pub const RequestValidation = struct {
     /// Main request validation entry point
@@ -33,7 +60,7 @@ pub const RequestValidation = struct {
         
         // 1. Same-Origin Policy Check
         if (config.enable_sop) {
-            const sop_result = try validateSameOriginPolicy(page_origin, request_origin);
+            const sop_result = try validateSameOriginPolicy(allocator, page_origin, request_origin);
             if (!sop_result.allowed) {
                 result.allowed = false;
                 result.reason = "Same-Origin Policy violation";
@@ -44,7 +71,7 @@ pub const RequestValidation = struct {
         
         // 2. Mixed Content Check
         if (config.enable_mixed_content_blocking) {
-            const mixed_result = try validateMixedContentPolicy(page_origin, request_url, "fetch");
+            const mixed_result = try validateMixedContentPolicyAlloc(allocator, page_origin, request_url, "fetch");
             if (!mixed_result.allowed) {
                 result.allowed = false;
                 result.reason = "Mixed content violation";
@@ -62,7 +89,7 @@ pub const RequestValidation = struct {
                 .origin = page_origin,
             };
             
-            const cors_result = try validateCORSRequest(cors_request, config);
+            const cors_result = try validateCORSRequest(allocator, cors_request, config);
             if (!cors_result.allowed) {
                 result.allowed = false;
                 result.reason = "CORS policy violation";
@@ -80,7 +107,7 @@ pub const RequestValidation = struct {
         
         // 4. Content Security Policy Check
         if (config.enable_csp) {
-            const csp_result = try validateCSPResource(request_url, "fetch", page_origin);
+            const csp_result = try validateCSPResource(allocator, request_url, "fetch", page_origin);
             if (!csp_result.allowed) {
                 result.allowed = false;
                 result.reason = "CSP policy violation";
@@ -101,11 +128,13 @@ pub const RequestValidation = struct {
         page_origin: Origin,
         config: PolicyEngineConfig,
     ) !ValidationResult {
+        _ = page_origin;
         var result = ValidationResult.init(allocator);
         
         // 1. CSP Response Headers
         if (config.enable_csp) {
             if (response_headers.get("Content-Security-Policy")) |csp_header| {
+                _ = csp_header;
                 const origin = try Origin.parse(response_url);
                 // Would parse and store CSP policy here
                 _ = origin; // Avoid unused variable warning
@@ -117,7 +146,7 @@ pub const RequestValidation = struct {
             if (response_headers.get("Access-Control-Allow-Origin")) |cors_header| {
                 // Validate CORS response headers
                 if (response_headers.get("Access-Control-Allow-Credentials")) |credentials| {
-                    if (std.mem.eql(u8, std.ascii.lowerString(credentials), "true") and
+                    if (std.ascii.eqlIgnoreCase(credentials, "true") and
                         std.mem.eql(u8, cors_header, "*")) {
                         result.allowed = false;
                         result.reason = "CORS credential conflict: wildcard origin with credentials";
@@ -164,7 +193,7 @@ pub const RequestValidation = struct {
         var context = CSPValidationContext.init("<inline>", "script", document_origin.host);
         context.script_nonce = script_nonce;
         
-        const csp_result = try validateInlineCSP(script_content, context);
+        const csp_result = try validateInlineCSP(allocator, script_content, context);
         
         result.allowed = csp_result.allowed;
         result.reason = csp_result.reason;
@@ -198,8 +227,9 @@ pub const PolicyManager = struct {
     
     /// Configure CORS for a specific origin
     pub fn configureCORS(self: *PolicyManager, origin: []const u8, options: CORSOptions) !void {
-        options.origin = origin;
-        try self.cors_handler.configure(options);
+        var opts = options;
+        opts.origin = origin;
+        try self.cors_handler.configure(opts);
     }
     
     /// Add CSP policy for an origin
@@ -246,6 +276,7 @@ pub const PolicyManager = struct {
     /// Handle CORS preflight request
     pub fn handlePreflightRequest(self: *PolicyManager, request_headers: StringHashMap([]const u8)) !CORSPreflightResponse {
         const origin = request_headers.get("Origin") orelse return CORSError.PreflightFailed;
+        _ = origin;
         
         var preflight_request = self.cors_handler.extractPreflightRequest("OPTIONS", request_headers) catch {
             return CORSError.PreflightFailed;
@@ -320,8 +351,8 @@ pub fn getDefaultPolicyConfig() PolicyEngineConfig {
 }
 
 // Private helper functions
-fn validateSameOriginPolicy(page_origin: Origin, request_origin: Origin) !ValidationResult {
-    var result = ValidationResult.init(std.heap.c_allocator);
+fn validateSameOriginPolicy(allocator: Allocator, page_origin: Origin, request_origin: Origin) !ValidationResult {
+    var result = ValidationResult.init(allocator);
     
     if (page_origin.isSameOrigin(request_origin)) {
         result.allowed = true;
@@ -334,8 +365,13 @@ fn validateSameOriginPolicy(page_origin: Origin, request_origin: Origin) !Valida
     return result;
 }
 
-fn validateMixedContentPolicy(page_origin: Origin, resource_url: []const u8, resource_type: []const u8) !ValidationResult {
-    var result = ValidationResult.init(std.heap.c_allocator);
+pub fn validateMixedContentPolicy(page_origin: Origin, resource_url: []const u8, resource_type: []const u8) !ValidationResult {
+    return validateMixedContentPolicyAlloc(std.heap.page_allocator, page_origin, resource_url, resource_type);
+}
+
+fn validateMixedContentPolicyAlloc(allocator: Allocator, page_origin: Origin, resource_url: []const u8, resource_type: []const u8) !ValidationResult {
+    _ = resource_type;
+    var result = ValidationResult.init(allocator);
     
     const resource_origin = try Origin.parse(resource_url);
     
@@ -353,26 +389,34 @@ fn validateMixedContentPolicy(page_origin: Origin, resource_url: []const u8, res
     return result;
 }
 
-fn validateCORSRequest(request: CORSRequest, config: PolicyEngineConfig) !ValidationResult {
-    var engine = PolicyEngine.init(std.heap.c_allocator, config);
+fn validateCORSRequest(allocator: Allocator, request: CORSRequest, config: PolicyEngineConfig) !ValidationResult {
+    var engine = PolicyEngine.init(allocator, config);
     defer engine.deinit();
     
     return engine.validateCORS(request);
 }
 
-fn validateCSPResource(url: []const u8, content_type: []const u8, origin: Origin) !ValidationResult {
-    var validator = CSPValidator.init(std.heap.c_allocator);
+fn validateCSPResource(allocator: Allocator, url: []const u8, content_type: []const u8, origin: Origin) !ValidationResult {
+    var validator = CSPValidator.init(allocator);
     defer validator.deinit();
     
-    var context = CSPValidationContext.init(url, content_type, origin.host);
-    return validator.validateResource(context);
+    const context = CSPValidationContext.init(url, content_type, origin.host);
+    const csp_res = try validator.validateResource(context);
+    var res = ValidationResult.init(allocator);
+    res.allowed = csp_res.allowed;
+    res.reason = csp_res.reason;
+    return res;
 }
 
-fn validateInlineCSP(script_content: []const u8, context: CSPValidationContext) !ValidationResult {
-    var validator = CSPValidator.init(std.heap.c_allocator);
+fn validateInlineCSP(allocator: Allocator, script_content: []const u8, context: CSPValidationContext) !ValidationResult {
+    var validator = CSPValidator.init(allocator);
     defer validator.deinit();
     
-    return validator.validateInlineScript(script_content, context);
+    const csp_res = try validator.validateInlineScript(script_content, context);
+    var res = ValidationResult.init(allocator);
+    res.allowed = csp_res.allowed;
+    res.reason = csp_res.reason;
+    return res;
 }
 
 fn isValidHSTSHeader(hsts: []const u8) bool {
@@ -419,7 +463,7 @@ test "request validation basic" {
     request_headers.put("Content-Type", "application/json") catch {};
     
     const page_origin = try Origin.parse("https://example.com");
-    const result = RequestValidation.validateRequest(
+    var result = RequestValidation.validateRequest(
         allocator,
         "https://example.com/api/data",
         "GET",

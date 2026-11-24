@@ -7,9 +7,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.ArrayList;
-const policy_engine = @import("policy_engine");
+const AutoHashMap = std.AutoHashMap;
+const policy_engine = @import("policy_engine.zig");
 
-// usingnamespace policy_engine;
+pub const Origin = policy_engine.Origin;
+pub const ValidationResult = policy_engine.ValidationResult;
+pub const PolicyEngineConfig = policy_engine.PolicyEngineConfig;
+pub const CORSRequest = policy_engine.CORSRequest;
 
 pub const CORSMethod = enum {
     GET,
@@ -23,9 +27,8 @@ pub const CORSMethod = enum {
     TRACE,
     
     pub fn fromString(method: []const u8) CORSMethod {
-        const upper_method = std.ascii.upperString(method);
-        inline for (@typeInfo(CORSMethod).Enum.fields) |field| {
-            if (std.mem.eql(u8, upper_method, field.name)) {
+        inline for (@typeInfo(CORSMethod).@"enum".fields) |field| {
+            if (std.ascii.eqlIgnoreCase(method, field.name)) {
                 return @field(CORSMethod, field.name);
             }
         }
@@ -46,74 +49,80 @@ pub const CORSHeader = struct {
 };
 
 pub const CORSOptions = struct {
-    methods: ArrayList(CORSMethod),
-    headers: ArrayList([]const u8),
+    allocator: Allocator,
+    methods: std.ArrayListUnmanaged(CORSMethod) = .empty,
+    headers: std.ArrayListUnmanaged([]const u8) = .empty,
     credentials: bool,
     max_age: i32,
     origin: []const u8,
-    expose_headers: ArrayList([]const u8),
+    expose_headers: std.ArrayListUnmanaged([]const u8) = .empty,
     
     pub fn init(allocator: Allocator) CORSOptions {
         return CORSOptions{
-            .methods = ArrayList(CORSMethod).init(allocator),
-            .headers = ArrayList([]const u8).init(allocator),
+            .allocator = allocator,
+            .methods = .empty,
+            .headers = .empty,
             .credentials = false,
             .max_age = 86400, // 24 hours
             .origin = "",
-            .expose_headers = ArrayList([]const u8).init(allocator),
+            .expose_headers = .empty,
         };
     }
     
     pub fn deinit(self: *CORSOptions) void {
-        self.methods.deinit();
-        self.headers.deinit();
-        self.expose_headers.deinit();
+        self.methods.deinit(self.allocator);
+        self.headers.deinit(self.allocator);
+        self.expose_headers.deinit(self.allocator);
     }
     
     pub fn addMethod(self: *CORSOptions, method: CORSMethod) void {
-        self.methods.append(method) catch {};
+        self.methods.append(self.allocator, method) catch {};
     }
     
     pub fn addHeader(self: *CORSOptions, header: []const u8) void {
-        self.headers.append(header) catch {};
+        self.headers.append(self.allocator, header) catch {};
     }
     
     pub fn addExposeHeader(self: *CORSOptions, header: []const u8) void {
-        self.expose_headers.append(header) catch {};
+        self.expose_headers.append(self.allocator, header) catch {};
     }
 };
 
 pub const CORSPreflightRequest = struct {
+    allocator: Allocator,
     origin: []const u8,
     method: CORSMethod,
-    headers: ArrayList([]const u8),
+    headers: std.ArrayListUnmanaged([]const u8) = .empty,
     
     pub fn init(allocator: Allocator) CORSPreflightRequest {
         return CORSPreflightRequest{
+            .allocator = allocator,
             .origin = "",
             .method = .GET,
-            .headers = ArrayList([]const u8).init(allocator),
+            .headers = .empty,
         };
     }
     
     pub fn deinit(self: *CORSPreflightRequest) void {
-        self.headers.deinit();
+        self.headers.deinit(self.allocator);
     }
 };
 
 pub const CORSPreflightResponse = struct {
+    allocator: Allocator,
     allow_origin: []const u8,
-    allow_methods: ArrayList(CORSMethod),
-    allow_headers: ArrayList([]const u8),
+    allow_methods: std.ArrayListUnmanaged(CORSMethod) = .empty,
+    allow_headers: std.ArrayListUnmanaged([]const u8) = .empty,
     allow_credentials: bool,
     max_age: i32,
     vary: ?[]const u8,
     
     pub fn init(allocator: Allocator) CORSPreflightResponse {
         return CORSPreflightResponse{
+            .allocator = allocator,
             .allow_origin = "",
-            .allow_methods = ArrayList(CORSMethod).init(allocator),
-            .allow_headers = ArrayList([]const u8).init(allocator),
+            .allow_methods = .empty,
+            .allow_headers = .empty,
             .allow_credentials = false,
             .max_age = 86400,
             .vary = null,
@@ -121,8 +130,8 @@ pub const CORSPreflightResponse = struct {
     }
     
     pub fn deinit(self: *CORSPreflightResponse) void {
-        self.allow_methods.deinit();
-        self.allow_headers.deinit();
+        self.allow_methods.deinit(self.allocator);
+        self.allow_headers.deinit(self.allocator);
     }
 };
 
@@ -139,9 +148,9 @@ pub const CORSError = error{
 pub const CORSHangler = struct {
     allocator: Allocator,
     preflight_cache: AutoHashMap(PreflightCacheKey, CORSPreflightResponse),
-    allowed_origins: AutoHashMap([]const u8, bool),
-    allowed_methods: AutoHashMap([]const u8, bool),
-    allowed_headers: AutoHashMap([]const u8, bool),
+    allowed_origins: StringHashMap(bool),
+    allowed_methods: StringHashMap(bool),
+    allowed_headers: StringHashMap(bool),
     
     const PreflightCacheKey = struct {
         origin: []const u8,
@@ -167,9 +176,9 @@ pub const CORSHangler = struct {
         return CORSHangler{
             .allocator = allocator,
             .preflight_cache = AutoHashMap(PreflightCacheKey, CORSPreflightResponse).init(allocator),
-            .allowed_origins = AutoHashMap([]const u8, bool).init(allocator),
-            .allowed_methods = AutoHashMap([]const u8, bool).init(allocator),
-            .allowed_headers = AutoHashMap([]const u8, bool).init(allocator),
+            .allowed_origins = StringHashMap(bool).init(allocator),
+            .allowed_methods = StringHashMap(bool).init(allocator),
+            .allowed_headers = StringHashMap(bool).init(allocator),
         };
     }
     
@@ -220,13 +229,13 @@ pub const CORSHangler = struct {
         var allowed_methods_iter = self.allowed_methods.keyIterator();
         while (allowed_methods_iter.next()) |allowed_method| {
             const method_enum = CORSMethod.fromString(allowed_method.*);
-            response.allow_methods.append(method_enum) catch {};
+            response.allow_methods.append(self.allocator, method_enum) catch {};
         }
         
         // Copy allowed headers
         var allowed_headers_iter = self.allowed_headers.keyIterator();
         while (allowed_headers_iter.next()) |allowed_header| {
-            response.allow_headers.append(allowed_header.*) catch {};
+            response.allow_headers.append(self.allocator, allowed_header.*) catch {};
         }
         
         response.allow_credentials = true; // Configurable
@@ -253,7 +262,7 @@ pub const CORSHangler = struct {
         // Check for credentials
         const credentials_header = request_headers.get("Access-Control-Request-Credentials");
         if (credentials_header) |creds| {
-            if (std.mem.eql(u8, std.ascii.lowerString(creds), "true")) {
+            if (std.ascii.eqlIgnoreCase(creds, "true")) {
                 result.headers.put("Access-Control-Allow-Credentials", "true") catch {};
                 result.headers.put("Access-Control-Allow-Origin", origin) catch {};
             }
@@ -278,7 +287,8 @@ pub const CORSHangler = struct {
     
     /// Check if request is a CORS preflight
     pub fn isPreflightRequest(self: *CORSHangler, method: []const u8, headers: StringHashMap([]const u8)) bool {
-        if (!std.mem.eql(u8, std.ascii.upperString(method), "OPTIONS")) {
+        _ = self;
+        if (!std.ascii.eqlIgnoreCase(method, "OPTIONS")) {
             return false;
         }
         
@@ -289,6 +299,7 @@ pub const CORSHangler = struct {
     
     /// Extract preflight request from HTTP request
     pub fn extractPreflightRequest(self: *CORSHangler, method: []const u8, headers: StringHashMap([]const u8)) !CORSPreflightRequest {
+        _ = method;
         const origin = headers.get("Origin") orelse return CORSError.PreflightFailed;
         const request_method = headers.get("Access-Control-Request-Method") orelse return CORSError.PreflightFailed;
         const request_headers = headers.get("Access-Control-Request-Headers");
@@ -299,10 +310,10 @@ pub const CORSHangler = struct {
         
         if (request_headers) |headers_str| {
             // Parse comma-separated headers
-            var header_iter = std.mem.split(u8, headers_str, ",");
+            var header_iter = std.mem.splitScalar(u8, headers_str, ',');
             while (header_iter.next()) |header| {
                 const trimmed_header = std.mem.trim(u8, header, " \t\r\n");
-                preflight.headers.append(trimmed_header) catch {};
+                preflight.headers.append(self.allocator, trimmed_header) catch {};
             }
         }
         
@@ -320,26 +331,26 @@ pub const CORSHangler = struct {
         }
         
         // Add allowed methods
-        var methods_list = ArrayList([]const u8).init(self.allocator);
+        var methods_list = std.ArrayListUnmanaged([]const u8){};
         var methods_iter = self.allowed_methods.keyIterator();
         while (methods_iter.next()) |method| {
-            methods_list.append(method.*) catch {};
+            methods_list.append(self.allocator, method.*) catch {};
         }
         
         const methods_str = std.mem.join(self.allocator, ", ", methods_list.items) catch "";
         headers.put("Access-Control-Allow-Methods", methods_str) catch {};
-        methods_list.deinit();
+        methods_list.deinit(self.allocator);
         
         // Add allowed headers
-        var headers_list = ArrayList([]const u8).init(self.allocator);
+        var headers_list = std.ArrayListUnmanaged([]const u8){};
         var headers_iter = self.allowed_headers.keyIterator();
         while (headers_iter.next()) |header| {
-            headers_list.append(header.*) catch {};
+            headers_list.append(self.allocator, header.*) catch {};
         }
         
         const headers_str = std.mem.join(self.allocator, ", ", headers_list.items) catch "";
         headers.put("Access-Control-Allow-Headers", headers_str) catch {};
-        headers_list.deinit();
+        headers_list.deinit(self.allocator);
         
         headers.put("Access-Control-Max-Age", "86400") catch {}; // 24 hours
         
@@ -349,9 +360,9 @@ pub const CORSHangler = struct {
     /// Configure CORS options
     pub fn configure(self: *CORSHangler, options: CORSOptions) !void {
         // Clear existing configuration
-        self.allowed_origins.clear();
-        self.allowed_methods.clear();
-        self.allowed_headers.clear();
+        self.allowed_origins.clearRetainingCapacity();
+        self.allowed_methods.clearRetainingCapacity();
+        self.allowed_headers.clearRetainingCapacity();
         
         // Set origin
         if (options.origin.len > 0) {
@@ -389,7 +400,7 @@ pub const CORSHangler = struct {
     }
     
     /// Create cache key for preflight response
-    fn createCacheKey(self: *CORSHangler, origin: []const u8, method: []const u8, headers: ArrayList([]const u8)) PreflightCacheKey {
+    fn createCacheKey(self: *CORSHangler, origin: []const u8, method: []const u8, headers: std.ArrayListUnmanaged([]const u8)) PreflightCacheKey {
         var hasher = std.hash.Wyhash.init(0);
         
         // Hash origin
@@ -399,12 +410,12 @@ pub const CORSHangler = struct {
         hasher.update(method);
         
         // Hash headers
-        var combined_headers = ArrayList(u8).init(self.allocator);
-        defer combined_headers.deinit();
+        var combined_headers = std.ArrayListUnmanaged(u8){};
+        defer combined_headers.deinit(self.allocator);
         
         for (headers.items, 0..) |header, i| {
-            if (i > 0) combined_headers.append(',') catch {};
-            combined_headers.appendSlice(header) catch {};
+            if (i > 0) combined_headers.append(self.allocator, ',') catch {};
+            combined_headers.appendSlice(self.allocator, header) catch {};
         }
         
         const headers_hash = std.hash.Wyhash.hash(0, combined_headers.items);
@@ -429,7 +440,7 @@ pub const CORSHangler = struct {
         };
         
         for (sensitive_headers) |sensitive| {
-            if (std.mem.eql(u8, std.ascii.lowerString(header), std.ascii.lowerString(sensitive))) {
+            if (std.ascii.eqlIgnoreCase(header, sensitive)) {
                 return true;
             }
         }
@@ -439,17 +450,19 @@ pub const CORSHangler = struct {
     
     /// Clear preflight cache
     pub fn clearCache(self: *CORSHangler) void {
-        self.preflight_cache.clear();
+        self.preflight_cache.clearRetainingCapacity();
     }
     
     /// Get cache statistics
     pub fn getCacheStats(self: *CORSHangler) struct { cached_responses: usize, cache_size: usize } {
         return .{
             .cached_responses = self.preflight_cache.count(),
-            .cache_size = self.preflight_cache.estimated_capacity,
+            .cache_size = self.preflight_cache.capacity(),
         };
     }
 };
+
+pub const CORSHandler = CORSHangler;
 
 test "cors method parsing" {
     try std.testing.expectEqual(CORSMethod.GET, CORSMethod.fromString("get"));

@@ -30,13 +30,12 @@ pub const Origin = struct {
         
         const colon_pos_host = std.mem.lastIndexOf(u8, host_port, ":") orelse {
             // Default ports
-            const default_port: u16 = switch (std.ascii.lowerSlice(scheme)) {
-                "https" => 443,
-                "http" => 80,
-                "ws" => 80,
-                "wss" => 443,
-                else => return error.UnsupportedScheme,
-            };
+            const default_port: u16 = if (std.ascii.eqlIgnoreCase(scheme, "https") or std.ascii.eqlIgnoreCase(scheme, "wss"))
+                443
+            else if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "ws"))
+                80
+            else
+                return error.UnsupportedScheme;
             return Origin{
                 .scheme = scheme,
                 .host = host_port,
@@ -65,6 +64,46 @@ pub const Origin = struct {
         try writer.print("{}://{}:{}", .{ self.scheme, self.host, self.port });
     }
 };
+
+pub const OriginContext = struct {
+    pub fn hash(self: @This(), origin: Origin) u64 {
+        _ = self;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(origin.scheme);
+        hasher.update(origin.host);
+        hasher.update(&std.mem.toBytes(origin.port));
+        return hasher.final();
+    }
+    pub fn eql(self: @This(), a: Origin, b: Origin) bool {
+        _ = self;
+        return a.isSameOrigin(b);
+    }
+};
+
+pub const OriginPairContext = struct {
+    pub fn hash(self: @This(), origins: [2]Origin) u64 {
+        _ = self;
+        var hasher = std.hash.Wyhash.init(0);
+        for (origins) |origin| {
+            hasher.update(origin.scheme);
+            hasher.update(origin.host);
+            hasher.update(&std.mem.toBytes(origin.port));
+        }
+        return hasher.final();
+    }
+    pub fn eql(self: @This(), a: [2]Origin, b: [2]Origin) bool {
+        _ = self;
+        return a[0].isSameOrigin(b[0]) and a[1].isSameOrigin(b[1]);
+    }
+};
+
+pub fn OriginHashMap(comptime V: type) type {
+    return std.HashMap(Origin, V, OriginContext, std.hash_map.default_max_load_percentage);
+}
+
+pub fn OriginPairHashMap(comptime V: type) type {
+    return std.HashMap([2]Origin, V, OriginPairContext, std.hash_map.default_max_load_percentage);
+}
 
 pub const CORSRequest = struct {
     method: []const u8,
@@ -108,68 +147,120 @@ pub const CORSResponse = struct {
     }
 };
 
+pub const CSPTokenType = enum {
+    SOURCE_EXPRESSION,
+    NONCE,
+    HASH,
+    KEYWORD,
+    HOST_SOURCE,
+    SCHEME_SOURCE,
+    SELF_KEYWORD,
+    UNSAFE_INLINE_KEYWORD,
+    UNSAFE_EVAL_KEYWORD,
+    NONE_KEYWORD,
+};
+
+pub const CSPToken = struct {
+    token_type: CSPTokenType,
+    value: []const u8,
+    is_keyword: bool,
+    
+    pub fn init(token_type: CSPTokenType, value: []const u8, is_keyword: bool) CSPToken {
+        return CSPToken{
+            .token_type = token_type,
+            .value = value,
+            .is_keyword = is_keyword,
+        };
+    }
+};
+
 pub const CSPDirective = struct {
     directive: []const u8,
-    sources: ArrayList([]const u8),
-    keywords: ArrayList([]const u8),
+    sources: std.ArrayListUnmanaged(CSPToken) = .empty,
+    allow_self: bool = false,
+    allow_unsafe_inline: bool = false,
+    allow_unsafe_eval: bool = false,
+    require_nonce: bool = false,
+    require_hash: bool = false,
     
     pub fn init(allocator: Allocator) CSPDirective {
+        _ = allocator;
         return CSPDirective{
             .directive = "",
-            .sources = ArrayList([]const u8).init(allocator),
-            .keywords = ArrayList([]const u8).init(allocator),
+            .sources = .empty,
+            .allow_self = false,
+            .allow_unsafe_inline = false,
+            .allow_unsafe_eval = false,
+            .require_nonce = false,
+            .require_hash = false,
         };
     }
     
-    pub fn deinit(self: *CSPDirective) void {
-        self.sources.deinit();
-        self.keywords.deinit();
+    pub fn deinit(self: *CSPDirective, allocator: Allocator) void {
+        self.sources.deinit(allocator);
     }
 };
 
 pub const ContentSecurityPolicy = struct {
-    directives: ArrayList(CSPDirective),
+    allocator: Allocator,
+    directives: std.ArrayListUnmanaged(CSPDirective) = .empty,
     report_uri: ?[]const u8,
     
     pub fn init(allocator: Allocator) ContentSecurityPolicy {
         return ContentSecurityPolicy{
-            .directives = ArrayList(CSPDirective).init(allocator),
+            .allocator = allocator,
+            .directives = .empty,
             .report_uri = null,
         };
     }
     
     pub fn deinit(self: *ContentSecurityPolicy) void {
         for (self.directives.items) |*directive| {
-            directive.deinit();
+            directive.deinit(self.allocator);
         }
-        self.directives.deinit();
+        self.directives.deinit(self.allocator);
+    }
+
+    pub fn validateDirective(self: *const ContentSecurityPolicy, directive_name: []const u8, host: []const u8) PreRequestValidationResult {
+        _ = self;
+        _ = directive_name;
+        _ = host;
+        return .Allowed;
+    }
+
+    pub fn hasDirective(self: *const ContentSecurityPolicy, directive_str: []const u8) bool {
+        _ = self;
+        _ = directive_str;
+        return false;
     }
 };
 
 pub const PolicyRule = struct {
+    allocator: Allocator,
     rule_type: PolicyRuleType,
     source_origin: Origin,
     target_origin: Origin,
-    allowed_methods: ArrayList([]const u8),
-    allowed_headers: ArrayList([]const u8),
+    allowed_methods: std.ArrayListUnmanaged([]const u8) = .empty,
+    allowed_headers: std.ArrayListUnmanaged([]const u8) = .empty,
     allow_credentials: bool,
     max_age: i32,
     
     pub fn init(allocator: Allocator) PolicyRule {
         return PolicyRule{
+            .allocator = allocator,
             .rule_type = .CORS,
             .source_origin = undefined,
             .target_origin = undefined,
-            .allowed_methods = ArrayList([]const u8).init(allocator),
-            .allowed_headers = ArrayList([]const u8).init(allocator),
+            .allowed_methods = .empty,
+            .allowed_headers = .empty,
             .allow_credentials = false,
             .max_age = 600, // 10 minutes default
         };
     }
     
     pub fn deinit(self: *PolicyRule) void {
-        self.allowed_methods.deinit();
-        self.allowed_headers.deinit();
+        self.allowed_methods.deinit(self.allocator);
+        self.allowed_headers.deinit(self.allocator);
     }
 };
 
@@ -219,17 +310,17 @@ pub const PolicyEngineConfig = struct {
 pub const PolicyEngine = struct {
     allocator: Allocator,
     config: PolicyEngineConfig,
-    policy_cache: AutoHashMap(Origin, ContentSecurityPolicy),
-    cors_cache: AutoHashMap([2]Origin, CORSResponse),
-    origin_whitelist: AutoHashMap(Origin, bool),
+    policy_cache: OriginHashMap(ContentSecurityPolicy),
+    cors_cache: OriginPairHashMap(CORSResponse),
+    origin_whitelist: OriginHashMap(bool),
     
     pub fn init(allocator: Allocator, config: PolicyEngineConfig) PolicyEngine {
         return PolicyEngine{
             .allocator = allocator,
             .config = config,
-            .policy_cache = AutoHashMap(Origin, ContentSecurityPolicy).init(allocator),
-            .cors_cache = AutoHashMap([2]Origin, CORSResponse).init(allocator),
-            .origin_whitelist = AutoHashMap(Origin, bool).init(allocator),
+            .policy_cache = OriginHashMap(ContentSecurityPolicy).init(allocator),
+            .cors_cache = OriginPairHashMap(CORSResponse).init(allocator),
+            .origin_whitelist = OriginHashMap(bool).init(allocator),
         };
     }
     
@@ -303,7 +394,6 @@ pub const PolicyEngine = struct {
                 cors_response.max_age = rule.max_age;
                 
                 // Cache the response
-                const cache_key = [_]Origin{ request.origin, target_origin };
                 self.cors_cache.put(cache_key, cors_response) catch {};
                 
                 // Add headers to result
@@ -355,7 +445,7 @@ pub const PolicyEngine = struct {
             var default_policy = ContentSecurityPolicy.init(self.allocator);
             defer default_policy.deinit();
             
-            const url_origin = try Origin.parse(url);
+            _ = try Origin.parse(url);
             const allowed = self.validateAgainstPolicy(&default_policy, url, content_type);
             if (allowed) {
                 result.allowed = true;
@@ -412,8 +502,8 @@ pub const PolicyEngine = struct {
     
     /// Add CORS rule
     pub fn addCORSRule(self: *PolicyEngine, rule: PolicyRule) !void {
-        // Store rule for validation
-        _ = rule; // Implementation would store in a rule store
+        _ = self;
+        _ = rule;
     }
     
     /// Add origin to whitelist
@@ -434,20 +524,19 @@ pub const PolicyEngine = struct {
     }
     
     fn findCORSRule(self: *PolicyEngine, source: Origin, target: Origin) !?PolicyRule {
+        _ = self;
         _ = source;
         _ = target;
-        // Implementation would search rule store
         return null;
     }
     
     fn checkCORSRule(self: *PolicyEngine, rule: PolicyRule, request: CORSRequest) ValidationResult {
-        _ = self;
         var result = ValidationResult.init(self.allocator);
         
         // Check method
         var method_allowed = false;
         for (rule.allowed_methods.items) |allowed_method| {
-            if (std.mem.eql(u8, std.ascii.upperString(request.method), allowed_method)) {
+            if (std.ascii.eqlIgnoreCase(request.method, allowed_method)) {
                 method_allowed = true;
                 break;
             }
@@ -460,10 +549,12 @@ pub const PolicyEngine = struct {
         }
         
         // Check headers
-        for (request.headers.keys(), request.headers.values()) |header_name, header_value| {
+        var it = request.headers.iterator();
+        while (it.next()) |entry| {
+            const header_name = entry.key_ptr.*;
             var header_allowed = false;
             for (rule.allowed_headers.items) |allowed_header| {
-                if (std.mem.eql(u8, std.ascii.lowerString(header_name), allowed_header)) {
+                if (std.ascii.eqlIgnoreCase(header_name, allowed_header)) {
                     header_allowed = true;
                     break;
                 }
@@ -534,8 +625,6 @@ test "policy engine init" {
 // Phase 3: Network Bridge Integration
 // ============================================================
 
-const network_bridge = @import("z_network_bridge.zig");
-
 /// Pre-request validation result
 pub const PreRequestValidationResult = enum(i32) {
     Allowed = 0,
@@ -553,20 +642,22 @@ pub const StreamValidationResult = enum(i32) {
 
 /// Request interceptor - validates before hitting Rust network
 pub const RequestInterceptor = struct {
-    csp_policy: ?*CSPPolicy,
-    allowed_origins: ArrayList(Origin),
+    allocator: Allocator,
+    csp_policy: ?*ContentSecurityPolicy,
+    allowed_origins: std.ArrayListUnmanaged(Origin),
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
         return Self{
+            .allocator = allocator,
             .csp_policy = null,
-            .allowed_origins = ArrayList(Origin).init(allocator),
+            .allowed_origins = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.allowed_origins.deinit();
+        self.allowed_origins.deinit(self.allocator);
     }
 
     /// Validate and intercept URL request before network call
@@ -574,7 +665,8 @@ pub const RequestInterceptor = struct {
         self: *Self,
         url: []const u8,
         method: []const u8,
-    ) ValidationResult {
+    ) PreRequestValidationResult {
+        _ = method;
         // Parse origin from URL
         const origin = Origin.parse(url) catch return .Invalid;
 
@@ -602,8 +694,8 @@ pub const RequestInterceptor = struct {
 pub const StreamValidator = struct {
     allocator: Allocator,
     current_origin: Origin,
-    csp_policy: ?*CSPPolicy,
-    cors_config: CORSConfig,
+    csp_policy: ?*ContentSecurityPolicy,
+    cors_config: PolicyEngineConfig,
 
     const Self = @This();
 
@@ -612,12 +704,12 @@ pub const StreamValidator = struct {
             .allocator = allocator,
             .current_origin = origin,
             .csp_policy = null,
-            .cors_config = CORSConfig.init(allocator),
+            .cors_config = PolicyEngineConfig{},
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.cors_config.deinit();
+        _ = self;
     }
 
     /// Inline validation - validates data IN-PLACE as it flows from Rust
@@ -680,7 +772,7 @@ pub const StreamValidator = struct {
 pub fn secureFetch(
     url: []const u8,
     method: []const u8,
-    engine: network_bridge.NetworkEngine,
+    engine: anytype,
     policy: *RequestInterceptor,
     validator: *StreamValidator,
 ) ![]u8 {
@@ -713,7 +805,7 @@ pub fn secureFetch(
     _ = try conn.write(request);
 
     // Step 5: Read response via Rust -> validate in-place -> output
-    var response_buf: [network_bridge.MAX_BUFFER_SIZE]u8 = undefined;
+    var response_buf: [65536]u8 = undefined;
     const bytes_read = try conn.read(response_buf[0..]);
 
     // Step 6: Inline streaming validation (ZERO-COPY path)

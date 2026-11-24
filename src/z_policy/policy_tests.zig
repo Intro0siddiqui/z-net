@@ -6,15 +6,20 @@
 const std = @import("std");
 const testing = std.testing;
 
-const policy_engine = @import("policy_engine");
-const cors_handler = @import("cors_handler");
-const csp_validator = @import("csp_validator");
 const policy = @import("policy.zig");
-
-// usingnamespace policy_engine;
-// usingnamespace cors_handler;
-// usingnamespace csp_validator;
-// usingnamespace policy;
+const Origin = policy.Origin;
+const PolicyEngineConfig = policy.PolicyEngineConfig;
+const PolicyEngine = policy.PolicyEngine;
+const CORSHangler = policy.CORSHangler;
+const CORSOptions = policy.CORSOptions;
+const CORSMethod = policy.CORSMethod;
+const CSPValidator = policy.CSPValidator;
+const CSPValidationContext = policy.CSPValidationContext;
+const createPolicyManager = policy.createPolicyManager;
+const getDefaultPolicyConfig = policy.getDefaultPolicyConfig;
+const RequestValidation = policy.RequestValidation;
+const validateMixedContentPolicy = policy.validateMixedContentPolicy;
+const StringHashMap = std.StringHashMap;
 
 test "origin parsing and comparison" {
     const origin1 = try Origin.parse("https://example.com:443/path");
@@ -66,7 +71,7 @@ test "cors preflight request detection" {
     try testing.expect(handler.isPreflightRequest("OPTIONS", headers));
     
     // Setup normal request headers
-    headers.clear();
+    headers.clearRetainingCapacity();
     headers.put("Content-Type", "application/json") catch {};
     
     // Should not detect as preflight
@@ -124,7 +129,7 @@ test "cors preflight request handling" {
     headers.put("Access-Control-Request-Method", "POST") catch {};
     headers.put("Access-Control-Request-Headers", "Content-Type") catch {};
     
-    const preflight_request = try handler.extractPreflightRequest("OPTIONS", headers);
+    var preflight_request = try handler.extractPreflightRequest("OPTIONS", headers);
     defer preflight_request.deinit();
     
     try testing.expectEqual(@as([]const u8, "https://example.com"), preflight_request.origin);
@@ -151,7 +156,7 @@ test "csp directive parsing" {
     const policy_header = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' https://fonts.googleapis.com";
     const origin = try Origin.parse("https://example.com");
     
-    const policy_parsed = try validator.parseCSPHeader(policy_header, origin);
+    var policy_parsed = try validator.parseCSPHeader(policy_header, origin);
     defer policy_parsed.deinit();
     
     // Should have 3 directives
@@ -175,7 +180,7 @@ test "csp validation context" {
     var validator = CSPValidator.init(allocator);
     defer validator.deinit();
     
-    var context = CSPValidationContext.init("https://example.com/script.js", "script", "https://example.com/page.html");
+    const context = CSPValidationContext.init("https://example.com/script.js", "script", "https://example.com/page.html");
     
     try testing.expect(std.mem.eql(u8, "https://example.com/script.js", context.resource_url));
     try testing.expect(std.mem.eql(u8, "script", context.resource_type));

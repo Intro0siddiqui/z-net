@@ -7,15 +7,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
 
-const policy_engine = @import("policy_engine");
-const cors_handler = @import("cors_handler");
-const csp_validator = @import("csp_validator");
 const policy = @import("policy.zig");
-
-// usingnamespace policy_engine;
-// usingnamespace cors_handler;
-// usingnamespace csp_validator;
-// usingnamespace policy;
+const createPolicyManager = policy.createPolicyManager;
+const getDefaultPolicyConfig = policy.getDefaultPolicyConfig;
+const CORSOptions = policy.CORSOptions;
+const PolicyManager = policy.PolicyManager;
+const Origin = policy.Origin;
+const PolicyEngineConfig = policy.PolicyEngineConfig;
+const RequestValidation = policy.RequestValidation;
 
 pub const PolicyIntegrationExample = struct {
     /// Example: How to integrate Policy Engine with fetch requests
