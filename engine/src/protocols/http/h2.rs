@@ -1,9 +1,13 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::Ordering;
+
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri};
-use rustls::ClientConnection;
+use h2_sans_io::{
+    H2Codec, H2Event, H2Header, HpackDecoder, HpackEncoder, CONNECTION_PREFACE,
+};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use url::Url;
 
 use crate::protocols::compression::StreamDecompressor;
 use crate::protocols::http::client::HttpRequestOptions;
@@ -21,7 +25,8 @@ impl Http2RequestBuilder {
     pub fn new(method_str: &str, uri_str: &str) -> Result<Self, String> {
         let method = Method::from_bytes(method_str.as_bytes())
             .map_err(|e| format!("Invalid HTTP method: {}", e))?;
-        let uri = uri_str.parse::<Uri>()
+        let uri = uri_str
+            .parse::<Uri>()
             .map_err(|e| format!("Invalid URI: {}", e))?;
 
         Ok(Self {
@@ -48,9 +53,7 @@ impl Http2RequestBuilder {
 
     /// Build the standard `http::Request` containing pseudo-headers (:method, :scheme, :authority, :path).
     pub fn build(mut self) -> Result<(Request<()>, Option<Bytes>), String> {
-        let mut builder = Request::builder()
-            .method(self.method)
-            .uri(self.uri);
+        let mut builder = Request::builder().method(self.method).uri(self.uri);
 
         if let Some(headers_mut) = builder.headers_mut() {
             for (k, v) in self.headers.drain() {
@@ -60,7 +63,9 @@ impl Http2RequestBuilder {
             }
         }
 
-        let request = builder.body(()).map_err(|e| format!("Failed to build request: {}", e))?;
+        let request = builder
+            .body(())
+            .map_err(|e| format!("Failed to build request: {}", e))?;
         Ok((request, self.body))
     }
 }
@@ -88,168 +93,32 @@ impl Http2ResponseHeader {
     }
 }
 
-struct TokioReader<'a>(&'a tokio::net::TcpStream);
-
-impl<'a> Read for TokioReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.try_read(buf)
-    }
-}
-
-struct TokioWriter<'a>(&'a tokio::net::TcpStream);
-
-impl<'a> Write for TokioWriter<'a> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.try_write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Asynchronous TLS stream adapter wrapping a `rustls::ClientConnection` and `tokio::net::TcpStream`.
-pub struct AsyncTlsStream {
-    pub tls: ClientConnection,
-    pub io: tokio::net::TcpStream,
-}
-
-impl AsyncTlsStream {
-    pub fn new(tls: ClientConnection, io: tokio::net::TcpStream) -> Self {
-        Self { tls, io }
-    }
-}
-
-impl tokio::io::AsyncRead for AsyncTlsStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.as_mut().get_mut();
-
-        loop {
-            let unfilled = buf.initialize_unfilled();
-            if !unfilled.is_empty() {
-                match this.tls.reader().read(unfilled) {
-                    Ok(n) if n > 0 => {
-                        buf.advance(n);
-                        return std::task::Poll::Ready(Ok(()));
-                    }
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return std::task::Poll::Ready(Err(e)),
-                }
-            }
-
-            match this.io.poll_read_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-
-            match this.tls.read_tls(&mut TokioReader(&this.io)) {
-                Ok(0) => return std::task::Poll::Ready(Ok(())),
-                Ok(_) => {
-                    if let Err(e) = this.tls.process_new_packets() {
-                        return std::task::Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            e,
-                        )));
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return std::task::Poll::Pending;
-                }
-                Err(e) => return std::task::Poll::Ready(Err(e)),
-            }
+fn write_slice_to_ring(ring: &BodyRingDescriptor, slice: &[u8]) {
+    let mut offset = 0;
+    while offset < slice.len() && !ring.is_closed.load(Ordering::Acquire) {
+        let written = ring.write_slice(&slice[offset..]);
+        offset += written;
+        if offset < slice.len() {
+            ring.wait_drain(5);
         }
     }
 }
 
-impl tokio::io::AsyncWrite for AsyncTlsStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.as_mut().get_mut();
-
-        while this.tls.wants_write() {
-            match this.io.poll_write_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-
-            match this.tls.write_tls(&mut TokioWriter(&this.io)) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return std::task::Poll::Pending;
-                }
-                Err(e) => return std::task::Poll::Ready(Err(e)),
-            }
-        }
-
-        let n = this.tls.writer().write(buf)?;
-
-        while this.tls.wants_write() {
-            match this.io.poll_write_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => break,
-            }
-
-            match this.tls.write_tls(&mut TokioWriter(&this.io)) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return std::task::Poll::Ready(Err(e)),
-            }
-        }
-
-        std::task::Poll::Ready(Ok(n))
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.as_mut().get_mut();
-        while this.tls.wants_write() {
-            match this.io.poll_write_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-
-            match this.tls.write_tls(&mut TokioWriter(&this.io)) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return std::task::Poll::Pending;
-                }
-                Err(e) => return std::task::Poll::Ready(Err(e)),
-            }
-        }
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.poll_flush(cx)
-    }
+fn is_hop_by_hop_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("host")
 }
 
 pub struct Http2Client;
 
 impl Http2Client {
-    /// Execute an HTTP/2 request with progressive streaming over an async transport.
+    /// Execute an HTTP/2 request with progressive streaming using `h2-sans-io` (zero async runtime).
     pub fn execute_streaming<S, H, D, C, K>(
-        stream: S,
+        mut stream: S,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         mut on_headers: H,
@@ -258,150 +127,272 @@ impl Http2Client {
         mut is_cancelled: K,
     ) -> Result<bool, String>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        S: Read + Write,
         H: FnMut(u16, &str, &[(String, String)]),
         D: FnMut(&[u8]),
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to create tokio runtime for h2: {}", e))?;
+        let parsed_url = Url::parse(&options.url)
+            .map_err(|e| format!("Invalid URL for h2: {}", e))?;
+        let scheme = parsed_url.scheme();
+        let host = parsed_url.host_str().ok_or("Missing host in URL")?;
+        let authority = match parsed_url.port() {
+            Some(p) => format!("{}:{}", host, p),
+            None => host.to_string(),
+        };
+        let mut path_and_query = parsed_url.path().to_string();
+        if let Some(q) = parsed_url.query() {
+            path_and_query.push('?');
+            path_and_query.push_str(q);
+        }
+        if path_and_query.is_empty() {
+            path_and_query = "/".to_string();
+        }
 
         let has_range_header = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
-        let has_accept_encoding = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
+        let has_accept_encoding = options
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
 
-        let mut req_builder = Http2RequestBuilder::new(&options.method, &options.url)?;
+        // 1. Encode HTTP/2 pseudo-headers and request headers via HPACK
+        let mut h2_headers = Vec::with_capacity(4 + options.headers.len() + 1);
+        h2_headers.push(H2Header::new(":method", options.method.as_bytes()));
+        h2_headers.push(H2Header::new(":scheme", scheme.as_bytes()));
+        h2_headers.push(H2Header::new(":authority", authority.as_bytes()));
+        h2_headers.push(H2Header::new(":path", path_and_query.as_bytes()));
+
         for (k, v) in &options.headers {
-            req_builder = req_builder.header(k, v)?;
+            if is_hop_by_hop_header(k) {
+                continue;
+            }
+            h2_headers.push(H2Header::new(k.to_ascii_lowercase().into_bytes(), v.as_bytes()));
         }
         if options.transparent_decompression && !has_range_header && !has_accept_encoding {
-            req_builder = req_builder.header("accept-encoding", "gzip, deflate, br, zstd")?;
+            h2_headers.push(H2Header::new("accept-encoding", "gzip, deflate, br, zstd"));
         }
-        if let Some(ref b) = options.body {
-            req_builder = req_builder.body(Bytes::copy_from_slice(b));
+
+        let mut encoder = HpackEncoder::new();
+        let header_block = encoder.encode(&h2_headers);
+
+        // 2. Send client connection preface, SETTINGS, connection window update, and request frames
+        stream
+            .write_all(CONNECTION_PREFACE)
+            .map_err(|e| format!("h2 preface write failed: {}", e))?;
+        stream
+            .write_all(&H2Codec::create_settings_with_window(1024 * 1024))
+            .map_err(|e| format!("h2 settings write failed: {}", e))?;
+        stream
+            .write_all(&H2Codec::create_window_update(0, 1024 * 1024))
+            .map_err(|e| format!("h2 window update write failed: {}", e))?;
+
+        let stream_id: u32 = 1;
+        let max_frame_size: u32 = 16384;
+        let has_body = options.body.as_ref().map_or(false, |b| !b.is_empty());
+        for frame in H2Codec::create_headers_frames(stream_id, &header_block, !has_body, max_frame_size) {
+            stream
+                .write_all(&frame)
+                .map_err(|e| format!("h2 headers write failed: {}", e))?;
         }
-        let (request, body_bytes) = req_builder.build()?;
+        if let Some(ref body) = options.body {
+            if !body.is_empty() {
+                for frame in H2Codec::create_data_frames(stream_id, body, true, max_frame_size) {
+                    stream
+                        .write_all(&frame)
+                        .map_err(|e| format!("h2 data write failed: {}", e))?;
+                }
+            }
+        }
+        stream
+            .flush()
+            .map_err(|e| format!("h2 flush failed: {}", e))?;
 
-        rt.block_on(async move {
-            let (mut client, h2_conn) = h2::client::handshake(stream)
-                .await
-                .map_err(|e| format!("h2 handshake error: {}", e))?;
+        // 3. Progressive frame read & decode loop
+        let mut codec = H2Codec::new();
+        codec.set_preface_received(true);
+        let mut decoder = HpackDecoder::new();
 
-            tokio::spawn(async move {
-                let _ = h2_conn.await;
-            });
+        let mut read_buf = [0u8; 16384];
+        let mut headers_dispatched = false;
+        let mut stream_ended = false;
+        let mut decompressor: Option<StreamDecompressor> = None;
 
-            let (response, mut send_stream) = client
-                .send_request(request, body_bytes.is_none())
-                .map_err(|e| format!("h2 send_request error: {}", e))?;
-
-            if let Some(bytes) = body_bytes {
-                send_stream
-                    .send_data(bytes, true)
-                    .map_err(|e| format!("h2 send_data error: {}", e))?;
+        while !stream_ended {
+            if is_cancelled() {
+                return Ok(headers_dispatched);
             }
 
-            let response = response
-                .await
-                .map_err(|e| format!("h2 response header error: {}", e))?;
-
-            let (head, mut body) = response.into_parts();
-            let status = head.status.as_u16();
-            let reason = head.status.canonical_reason().unwrap_or("OK");
-
-            let mut headers_vec = Vec::with_capacity(head.headers.len());
-            for (k, v) in head.headers.iter() {
-                headers_vec.push((
-                    k.as_str().to_string(),
-                    String::from_utf8_lossy(v.as_bytes()).to_string(),
-                ));
-            }
-
-            let should_decompress = options.transparent_decompression
-                && !has_range_header
-                && status != 206;
-
-            let mut decompressor: Option<StreamDecompressor> = None;
-            if should_decompress {
-                if let Some((_, enc)) = headers_vec.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-encoding")) {
-                    if let Some(dec) = StreamDecompressor::new(enc) {
-                        decompressor = Some(dec);
+            if let Some(ring) = body_ring {
+                while ring.should_stop_reading() && !ring.is_closed.load(Ordering::Acquire) {
+                    if is_cancelled() {
+                        return Ok(headers_dispatched);
                     }
+                    ring.wait_drain(5);
                 }
             }
 
-            if decompressor.is_some() {
-                let filtered_headers: Vec<(String, String)> = headers_vec
-                    .into_iter()
-                    .filter(|(k, _)| {
-                        !k.eq_ignore_ascii_case("content-encoding")
-                            && !k.eq_ignore_ascii_case("content-length")
-                    })
-                    .collect();
-                on_headers(status, reason, &filtered_headers);
-            } else {
-                on_headers(status, reason, &headers_vec);
-            }
-
-            while let Some(chunk_res) = body.data().await {
-                if is_cancelled() {
-                    return Ok(true);
+            let n = match stream.read(&mut read_buf) {
+                Ok(0) => {
+                    if headers_dispatched {
+                        break;
+                    }
+                    return Err("h2 connection closed before response headers".to_string());
                 }
-                let chunk = chunk_res.map_err(|e| format!("h2 body chunk error: {}", e))?;
-                let chunk_len = chunk.len();
-                if chunk_len > 0 {
-                    let _ = body.flow_control().release_capacity(chunk_len);
+                Ok(n) => n,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                Err(e) => return Err(format!("h2 read error: {}", e)),
+            };
 
-                    if let Some(ref mut dec) = decompressor {
-                        dec.feed(&chunk, |decompressed_slice| {
-                            if let Some(ring) = body_ring {
-                                let mut offset = 0;
-                                while offset < decompressed_slice.len() && !ring.is_closed.load(Ordering::Acquire) {
-                                    let written = ring.write_slice(&decompressed_slice[offset..]);
-                                    offset += written;
-                                    if offset < decompressed_slice.len() {
-                                        ring.wait_drain(5);
-                                    }
+            let events = codec
+                .process(&read_buf[..n])
+                .map_err(|e| format!("h2 frame decode error: {}", e))?;
+
+            for event in events {
+                match event {
+                    H2Event::Settings { ack: false, .. } => {
+                        let _ = stream.write_all(&H2Codec::create_settings_ack());
+                        let _ = stream.flush();
+                    }
+                    H2Event::Ping { ack: false, data } => {
+                        let _ = stream.write_all(&H2Codec::create_ping_ack(data));
+                        let _ = stream.flush();
+                    }
+                    H2Event::Headers {
+                        stream_id: ev_sid,
+                        header_block,
+                        end_stream,
+                    } if ev_sid == stream_id => {
+                        let decoded = decoder
+                            .decode(&header_block)
+                            .map_err(|e| format!("h2 HPACK decode error: {}", e))?;
+
+                        let mut status: u16 = 200;
+                        let mut headers_vec = Vec::with_capacity(decoded.len());
+                        for h in decoded {
+                            let name = String::from_utf8_lossy(&h.name).to_string();
+                            let value = String::from_utf8_lossy(&h.value).to_string();
+                            if name == ":status" {
+                                if let Ok(code) = value.parse::<u16>() {
+                                    status = code;
                                 }
+                            } else if !name.starts_with(':') {
+                                headers_vec.push((name, value));
                             }
-                            on_data_chunk(decompressed_slice);
-                        }).map_err(|e| format!("h2 decompression error: {}", e))?;
-                    } else {
-                        if let Some(ring) = body_ring {
-                            let mut offset = 0;
-                            while offset < chunk.len() && !ring.is_closed.load(Ordering::Acquire) {
-                                let written = ring.write_slice(&chunk[offset..]);
-                                offset += written;
-                                if offset < chunk.len() {
-                                    ring.wait_drain(5);
+                        }
+
+                        // Skip 1xx informational headers
+                        if (100..200).contains(&status) {
+                            continue;
+                        }
+
+                        let reason = StatusCode::from_u16(status)
+                            .ok()
+                            .and_then(|s| s.canonical_reason())
+                            .unwrap_or("OK");
+
+                        let should_decompress = options.transparent_decompression
+                            && !has_range_header
+                            && status != 206;
+
+                        if should_decompress {
+                            if let Some((_, enc)) = headers_vec
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                            {
+                                if let Some(dec) = StreamDecompressor::new(enc) {
+                                    decompressor = Some(dec);
                                 }
                             }
                         }
-                        on_data_chunk(&chunk);
+
+                        if decompressor.is_some() {
+                            let filtered_headers: Vec<(String, String)> = headers_vec
+                                .into_iter()
+                                .filter(|(k, _)| {
+                                    !k.eq_ignore_ascii_case("content-encoding")
+                                        && !k.eq_ignore_ascii_case("content-length")
+                                })
+                                .collect();
+                            on_headers(status, reason, &filtered_headers);
+                        } else {
+                            on_headers(status, reason, &headers_vec);
+                        }
+
+                        headers_dispatched = true;
+                        if end_stream {
+                            stream_ended = true;
+                        }
                     }
+                    H2Event::Data {
+                        stream_id: ev_sid,
+                        data,
+                        end_stream,
+                    } if ev_sid == stream_id => {
+                        if !data.is_empty() {
+                            let len_u32 = data.len() as u32;
+                            let _ = stream.write_all(&H2Codec::create_window_update(0, len_u32));
+                            let _ = stream.write_all(&H2Codec::create_window_update(stream_id, len_u32));
+                            let _ = stream.flush();
+
+                            if let Some(ref mut dec) = decompressor {
+                                dec.feed(&data, |decompressed_slice| {
+                                    if let Some(ring) = body_ring {
+                                        write_slice_to_ring(ring, decompressed_slice);
+                                    }
+                                    on_data_chunk(decompressed_slice);
+                                })
+                                .map_err(|e| format!("h2 decompression error: {}", e))?;
+                            } else {
+                                if let Some(ring) = body_ring {
+                                    write_slice_to_ring(ring, &data);
+                                }
+                                on_data_chunk(&data);
+                            }
+                        }
+                        if end_stream {
+                            stream_ended = true;
+                        }
+                    }
+                    H2Event::StreamReset {
+                        stream_id: ev_sid,
+                        error_code,
+                    } if ev_sid == stream_id => {
+                        return Err(format!("h2 stream reset (error code {})", error_code));
+                    }
+                    H2Event::GoAway { error_code, .. } => {
+                        if !headers_dispatched {
+                            return Err(format!("h2 GOAWAY before headers (error code {})", error_code));
+                        }
+                        stream_ended = true;
+                    }
+                    _ => {}
                 }
             }
+        }
 
-            if let Some(dec) = decompressor.take() {
-                dec.finish(|decompressed_slice| {
-                    if let Some(ring) = body_ring {
-                        ring.write_slice(decompressed_slice);
-                    }
-                    on_data_chunk(decompressed_slice);
-                }).map_err(|e| format!("h2 decompression finish error: {}", e))?;
-            }
+        if let Some(dec) = decompressor.take() {
+            dec.finish(|decompressed_slice| {
+                if let Some(ring) = body_ring {
+                    write_slice_to_ring(ring, decompressed_slice);
+                }
+                on_data_chunk(decompressed_slice);
+            })
+            .map_err(|e| format!("h2 decompression finish error: {}", e))?;
+        }
 
-            on_complete(true);
-            Ok(true)
-        })
+        on_complete(true);
+        Ok(headers_dispatched)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Shutdown, TcpListener, TcpStream};
 
     #[test]
     fn test_h2_request_builder_get() {
@@ -447,38 +438,63 @@ mod tests {
 
     #[test]
     fn test_h2_client_execute_streaming_roundtrip() {
-        let (client_io, server_io) = tokio::io::duplex(65536);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local h2 server");
+        let addr = listener.local_addr().unwrap();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let mut server = h2::server::handshake(server_io).await.unwrap();
-                if let Some(Ok((request, mut respond))) = server.accept().await {
-                    assert_eq!(request.method(), Method::GET);
-                    let response = http::Response::builder()
-                        .status(200)
-                        .header("content-type", "text/plain")
-                        .body(())
-                        .unwrap();
-                    let mut send = respond.send_response(response, false).unwrap();
-                    send.send_data(Bytes::from_static(b"hello "), false).unwrap();
-                    send.send_data(Bytes::from_static(b"world!"), true).unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut codec = H2Codec::new();
+            let mut dec = HpackDecoder::new();
+            let mut enc = HpackEncoder::new();
+            let mut buf = [0u8; 4096];
+
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
                 }
-                while let Some(_) = server.accept().await {}
-            });
+                let events = codec.process(&buf[..n]).expect("server decode");
+                for ev in events {
+                    if let H2Event::Settings { ack: false, .. } = ev {
+                        conn.write_all(&H2Codec::create_settings()).unwrap();
+                        conn.write_all(&H2Codec::create_settings_ack()).unwrap();
+                        conn.flush().unwrap();
+                    } else if let H2Event::Headers { stream_id, header_block, .. } = ev {
+                        let hdrs = dec.decode(&header_block).expect("decode req headers");
+                        assert!(hdrs.iter().any(|h| h.name == b":method" && h.value == b"GET"));
+                        assert!(hdrs.iter().any(|h| h.name == b":path" && h.value == b"/stream"));
+
+                        let resp_hdrs = vec![
+                            H2Header::new(":status", "200"),
+                            H2Header::new("content-type", "text/plain"),
+                        ];
+                        let block = enc.encode(&resp_hdrs);
+                        conn.write_all(&H2Codec::create_headers_frame(stream_id, &block, false))
+                            .unwrap();
+                        for f in H2Codec::create_data_frames(stream_id, b"hello ", false, 16384) {
+                            conn.write_all(&f).unwrap();
+                        }
+                        for f in H2Codec::create_data_frames(stream_id, b"world!", true, 16384) {
+                            conn.write_all(&f).unwrap();
+                        }
+                        conn.flush().unwrap();
+                        let _ = conn.shutdown(Shutdown::Write);
+                        while conn.read(&mut buf).unwrap_or(0) > 0 {}
+                        return;
+                    }
+                }
+            }
         });
 
-        let opts = HttpRequestOptions::new("GET", "https://example.com/stream");
+        let client_tcp = TcpStream::connect(addr).expect("connect to local h2 server");
+        let opts = HttpRequestOptions::new("GET", &format!("http://{}/stream", addr));
         let mut got_status = 0;
         let mut got_headers = Vec::new();
         let mut got_body = Vec::new();
         let mut got_complete = false;
 
         let res = Http2Client::execute_streaming(
-            client_io,
+            client_tcp,
             &opts,
             None,
             |status, _reason, headers| {
@@ -494,55 +510,75 @@ mod tests {
             || false,
         );
 
+        server_thread.join().expect("server join");
         assert!(res.is_ok(), "res error: {:?}", res.err());
         assert_eq!(got_status, 200);
         assert_eq!(got_body, b"hello world!");
         assert!(got_complete);
-        assert!(got_headers.iter().any(|(k, v)| k == "content-type" && v == "text/plain"));
+        assert!(got_headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "text/plain"));
     }
 
     #[test]
     fn test_h2_client_execute_streaming_gzip_decompression() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local h2 gzip server");
+        let addr = listener.local_addr().unwrap();
 
-        let raw_payload = b"Hello from compressed HTTP/2 streaming with transparent decompression!";
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(raw_payload).unwrap();
-        let compressed_bytes = Bytes::from(encoder.finish().unwrap());
+        let server_thread = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut codec = H2Codec::new();
+            let mut enc = HpackEncoder::new();
+            let mut buf = [0u8; 4096];
 
-        let (client_io, server_io) = tokio::io::duplex(65536);
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let mut server = h2::server::handshake(server_io).await.unwrap();
-                if let Some(Ok((request, mut respond))) = server.accept().await {
-                    assert_eq!(request.method(), Method::GET);
-                    let response = http::Response::builder()
-                        .status(200)
-                        .header("content-type", "text/plain")
-                        .header("content-encoding", "gzip")
-                        .body(())
-                        .unwrap();
-                    let mut send = respond.send_response(response, false).unwrap();
-                    send.send_data(compressed_bytes, true).unwrap();
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
                 }
-                while let Some(_) = server.accept().await {}
-            });
+                let events = codec.process(&buf[..n]).expect("server decode");
+                for ev in events {
+                    if let H2Event::Settings { ack: false, .. } = ev {
+                        conn.write_all(&H2Codec::create_settings()).unwrap();
+                        conn.write_all(&H2Codec::create_settings_ack()).unwrap();
+                        conn.flush().unwrap();
+                    } else if let H2Event::Headers { stream_id, .. } = ev {
+                        let mut gz = flate2::write::GzEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        gz.write_all(b"compressed h2 payload").unwrap();
+                        let gz_bytes = gz.finish().unwrap();
+
+                        let resp_hdrs = vec![
+                            H2Header::new(":status", "200"),
+                            H2Header::new("content-encoding", "gzip"),
+                            H2Header::new("content-length", gz_bytes.len().to_string().as_bytes()),
+                        ];
+                        let block = enc.encode(&resp_hdrs);
+                        conn.write_all(&H2Codec::create_headers_frame(stream_id, &block, false))
+                            .unwrap();
+                        for f in H2Codec::create_data_frames(stream_id, &gz_bytes, true, 16384) {
+                            conn.write_all(&f).unwrap();
+                        }
+                        conn.flush().unwrap();
+                        let _ = conn.shutdown(Shutdown::Write);
+                        while conn.read(&mut buf).unwrap_or(0) > 0 {}
+                        return;
+                    }
+                }
+            }
         });
 
-        let opts = HttpRequestOptions::new("GET", "https://example.com/gzip-stream");
+        let client_tcp = TcpStream::connect(addr).expect("connect to local h2 gzip server");
+        let opts = HttpRequestOptions::new("GET", &format!("http://{}/gzip", addr));
         let mut got_status = 0;
         let mut got_headers = Vec::new();
         let mut got_body = Vec::new();
         let mut got_complete = false;
 
         let res = Http2Client::execute_streaming(
-            client_io,
+            client_tcp,
             &opts,
             None,
             |status, _reason, headers| {
@@ -558,11 +594,16 @@ mod tests {
             || false,
         );
 
+        server_thread.join().expect("server join");
         assert!(res.is_ok(), "res error: {:?}", res.err());
         assert_eq!(got_status, 200);
-        assert_eq!(got_body, raw_payload);
+        assert_eq!(got_body, b"compressed h2 payload");
         assert!(got_complete);
-        // Verify Content-Encoding was stripped on transparent decompression
-        assert!(!got_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")));
+        assert!(!got_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")));
+        assert!(!got_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length")));
     }
 }

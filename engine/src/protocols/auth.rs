@@ -17,8 +17,7 @@
 
 use base64::Engine;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Authentication scheme parsed from the `WWW-Authenticate` /
 /// `Proxy-Authenticate` header value.
@@ -292,8 +291,8 @@ impl AuthEngine {
 
     /// Observe a response status. If it is a 401/407 we record the
     /// challenge and signal that the caller should retry.
-    pub async fn observe(&self, conn_key: &str, status: u16, www_auth: Option<&str>, proxy_auth: Option<&str>) -> Option<AuthChallenge> {
-        let mut states = self.states.lock().await;
+    pub fn observe(&self, conn_key: &str, status: u16, www_auth: Option<&str>, proxy_auth: Option<&str>) -> Option<AuthChallenge> {
+        let mut states = self.states.lock().ok()?;
         let state = states.entry(conn_key.to_string()).or_default();
         match status {
             401 => {
@@ -327,8 +326,8 @@ impl AuthEngine {
     }
 
     /// Build the auth header to attach to the retry request.
-    pub async fn build_retry_header(&self, conn_key: &str, challenge: &AuthChallenge, target_host: &str) -> Result<(AuthHeader, String), AuthError> {
-        let mut states = self.states.lock().await;
+    pub fn build_retry_header(&self, conn_key: &str, challenge: &AuthChallenge, target_host: &str) -> Result<(AuthHeader, String), AuthError> {
+        let mut states = self.states.lock().map_err(|_| AuthError::Backend("auth state lock poisoned".into()))?;
         let state = states.entry(conn_key.to_string()).or_default();
         if state.retried {
             return Err(AuthError::Backend("auth already retried once".into()));

@@ -1,9 +1,53 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+fn truncate_path(path: &str) -> String {
+    path.chars().take(48).collect()
+}
+
+struct PerfTelemetry {
+    method: String,
+    host: String,
+    path_prefix: String,
+    proto: &'static str,
+    reused: bool,
+    streams: usize,
+    dns_ms: f64,
+    tcp_tls_ms: f64,
+    ttfb_ms: f64,
+    body_ms: f64,
+    status: u16,
+    total_start: Instant,
+}
+
+impl Drop for PerfTelemetry {
+    fn drop(&mut self) {
+        ACTIVE_STREAMS.fetch_sub(1, Ordering::AcqRel);
+        let total_ms = self.total_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[ZNET-PERF] {} {}{} | proto={} reused={} streams={} | dns={:.1}ms tls={:.1}ms ttfb={:.1}ms body={:.1}ms total={:.1}ms status={}",
+            self.method,
+            self.host,
+            self.path_prefix,
+            self.proto,
+            self.reused,
+            self.streams,
+            self.dns_ms,
+            self.tcp_tls_ms,
+            self.ttfb_ms,
+            self.body_ms,
+            total_ms,
+            self.status,
+        );
+    }
+}
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
@@ -133,18 +177,29 @@ impl HttpClientEngine {
         host: &str,
         port: u16,
         timeout: Duration,
+        dns_ms: &mut f64,
+        tcp_ms: &mut f64,
     ) -> Result<TcpStream, String> {
-        let addrs = dns_resolver.resolve(host, port)?;
+        let is_ip_literal = host.parse::<std::net::IpAddr>().is_ok();
+        let dns_start = Instant::now();
+        let addrs_res = dns_resolver.resolve(host, port);
+        if !is_ip_literal {
+            *dns_ms = dns_start.elapsed().as_secs_f64() * 1000.0;
+        }
+        let addrs = addrs_res?;
 
+        let tcp_start = Instant::now();
         let connect_timeout = std::cmp::min(timeout, Duration::from_secs(3));
         for addr in addrs {
             if let Ok(s) = TcpStream::connect_timeout(&addr, connect_timeout) {
                 let _ = s.set_nodelay(true);
                 let _ = s.set_read_timeout(Some(timeout));
                 let _ = s.set_write_timeout(Some(timeout));
+                *tcp_ms = tcp_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok(s);
             }
         }
+        *tcp_ms = tcp_start.elapsed().as_secs_f64() * 1000.0;
 
         Err(format!("Could not connect to {}:{}", host, port))
     }
@@ -188,6 +243,23 @@ impl HttpClientEngine {
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
+        let total_start = Instant::now();
+        let active_streams = ACTIVE_STREAMS.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut perf = PerfTelemetry {
+            method: options.method.clone(),
+            host: String::new(),
+            path_prefix: truncate_path(&options.url),
+            proto: "h1",
+            reused: false,
+            streams: active_streams,
+            dns_ms: 0.0,
+            tcp_tls_ms: 0.0,
+            ttfb_ms: 0.0,
+            body_ms: 0.0,
+            status: 0,
+            total_start,
+        };
+
         let parsed_url = Url::parse(&options.url)
             .map_err(|e| format!("Invalid URL: {}", e))?;
 
@@ -200,6 +272,17 @@ impl HttpClientEngine {
 
         let host = parsed_url.host_str().ok_or("Missing host in URL")?.to_string();
         let port = parsed_url.port_or_known_default().unwrap_or(if is_tls { 443 } else { 80 });
+
+        let mut path_and_query = parsed_url.path().to_string();
+        if let Some(q) = parsed_url.query() {
+            path_and_query.push('?');
+            path_and_query.push_str(q);
+        }
+        if path_and_query.is_empty() {
+            path_and_query = "/".to_string();
+        }
+        perf.host = host.clone();
+        perf.path_prefix = truncate_path(&path_and_query);
 
         // Resolve proxy configuration
         let proxy_rule = self
@@ -227,6 +310,7 @@ impl HttpClientEngine {
                     &mut is_cancelled,
                     h3_timeout,
                 ) {
+                    perf.proto = "h3";
                     return Ok(true);
                 }
                 // Seamlessly fall back to TCP TLS streaming
@@ -237,30 +321,44 @@ impl HttpClientEngine {
 
         // 1. Check connection pool or establish new connection
         let mut stream = if let Some(pooled) = self.pool.get(&pool_key) {
+            perf.reused = true;
             pooled.socket
         } else {
+            let mut tcp_ms = 0.0;
             let mut tcp = match proxy_rule.scheme {
                 ProxyScheme::Direct => {
-                    Self::connect_tcp(&self.dns_resolver, &host, port, options.timeout)?
+                    Self::connect_tcp(&self.dns_resolver, &host, port, options.timeout, &mut perf.dns_ms, &mut tcp_ms)?
                 }
                 ProxyScheme::Http => {
-                    let mut s = Self::connect_tcp(&self.dns_resolver, &proxy_rule.host, proxy_rule.port, options.timeout)?;
-                    establish_http_connect_tunnel(&mut s, &host, port)
-                        .map_err(|e| format!("HTTP CONNECT tunnel failed: {}", e))?;
+                    let mut s = Self::connect_tcp(&self.dns_resolver, &proxy_rule.host, proxy_rule.port, options.timeout, &mut perf.dns_ms, &mut tcp_ms)?;
+                    let tunnel_start = Instant::now();
+                    let tunnel_res = establish_http_connect_tunnel(&mut s, &host, port);
+                    tcp_ms += tunnel_start.elapsed().as_secs_f64() * 1000.0;
+                    tunnel_res.map_err(|e| {
+                        perf.tcp_tls_ms = tcp_ms;
+                        format!("HTTP CONNECT tunnel failed: {}", e)
+                    })?;
                     s
                 }
                 ProxyScheme::Socks5 => {
-                    let mut s = Self::connect_tcp(&self.dns_resolver, &proxy_rule.host, proxy_rule.port, options.timeout)?;
-                    establish_socks5_tunnel(&mut s, &host, port)
-                        .map_err(|e| format!("SOCKS5 tunnel failed: {}", e))?;
+                    let mut s = Self::connect_tcp(&self.dns_resolver, &proxy_rule.host, proxy_rule.port, options.timeout, &mut perf.dns_ms, &mut tcp_ms)?;
+                    let tunnel_start = Instant::now();
+                    let tunnel_res = establish_socks5_tunnel(&mut s, &host, port);
+                    tcp_ms += tunnel_start.elapsed().as_secs_f64() * 1000.0;
+                    tunnel_res.map_err(|e| {
+                        perf.tcp_tls_ms = tcp_ms;
+                        format!("SOCKS5 tunnel failed: {}", e)
+                    })?;
                     s
                 }
                 ProxyScheme::Socks4 => {
                     return Err("SOCKS4 proxy is not supported, configure SOCKS5 or HTTP proxy".to_string());
                 }
             };
+            perf.tcp_tls_ms = tcp_ms;
 
             if is_tls {
+                let tls_start = Instant::now();
                 let server_name = ServerName::try_from(host.as_str())
                     .map_err(|e| format!("Invalid TLS server name: {}", e))?
                     .to_owned();
@@ -269,16 +367,17 @@ impl HttpClientEngine {
                     .map_err(|e| format!("TLS handshake init failed: {}", e))?;
 
                 while tls_conn.is_handshaking() {
-                    tls_conn.complete_io(&mut tcp)
-                        .map_err(|e| format!("TLS handshake failed: {}", e))?;
+                    if let Err(e) = tls_conn.complete_io(&mut tcp) {
+                        perf.tcp_tls_ms = tcp_ms + tls_start.elapsed().as_secs_f64() * 1000.0;
+                        return Err(format!("TLS handshake failed: {}", e));
+                    }
                 }
+                perf.tcp_tls_ms = tcp_ms + tls_start.elapsed().as_secs_f64() * 1000.0;
 
                 let alpn = tls_conn.alpn_protocol().map(|s| s.to_vec());
                 if alpn.as_deref() == Some(b"h2") {
-                    let _ = tcp.set_nonblocking(true);
-                    let tokio_tcp = tokio::net::TcpStream::from_std(tcp)
-                        .map_err(|e| format!("Failed to create tokio TcpStream for h2: {}", e))?;
-                    let async_tls = super::h2::AsyncTlsStream::new(tls_conn, tokio_tcp);
+                    perf.proto = "h2";
+                    let tls_stream = StreamOwned::new(tls_conn, tcp);
 
                     // Preload matching cookies from RFC 6265 CookieJar and merge with request headers
                     let mut h2_options = options.clone();
@@ -317,11 +416,26 @@ impl HttpClientEngine {
                     let parsed_url_clone = parsed_url.clone();
                     let host_clone = host.clone();
 
-                    return super::h2::Http2Client::execute_streaming(
-                        async_tls,
+                    let req_ready_at = Instant::now();
+                    let headers_at = Cell::new(None::<Instant>);
+                    let ttfb_ms_cell = Cell::new(0.0_f64);
+                    let body_ms_cell = Cell::new(0.0_f64);
+                    let status_cell = Cell::new(0_u16);
+
+                    let headers_at_ref = &headers_at;
+                    let ttfb_ms_ref = &ttfb_ms_cell;
+                    let status_ref = &status_cell;
+                    let headers_at_ref_2 = &headers_at;
+                    let body_ms_ref = &body_ms_cell;
+
+                    let res = super::h2::Http2Client::execute_streaming(
+                        tls_stream,
                         &h2_options,
                         body_ring,
                         move |status, reason, headers| {
+                            headers_at_ref.set(Some(Instant::now()));
+                            ttfb_ms_ref.set(req_ready_at.elapsed().as_secs_f64() * 1000.0);
+                            status_ref.set(status);
                             for (k, v) in headers {
                                 if k.eq_ignore_ascii_case("set-cookie") {
                                     cookie_jar.process_set_cookie(session_id, &parsed_url_clone, v);
@@ -333,9 +447,19 @@ impl HttpClientEngine {
                             on_headers(status, reason, headers);
                         },
                         on_data_chunk,
-                        on_complete,
+                        move |keep_alive| {
+                            if let Some(h_at) = headers_at_ref_2.get() {
+                                body_ms_ref.set(h_at.elapsed().as_secs_f64() * 1000.0);
+                            }
+                            on_complete(keep_alive);
+                        },
                         is_cancelled,
                     );
+
+                    perf.ttfb_ms = ttfb_ms_cell.get();
+                    perf.body_ms = body_ms_cell.get();
+                    perf.status = status_cell.get();
+                    return res;
                 }
 
                 ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp)))
@@ -345,14 +469,6 @@ impl HttpClientEngine {
         };
 
         // 2. Format Request
-        let mut path_and_query = parsed_url.path().to_string();
-        if let Some(q) = parsed_url.query() {
-            path_and_query.push('?');
-            path_and_query.push_str(q);
-        }
-        if path_and_query.is_empty() {
-            path_and_query = "/".to_string();
-        }
 
         let mut req_builder = Http1RequestBuilder::new(&options.method, &path_and_query);
         let mut has_range_header = false;
@@ -413,6 +529,7 @@ impl HttpClientEngine {
         let wire_req = req_builder.serialize(&host, true);
 
         // 3. Send Request
+        let req_ready_at = Instant::now();
         stream.write_all(&wire_req)
             .map_err(|e| format!("Failed to send request: {}", e))?;
         stream.flush()
@@ -422,6 +539,7 @@ impl HttpClientEngine {
         let mut parser = Http1ResponseParser::new();
         let mut read_buf = [0u8; 8192];
         let mut headers_dispatched = false;
+        let mut headers_at: Option<Instant> = None;
         let mut can_keep_alive = false;
         let mut is_completed = false;
         let mut decompressor: Option<StreamDecompressor> = None;
@@ -471,6 +589,9 @@ impl HttpClientEngine {
                         })
                         .map_err(|e| format!("Decompression finish error: {}", e))?;
                     }
+                    if let Some(h_at) = headers_at {
+                        perf.body_ms = h_at.elapsed().as_secs_f64() * 1000.0;
+                    }
                     on_complete(false);
                     break;
                 }
@@ -506,6 +627,9 @@ impl HttpClientEngine {
                                     }
                                 }
 
+                                headers_at = Some(Instant::now());
+                                perf.ttfb_ms = req_ready_at.elapsed().as_secs_f64() * 1000.0;
+                                perf.status = status_code;
                                 if is_decompressing {
                                     // Filter out Content-Encoding and Content-Length so downstream consumers
                                     // (like WebKit's NetworkProcess) receive clean uncompressed data and know
@@ -567,6 +691,9 @@ impl HttpClientEngine {
                                 }
                                 can_keep_alive = keep_alive;
                                 is_completed = true;
+                                if let Some(h_at) = headers_at {
+                                    perf.body_ms = h_at.elapsed().as_secs_f64() * 1000.0;
+                                }
                                 on_complete(keep_alive);
                                 break;
                             }
