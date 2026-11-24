@@ -164,5 +164,23 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(pac_test).step);
 
+    const policy_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/z_policy/policy_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(policy_test).step);
+
+    const ws_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/z_websocket/websocket_protocol.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ws_test).step);
+
     _ = cargo_build;
 }

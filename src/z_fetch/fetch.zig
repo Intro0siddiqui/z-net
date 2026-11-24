@@ -2,14 +2,12 @@
 const std = @import("std");
 const bridge = @import("z_network_bridge");
 const cache = @import("z_cache");
-const storage = @import("z_storage");
 const quic = @import("z_quic");
 const webtransport = @import("z_webtransport");
 
 pub const Fetch = struct {
     engine: *bridge.NetworkEngine,
     http_cache: ?*cache.HttpCache = null,
-    cookie_api: ?*storage.CookieAPI = null,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, engine: *bridge.NetworkEngine) !Fetch {
@@ -20,12 +18,6 @@ pub const Fetch = struct {
     }
 
     pub fn get(self: *Fetch, url: []const u8, options: bridge.FetchOptions) !bridge.FetchHandle {
-        // Integrate Cookie Jar
-        if (self.cookie_api) |api| {
-            const cookies = api.getCookiesForUrl(url, std.mem.span(options.top_level_site), std.mem.span(options.origin));
-            defer cookies.deinit();
-        }
-
         if (self.http_cache) |hcache| {
             _ = hcache;
         }

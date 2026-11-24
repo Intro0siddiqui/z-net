@@ -1,7 +1,10 @@
 .zig-cache/
+zig-cache/
 zig-out/
 engine/target/
 *.o
+*.log
+rust_net/
 js_runtime_native
 js_runtime_znet
 high_perf_server

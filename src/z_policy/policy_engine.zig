@@ -54,6 +54,10 @@ pub const Origin = struct {
         };
     }
     
+    pub fn toUrl(self: Origin, allocator: Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}://{s}:{d}", .{ self.scheme, self.host, self.port });
+    }
+    
     pub fn isSameOrigin(self: Origin, other: Origin) bool {
         return std.mem.eql(u8, self.scheme, other.scheme) and
                std.mem.eql(u8, self.host, other.host) and
@@ -598,8 +602,8 @@ pub const PolicyError = error{
 
 test "origin parsing" {
     const origin = try Origin.parse("https://example.com:443/path");
-    try std.testing.expectEqual(@as([]const u8, "https"), origin.scheme);
-    try std.testing.expectEqual(@as([]const u8, "example.com"), origin.host);
+    try std.testing.expectEqualStrings("https", origin.scheme);
+    try std.testing.expectEqualStrings("example.com", origin.host);
     try std.testing.expectEqual(@as(u16, 443), origin.port);
 }
 

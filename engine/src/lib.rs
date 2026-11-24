@@ -381,12 +381,11 @@ impl NetEngine {
         #[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
         
-        // Setup default TLS config with ALPN for HTTP/1.1 streaming and full session resumption
-        // Note: HTTP/1.1 is pinned until full HTTP/2 multiplexed streaming is wired into execute_streaming
+        // Setup default TLS config with ALPN for HTTP/2 and HTTP/1.1 streaming and full session resumption
         let mut config = ClientConfig::builder()
             .with_root_certificates(root_store())
             .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         config.resumption = rustls::client::Resumption::in_memory_sessions(1024);
         config.enable_early_data = true;
             
@@ -874,6 +873,7 @@ pub extern "C" fn net_http_execute(
             }
 
             let mut body_vec = resp.body;
+            body_vec.shrink_to_fit();
             let body_len = body_vec.len();
             let body_ptr = if body_len > 0 {
                 let p = body_vec.as_mut_ptr();
@@ -883,6 +883,8 @@ pub extern "C" fn net_http_execute(
                 std::ptr::null_mut()
             };
 
+            name_ptrs.shrink_to_fit();
+            val_ptrs.shrink_to_fit();
             let names_slice = name_ptrs.leak();
             let vals_slice = val_ptrs.leak();
 
@@ -1842,12 +1844,12 @@ mod tests {
     }
 
     #[test]
-    fn engine_configures_alpn_for_http11() {
+    fn engine_configures_alpn_for_h2_and_http11() {
         let engine = NetEngine::new().expect("engine must initialize");
         assert_eq!(
             engine.tls_config.alpn_protocols,
-            vec![b"http/1.1".to_vec()],
-            "ALPN must negotiate http/1.1 for streaming engine"
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "ALPN must negotiate h2 and http/1.1 for streaming engine"
         );
     }
 

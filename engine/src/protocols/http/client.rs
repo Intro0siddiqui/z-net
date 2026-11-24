@@ -239,7 +239,7 @@ impl HttpClientEngine {
         let mut stream = if let Some(pooled) = self.pool.get(&pool_key) {
             pooled.socket
         } else {
-            let tcp = match proxy_rule.scheme {
+            let mut tcp = match proxy_rule.scheme {
                 ProxyScheme::Direct => {
                     Self::connect_tcp(&self.dns_resolver, &host, port, options.timeout)?
                 }
@@ -265,8 +265,78 @@ impl HttpClientEngine {
                     .map_err(|e| format!("Invalid TLS server name: {}", e))?
                     .to_owned();
 
-                let tls_conn = ClientConnection::new(self.tls_config.clone(), server_name)
+                let mut tls_conn = ClientConnection::new(self.tls_config.clone(), server_name)
                     .map_err(|e| format!("TLS handshake init failed: {}", e))?;
+
+                while tls_conn.is_handshaking() {
+                    tls_conn.complete_io(&mut tcp)
+                        .map_err(|e| format!("TLS handshake failed: {}", e))?;
+                }
+
+                let alpn = tls_conn.alpn_protocol().map(|s| s.to_vec());
+                if alpn.as_deref() == Some(b"h2") {
+                    let _ = tcp.set_nonblocking(true);
+                    let tokio_tcp = tokio::net::TcpStream::from_std(tcp)
+                        .map_err(|e| format!("Failed to create tokio TcpStream for h2: {}", e))?;
+                    let async_tls = super::h2::AsyncTlsStream::new(tls_conn, tokio_tcp);
+
+                    // Preload matching cookies from RFC 6265 CookieJar and merge with request headers
+                    let mut h2_options = options.clone();
+                    let mut cookie_map: HashMap<String, String> = HashMap::new();
+                    if let Some(cookie_val) = self.cookie_jar.get_cookie_header(options.session_id, &parsed_url) {
+                        for part in cookie_val.split(';') {
+                            let trimmed = part.trim();
+                            if let Some((ck, cv)) = trimmed.split_once('=') {
+                                cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                            }
+                        }
+                    }
+                    for (k, v) in &options.headers {
+                        if k.eq_ignore_ascii_case("cookie") {
+                            for part in v.split(';') {
+                                let trimmed = part.trim();
+                                if let Some((ck, cv)) = trimmed.split_once('=') {
+                                    cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                    if !cookie_map.is_empty() {
+                        let mut cookie_pairs: Vec<String> = cookie_map
+                            .into_iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect();
+                        cookie_pairs.sort();
+                        h2_options.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+                        h2_options.headers.push(("cookie".to_string(), cookie_pairs.join("; ")));
+                    }
+
+                    let cookie_jar = self.cookie_jar.clone();
+                    let alt_svc_registry = self.alt_svc_registry.clone();
+                    let session_id = options.session_id;
+                    let parsed_url_clone = parsed_url.clone();
+                    let host_clone = host.clone();
+
+                    return super::h2::Http2Client::execute_streaming(
+                        async_tls,
+                        &h2_options,
+                        body_ring,
+                        move |status, reason, headers| {
+                            for (k, v) in headers {
+                                if k.eq_ignore_ascii_case("set-cookie") {
+                                    cookie_jar.process_set_cookie(session_id, &parsed_url_clone, v);
+                                }
+                                if k.eq_ignore_ascii_case("alt-svc") {
+                                    alt_svc_registry.insert(&host_clone, port, v);
+                                }
+                            }
+                            on_headers(status, reason, headers);
+                        },
+                        on_data_chunk,
+                        on_complete,
+                        is_cancelled,
+                    );
+                }
 
                 ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp)))
             } else {

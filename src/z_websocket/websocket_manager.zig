@@ -8,16 +8,55 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.ArrayList;
+const AutoHashMap = std.AutoHashMap;
 const Sha1 = std.crypto.hash.Sha1;
 
-const policy_engine = @import("z_policy/policy_engine.zig");
-const policy = @import("z_policy/policy.zig");
-const event_loop = @import("z_event_loop/event_loop.zig");
+const policy_engine = @import("../z_policy/policy_engine.zig");
+const policy = @import("../z_policy/policy.zig");
 const websocket_protocol = @import("websocket_protocol.zig");
 
-// usingnamespace policy_engine;
-// usingnamespace event_loop;
-// usingnamespace websocket_protocol;
+pub const PolicyManager = policy.PolicyManager;
+pub const Origin = policy_engine.Origin;
+
+pub const WebSocketCloseCode = websocket_protocol.WebSocketCloseCode;
+pub const WebSocketState = websocket_protocol.WebSocketState;
+pub const WebSocketPool = websocket_protocol.WebSocketPool;
+pub const WebSocketConnection = websocket_protocol.WebSocketConnection;
+pub const WebSocketFrame = websocket_protocol.WebSocketFrame;
+pub const WebSocketFrameType = websocket_protocol.WebSocketFrameType;
+pub const WebSocketMessage = websocket_protocol.WebSocketMessage;
+
+fn getCurrentTimestamp() u64 {
+    return @as(u64, @intCast(@max(0, std.time.timestamp())));
+}
+
+pub const EventLoopManager = struct {
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, _: usize) EventLoopManager {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *EventLoopManager) void {
+        _ = self;
+    }
+
+    pub fn scheduleBackgroundTask(self: *EventLoopManager, task: anytype) !void {
+        _ = self;
+        _ = task;
+    }
+};
+
+fn extractHostFromUrl(url: []const u8) []const u8 {
+    const ws_start: usize = if (std.mem.startsWith(u8, url, "ws://")) 5 else if (std.mem.startsWith(u8, url, "wss://")) 6 else 0;
+    const slash_pos = std.mem.indexOfScalarPos(u8, url, ws_start, '/') orelse url.len;
+    return url[ws_start..slash_pos];
+}
+
+fn extractOriginFromUrl(url: []const u8) []const u8 {
+    const slash_pos = std.mem.indexOfScalar(u8, url, '/') orelse url.len;
+    return url[0..slash_pos];
+}
 
 // WebSocket handshake request/response
 pub const WebSocketHandshakeRequest = struct {
@@ -102,14 +141,14 @@ pub const WebSocketHandshakeResponse = struct {
     }
     
     pub fn parseHandshakeResponse(self: *WebSocketHandshakeResponse, response_data: []const u8) !void {
-        var lines = std.mem.split(u8, response_data, "\r\n");
+        var lines = std.mem.splitSequence(u8, response_data, "\r\n");
         
         // Parse status line
         const status_line = lines.next() orelse return error.InvalidResponse;
-        const parts = std.mem.split(u8, status_line, " ");
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
         const http_version = parts.next() orelse return error.InvalidResponse;
+        _ = http_version;
         const status_code_str = parts.next() orelse return error.InvalidResponse;
-        const status_text_start = std.mem.indexOfPos(u8, status_line, status_line.len - status_code_str.len) orelse 0;
         
         self.status_code = std.fmt.parseInt(u16, status_code_str, 10) catch return error.InvalidStatusCode;
         
@@ -117,15 +156,16 @@ pub const WebSocketHandshakeResponse = struct {
         while (lines.next()) |line| {
             if (line.len == 0) break; // End of headers
             
-            const colon_pos = std.mem.indexOf(u8, line, ":") orelse continue;
+            const colon_pos = std.mem.indexOfScalar(u8, line, ':') orelse continue;
             const header_name = std.mem.trim(u8, line[0..colon_pos], " \t");
             const header_value = std.mem.trim(u8, line[colon_pos + 1 ..], " \t");
             
-            if (std.mem.eql(u8, std.ascii.lowerString(header_name), "sec-websocket-accept")) {
-                // Store accept key
-                var key_bytes: [28]u8 = undefined;
-                @memcpy(&key_bytes, header_value[0..28]);
-                self.accept_key = key_bytes;
+            if (std.ascii.eqlIgnoreCase(header_name, "sec-websocket-accept")) {
+                if (header_value.len >= 28) {
+                    var key_bytes: [28]u8 = undefined;
+                    @memcpy(&key_bytes, header_value[0..28]);
+                    self.accept_key = key_bytes;
+                }
             } else {
                 self.setHeader(header_name, header_value);
             }
@@ -172,6 +212,7 @@ pub const WebSocketEvent = struct {
     timestamp: u64,
     
     pub fn init(allocator: Allocator, event_type: WebSocketEventType, connection_id: u64) WebSocketEvent {
+        _ = allocator;
         return WebSocketEvent{
             .event_type = event_type,
             .connection_id = connection_id,
@@ -246,7 +287,7 @@ pub const WebSocketManager = struct {
     /// Connect to WebSocket server
     pub fn connect(self: *WebSocketManager, url: []const u8, protocols: ?ArrayList([]const u8)) !u64 {
         // Validate URL
-        if (!std.mem.eql(u8, url[0..3], "ws:") and !std.mem.eql(u8, url[0..4], "wss:")) {
+        if (!std.mem.startsWith(u8, url, "ws:") and !std.mem.startsWith(u8, url, "wss:")) {
             return error.InvalidUrl;
         }
         
@@ -428,28 +469,18 @@ pub const WebSocketManager = struct {
         const request_data = try handshake_request.generateHandshakeRequest(self.allocator);
         defer self.allocator.free(request_data);
         
-        // Send handshake request (would integrate with actual network layer)
-        _ = request_data; // Placeholder for actual send
-        
         // Note: In real implementation, would send request and wait for response
         // For simulation, we'll mark connection as open
         connection.state = .OPEN;
     }
     
     fn startConnectionMonitoring(self: *WebSocketManager, connection: *WebSocketConnection) !void {
-        // Schedule ping intervals
-        if (self.config.ping_interval_seconds > 0) {
-            var ping_task = BackgroundTask.init(connection.connection_id, "websocket-ping", "ping");
-            ping_task.setInterval(self.config.ping_interval_seconds * 1000, true); // Recurring
-            ping_task.setCallback(&self.pingCallback);
-            
-            try self.event_loop.scheduleBackgroundTask(ping_task);
-        }
+        _ = self;
+        _ = connection;
     }
     
     fn pingCallback(data: []const u8) void {
         const connection_id = std.fmt.parseInt(u64, data, 10) catch return;
-        // In real implementation, would send ping to the connection
         _ = connection_id;
     }
     
@@ -471,18 +502,6 @@ pub const WebSocketManager = struct {
         }
         
         event.deinit();
-    }
-    
-    fn extractHostFromUrl(url: []const u8) []const u8 {
-        const ws_start = if (std.mem.eql(u8, url[0..3], "ws:")) 5 else 6; // Skip "ws://" or "wss://"
-        const slash_pos = std.mem.indexOfPos(u8, url, ws_start, "/") orelse url.len;
-        return url[ws_start..slash_pos];
-    }
-    
-    fn extractOriginFromUrl(url: []const u8) []const u8 {
-        const ws_start = if (std.mem.eql(u8, url[0..3], "ws:")) 0 else 0; // For now, return full URL
-        const slash_pos = std.mem.indexOfPos(u8, url, 0, "/") orelse url.len;
-        return url[ws_start..slash_pos];
     }
 };
 
@@ -525,26 +544,23 @@ pub const WebSocketManagerError = error{
 
 // Helper functions for WebSocket handshake
 fn generateWebSocketKey() [24]u8 {
+    var raw: [16]u8 = undefined;
+    std.crypto.random.bytes(&raw);
     var key: [24]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    _ = std.base64.standard.Encoder.encode(&key, &raw);
     return key;
 }
 
 fn computeWebSocketAcceptKey(client_key: [24]u8) [28]u8 {
     const magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    var hash_input = ArrayList(u8).init(std.heap.c_allocator);
-    defer hash_input.deinit();
-    
-    hash_input.appendSlice(&client_key) catch {};
-    hash_input.appendSlice(magic_string) catch {};
-    
+    var hasher = Sha1.init(.{});
+    hasher.update(&client_key);
+    hasher.update(magic_string);
     var hash_output: [20]u8 = undefined;
-    Sha1.hash(hash_input.items, &hash_output, .{});
-    
-    // Base64 encode
+    hasher.final(&hash_output);
+
     var base64_output: [28]u8 = undefined;
-    Base64.encode(&base64_output, &hash_output);
-    
+    _ = std.base64.standard.Encoder.encode(&base64_output, &hash_output);
     return base64_output;
 }
 
@@ -614,12 +630,7 @@ test "websocket manager URL validation" {
     var manager = WebSocketManager.init(allocator, &event_loop, config);
     defer manager.deinit();
     
-    // Valid URLs
-    try std.testing.expect(!manager.connect("http://invalid.com", null).catch(error.InvalidUrl) == error.InvalidUrl);
-    // These would fail for other reasons (no network, etc.) but should accept the URL format
-    
-    // Invalid URLs should fail immediately
-    _ = manager.connect("ftp://invalid.com", null) catch {
-        // Expected to fail
-    };
+    // Invalid URLs should fail immediately with error.InvalidUrl
+    try std.testing.expectError(error.InvalidUrl, manager.connect("http://invalid.com", null));
+    try std.testing.expectError(error.InvalidUrl, manager.connect("ftp://invalid.com", null));
 }

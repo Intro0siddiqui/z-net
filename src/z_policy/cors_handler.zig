@@ -146,8 +146,21 @@ pub const CORSError = error{
 
 /// CORS Handler - Core Implementation
 pub const CORSHangler = struct {
+    pub const PreflightCacheContext = struct {
+        pub fn hash(self: @This(), key: PreflightCacheKey) u64 {
+            _ = self;
+            return key.hash();
+        }
+        pub fn eql(self: @This(), a: PreflightCacheKey, b: PreflightCacheKey) bool {
+            _ = self;
+            return a.eql(b);
+        }
+    };
+
+    pub const PreflightCacheMap = std.HashMap(PreflightCacheKey, CORSPreflightResponse, PreflightCacheContext, std.hash_map.default_max_load_percentage);
+
     allocator: Allocator,
-    preflight_cache: AutoHashMap(PreflightCacheKey, CORSPreflightResponse),
+    preflight_cache: PreflightCacheMap,
     allowed_origins: StringHashMap(bool),
     allowed_methods: StringHashMap(bool),
     allowed_headers: StringHashMap(bool),
@@ -175,7 +188,7 @@ pub const CORSHangler = struct {
     pub fn init(allocator: Allocator) CORSHangler {
         return CORSHangler{
             .allocator = allocator,
-            .preflight_cache = AutoHashMap(PreflightCacheKey, CORSPreflightResponse).init(allocator),
+            .preflight_cache = PreflightCacheMap.init(allocator),
             .allowed_origins = StringHashMap(bool).init(allocator),
             .allowed_methods = StringHashMap(bool).init(allocator),
             .allowed_headers = StringHashMap(bool).init(allocator),
@@ -199,18 +212,18 @@ pub const CORSHangler = struct {
         const method = @tagName(request.method);
         
         // Check if origin is allowed
-        if (!self.allowed_origins.get(origin) orelse false) {
+        if (!(self.allowed_origins.get(origin) orelse false)) {
             return CORSError.OriginMismatch;
         }
         
         // Check if method is allowed
-        if (!self.allowed_methods.get(method) orelse false) {
+        if (!(self.allowed_methods.get(method) orelse false)) {
             return CORSError.MethodNotAllowed;
         }
         
         // Check if headers are allowed
         for (request.headers.items) |header| {
-            if (!self.allowed_headers.get(header) orelse false) {
+            if (!(self.allowed_headers.get(header) orelse false)) {
                 return CORSError.HeaderNotAllowed;
             }
         }
@@ -253,7 +266,7 @@ pub const CORSHangler = struct {
         var result = ValidationResult.init(self.allocator);
         
         // Check origin
-        if (!self.allowed_origins.get(origin) orelse false) {
+        if (!(self.allowed_origins.get(origin) orelse false)) {
             result.allowed = false;
             result.reason = "Origin not allowed by CORS";
             return result;
@@ -410,7 +423,7 @@ pub const CORSHangler = struct {
         hasher.update(method);
         
         // Hash headers
-        var combined_headers = std.ArrayListUnmanaged(u8){};
+        var combined_headers: std.ArrayListUnmanaged(u8) = .empty;
         defer combined_headers.deinit(self.allocator);
         
         for (headers.items, 0..) |header, i| {

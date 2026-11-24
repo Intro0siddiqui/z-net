@@ -190,7 +190,9 @@ pub const RequestValidation = struct {
         }
         
         // Validate against CSP
-        var context = CSPValidationContext.init("<inline>", "script", document_origin.host);
+        const doc_url = try document_origin.toUrl(allocator);
+        defer allocator.free(doc_url);
+        var context = CSPValidationContext.init("<inline>", "script", doc_url);
         context.script_nonce = script_nonce;
         
         const csp_result = try validateInlineCSP(allocator, script_content, context);
@@ -400,7 +402,9 @@ fn validateCSPResource(allocator: Allocator, url: []const u8, content_type: []co
     var validator = CSPValidator.init(allocator);
     defer validator.deinit();
     
-    const context = CSPValidationContext.init(url, content_type, origin.host);
+    const doc_url = try origin.toUrl(allocator);
+    defer allocator.free(doc_url);
+    const context = CSPValidationContext.init(url, content_type, doc_url);
     const csp_res = try validator.validateResource(context);
     var res = ValidationResult.init(allocator);
     res.allowed = csp_res.allowed;
