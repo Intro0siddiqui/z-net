@@ -16,6 +16,12 @@ pub struct DnsRecord {
     pub addr: IpAddr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeOutcome {
+    Success(Vec<DnsRecord>),
+    Truncated,
+}
+
 pub struct DnsWireCodec;
 
 impl DnsWireCodec {
@@ -48,6 +54,76 @@ impl DnsWireCodec {
         buf
     }
 
+    /// Encode a DNS query with EDNS0 OPT RR for larger UDP payloads (RFC 6891).
+    pub fn encode_query_with_edns(
+        id: u16,
+        hostname: &str,
+        record_type: DnsRecordType,
+        buf_size: u16,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(80);
+
+        // Header (12 bytes)
+        buf.extend_from_slice(&id.to_be_bytes()); // ID
+        buf.extend_from_slice(&0x0100u16.to_be_bytes()); // Flags: RD (Recursion Desired)
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT: 1
+        buf.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT: 0
+        buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT: 0
+        buf.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT: 1 (EDNS0 OPT RR)
+
+        // Question: QNAME
+        for label in hostname.split('.') {
+            if label.is_empty() {
+                continue;
+            }
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0x00); // Root label null terminator
+
+        // QTYPE and QCLASS
+        buf.extend_from_slice(&(record_type as u16).to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS: IN (1)
+
+        // EDNS0 OPT Pseudo-RR (11 bytes)
+        buf.push(0x00); // NAME: root
+        buf.extend_from_slice(&41u16.to_be_bytes()); // TYPE: OPT (41)
+        buf.extend_from_slice(&buf_size.to_be_bytes()); // CLASS: UDP payload size (e.g. 1232)
+        buf.extend_from_slice(&0u32.to_be_bytes()); // Extended RCODE (0) + Version (0) + Flags (0)
+        buf.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH: 0
+
+        buf
+    }
+
+    /// Decode DNS response wireformat data with transaction ID and truncation checks.
+    pub fn decode_response_checked(
+        data: &[u8],
+        expected_id: u16,
+    ) -> Result<DecodeOutcome, String> {
+        if data.len() < 12 {
+            return Err("DNS response too short for header".to_string());
+        }
+
+        let resp_id = u16::from_be_bytes([data[0], data[1]]);
+        if resp_id != expected_id {
+            return Err(format!("DNS TXID mismatch: expected {}, got {}", expected_id, resp_id));
+        }
+
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        let rcode = flags & 0x000F;
+        if rcode != 0 {
+            return Err(format!("DNS server returned error code RCODE: {}", rcode));
+        }
+
+        // TC (Truncation) flag is bit 9 (0x0200)
+        if (flags & 0x0200) != 0 {
+            return Ok(DecodeOutcome::Truncated);
+        }
+
+        let records = Self::decode_answers(data)?;
+        Ok(DecodeOutcome::Success(records))
+    }
+
     /// Decode DNS response wireformat data and extract resolved IP addresses.
     pub fn decode_response(data: &[u8]) -> Result<Vec<DnsRecord>, String> {
         if data.len() < 12 {
@@ -60,6 +136,10 @@ impl DnsWireCodec {
             return Err(format!("DNS server returned error code RCODE: {}", rcode));
         }
 
+        Self::decode_answers(data)
+    }
+
+    fn decode_answers(data: &[u8]) -> Result<Vec<DnsRecord>, String> {
         let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
         let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
 
@@ -262,5 +342,36 @@ mod tests {
         assert_eq!(records[0].record_type, DnsRecordType::A);
         assert_eq!(records[0].ttl, 300);
         assert_eq!(records[0].addr, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
+
+    #[test]
+    fn test_encode_dns_query_with_edns() {
+        let encoded = DnsWireCodec::encode_query_with_edns(0x5678, "doc.rust-lang.org", DnsRecordType::A, 1232);
+        // ID: 0x5678
+        assert_eq!(&encoded[0..2], &0x5678u16.to_be_bytes());
+        // ARCOUNT: 1
+        assert_eq!(&encoded[10..12], &1u16.to_be_bytes());
+        // Ends with OPT record (11 bytes): 0x00, 0x0029, 0x04D0, 0x00000000, 0x0000
+        let len = encoded.len();
+        assert_eq!(encoded[len - 11], 0); // Root name
+        assert_eq!(&encoded[len - 10..len - 8], &41u16.to_be_bytes()); // OPT
+        assert_eq!(&encoded[len - 8..len - 6], &1232u16.to_be_bytes()); // 1232 bytes buffer
+    }
+
+    #[test]
+    fn test_decode_response_checked_txid_and_truncation() {
+        // 1. TXID mismatch test
+        let mut res = vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let err = DnsWireCodec::decode_response_checked(&res, 0x9999);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("TXID mismatch"));
+
+        // 2. Truncation (TC bit set: 0x8380 or 0x8200)
+        res[0] = 0x99;
+        res[1] = 0x99;
+        res[2] = 0x83; // 0x8200 | ... (TC bit set)
+        res[3] = 0x80;
+        let outcome = DnsWireCodec::decode_response_checked(&res, 0x9999).expect("decode checked");
+        assert_eq!(outcome, DecodeOutcome::Truncated);
     }
 }

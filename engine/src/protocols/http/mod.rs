@@ -1,4 +1,5 @@
 pub mod alt_svc;
+pub mod cache;
 pub mod client;
 pub mod cookie_jar;
 pub mod h1;

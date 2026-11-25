@@ -149,6 +149,8 @@ impl Write for ActiveStream {
 pub struct HttpClientEngine {
     tls_config: Arc<ClientConfig>,
     pool: ConnectionPool<ActiveStream>,
+    h2_pool: ConnectionPool<super::h2::H2Session<ActiveStream>>,
+    pub http_cache: super::cache::HttpCache,
     pub cookie_jar: Arc<CookieJar>,
     pub proxy_config: Option<ProxyConfig>,
     pub alt_svc_registry: Arc<AltSvcRegistry>,
@@ -164,6 +166,8 @@ impl HttpClientEngine {
         Self {
             tls_config,
             pool: ConnectionPool::new(6, Duration::from_secs(60)),
+            h2_pool: ConnectionPool::new(4, Duration::from_secs(60)),
+            http_cache: super::cache::HttpCache::new(512, 4 * 1024 * 1024),
             cookie_jar: Arc::new(CookieJar::new()),
             proxy_config: Some(ProxyConfig::from_env()),
             alt_svc_registry: Arc::new(AltSvcRegistry::new()),
@@ -207,7 +211,127 @@ impl HttpClientEngine {
     /// Clear pooled connections and cookies for a specific session.
     pub fn clear_session(&mut self, session_id: u64) {
         self.pool.clear_session(session_id);
+        self.h2_pool.clear_session(session_id);
+        self.http_cache.clear_session(session_id);
         self.cookie_jar.clear_session(session_id);
+    }
+
+    fn prepare_h2_options(
+        cookie_jar: &CookieJar,
+        options: &HttpRequestOptions,
+        parsed_url: &Url,
+    ) -> HttpRequestOptions {
+        let mut h2_options = options.clone();
+        let mut cookie_map: HashMap<String, String> = HashMap::new();
+        if let Some(cookie_val) = cookie_jar.get_cookie_header(options.session_id, parsed_url) {
+            for part in cookie_val.split(';') {
+                let trimmed = part.trim();
+                if let Some((ck, cv)) = trimmed.split_once('=') {
+                    cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                }
+            }
+        }
+        for (k, v) in &options.headers {
+            if k.eq_ignore_ascii_case("cookie") {
+                for part in v.split(';') {
+                    let trimmed = part.trim();
+                    if let Some((ck, cv)) = trimmed.split_once('=') {
+                        cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                    }
+                }
+            }
+        }
+        if !cookie_map.is_empty() {
+            let mut cookie_pairs: Vec<String> = cookie_map
+                .into_iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            cookie_pairs.sort();
+            h2_options.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+            h2_options.headers.push(("cookie".to_string(), cookie_pairs.join("; ")));
+        }
+        h2_options
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_h2_session<H, D, C, K>(
+        cookie_jar: &Arc<CookieJar>,
+        alt_svc_registry: &Arc<AltSvcRegistry>,
+        h2_pool: &mut ConnectionPool<super::h2::H2Session<ActiveStream>>,
+        mut h2_session: super::h2::H2Session<ActiveStream>,
+        pool_key: &PoolKey,
+        options: &HttpRequestOptions,
+        parsed_url: &Url,
+        host: &str,
+        port: u16,
+        body_ring: Option<&BodyRingDescriptor>,
+        perf: &mut PerfTelemetry,
+        on_headers: &mut H,
+        on_data_chunk: &mut D,
+        on_complete: &mut C,
+        is_cancelled: &mut K,
+    ) -> Result<bool, String>
+    where
+        H: FnMut(u16, &str, &[(String, String)]),
+        D: FnMut(&[u8]),
+        C: FnMut(bool),
+        K: FnMut() -> bool,
+    {
+        let h2_options = Self::prepare_h2_options(cookie_jar, options, parsed_url);
+        let cookie_jar = cookie_jar.clone();
+        let alt_svc_registry = alt_svc_registry.clone();
+        let session_id = options.session_id;
+        let parsed_url_clone = parsed_url.clone();
+        let host_clone = host.to_string();
+
+        let req_ready_at = Instant::now();
+        let headers_at = Cell::new(None::<Instant>);
+        let ttfb_ms_cell = Cell::new(0.0_f64);
+        let body_ms_cell = Cell::new(0.0_f64);
+        let status_cell = Cell::new(0_u16);
+
+        let headers_at_ref = &headers_at;
+        let ttfb_ms_ref = &ttfb_ms_cell;
+        let status_ref = &status_cell;
+        let headers_at_ref_2 = &headers_at;
+        let body_ms_ref = &body_ms_cell;
+
+        let res = h2_session.execute_request(
+            &h2_options,
+            body_ring,
+            |status, reason, headers| {
+                headers_at_ref.set(Some(Instant::now()));
+                ttfb_ms_ref.set(req_ready_at.elapsed().as_secs_f64() * 1000.0);
+                status_ref.set(status);
+                for (k, v) in headers {
+                    if k.eq_ignore_ascii_case("set-cookie") {
+                        cookie_jar.process_set_cookie(session_id, &parsed_url_clone, v);
+                    }
+                    if k.eq_ignore_ascii_case("alt-svc") {
+                        alt_svc_registry.insert(&host_clone, port, v);
+                    }
+                }
+                on_headers(status, reason, headers);
+            },
+            |chunk| on_data_chunk(chunk),
+            |keep_alive| {
+                if let Some(h_at) = headers_at_ref_2.get() {
+                    body_ms_ref.set(h_at.elapsed().as_secs_f64() * 1000.0);
+                }
+                on_complete(keep_alive);
+            },
+            || is_cancelled(),
+        );
+
+        perf.ttfb_ms = ttfb_ms_cell.get();
+        perf.body_ms = body_ms_cell.get();
+        perf.status = status_cell.get();
+
+        if res.is_ok() && h2_session.is_reusable() {
+            h2_pool.put(pool_key.clone(), h2_session, true);
+        }
+
+        res
     }
 
     /// Execute an HTTP request with progressive streaming and optional zero-copy BodyRing piping.
@@ -228,7 +352,169 @@ impl HttpClientEngine {
     }
 
     /// Execute an HTTP request with progressive streaming, zero-copy BodyRing, and early cancellation check.
+    /// Integrates in-memory HTTP caching (`Cache-Control` freshness + `ETag`/`Last-Modified` 304 revalidation).
     pub fn execute_streaming_with_cancel<H, D, C, K>(
+        &mut self,
+        options: &HttpRequestOptions,
+        body_ring: Option<&BodyRingDescriptor>,
+        mut on_headers: H,
+        mut on_data_chunk: D,
+        mut on_complete: C,
+        mut is_cancelled: K,
+    ) -> Result<bool, String>
+    where
+        H: FnMut(u16, &str, &[(String, String)]),
+        D: FnMut(&[u8]),
+        C: FnMut(bool),
+        K: FnMut() -> bool,
+    {
+        use super::cache::CacheLookup;
+
+        let mut is_revalidating = false;
+        let mut reval_options: Option<HttpRequestOptions> = None;
+
+        match self.http_cache.lookup(
+            options.session_id,
+            &options.method,
+            &options.url,
+            &options.headers,
+        ) {
+            CacheLookup::Fresh(entry) => {
+                if is_cancelled() {
+                    return Ok(false);
+                }
+                on_headers(entry.status, &entry.reason, &entry.headers);
+                if !entry.body.is_empty() {
+                    if let Some(ring) = body_ring {
+                        let mut offset = 0;
+                        while offset < entry.body.len() && !ring.is_closed.load(Ordering::Acquire) {
+                            if is_cancelled() {
+                                return Ok(true);
+                            }
+                            let written = ring.write_slice(&entry.body[offset..]);
+                            offset += written;
+                            if offset < entry.body.len() {
+                                ring.wait_drain(5);
+                            }
+                        }
+                    }
+                    on_data_chunk(&entry.body);
+                }
+                on_complete(true);
+                return Ok(true);
+            }
+            CacheLookup::Revalidate { etag, last_modified } => {
+                is_revalidating = true;
+                let mut opts = options.clone();
+                if let Some(tag) = etag {
+                    if !opts.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("if-none-match")) {
+                        opts.headers.push(("If-None-Match".to_string(), tag));
+                    }
+                }
+                if let Some(lm) = last_modified {
+                    if !opts.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("if-modified-since")) {
+                        opts.headers.push(("If-Modified-Since".to_string(), lm));
+                    }
+                }
+                reval_options = Some(opts);
+            }
+            CacheLookup::Miss => {}
+        }
+
+        let effective_opts = reval_options.as_ref().unwrap_or(options);
+        let should_capture = options.method.eq_ignore_ascii_case("GET")
+            && !options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+
+        let mut cap_status: u16 = 0;
+        let mut cap_reason = String::new();
+        let mut cap_headers: Vec<(String, String)> = Vec::new();
+        let mut cap_body: Vec<u8> = Vec::new();
+        let mut cap_overflow = false;
+        let got_304 = Cell::new(false);
+        const MAX_CACHE_CAPTURE: usize = 4 * 1024 * 1024;
+
+        let res = self.execute_streaming_uncached(
+            effective_opts,
+            body_ring,
+            |status, reason, headers| {
+                cap_status = status;
+                cap_reason = reason.to_string();
+                cap_headers = headers.to_vec();
+                if is_revalidating && status == 304 {
+                    got_304.set(true);
+                    return;
+                }
+                on_headers(status, reason, headers);
+            },
+            |chunk| {
+                if got_304.get() {
+                    return;
+                }
+                if should_capture && !cap_overflow {
+                    if cap_body.len() + chunk.len() <= MAX_CACHE_CAPTURE {
+                        cap_body.extend_from_slice(chunk);
+                    } else {
+                        cap_overflow = true;
+                        cap_body.clear();
+                        cap_body.shrink_to_fit();
+                    }
+                }
+                on_data_chunk(chunk);
+            },
+            |keep_alive| {
+                if got_304.get() {
+                    return;
+                }
+                on_complete(keep_alive);
+            },
+            is_cancelled,
+        );
+
+        if got_304.get() {
+            if let Some(refreshed) = self.http_cache.revalidate_304(
+                options.session_id,
+                &options.url,
+                &cap_headers,
+            ) {
+                on_headers(refreshed.status, &refreshed.reason, &refreshed.headers);
+                if !refreshed.body.is_empty() {
+                    if let Some(ring) = body_ring {
+                        let mut offset = 0;
+                        while offset < refreshed.body.len() && !ring.is_closed.load(Ordering::Acquire) {
+                            let written = ring.write_slice(&refreshed.body[offset..]);
+                            offset += written;
+                            if offset < refreshed.body.len() {
+                                ring.wait_drain(5);
+                            }
+                        }
+                    }
+                    on_data_chunk(&refreshed.body);
+                }
+                on_complete(true);
+                return Ok(true);
+            } else {
+                on_headers(cap_status, &cap_reason, &cap_headers);
+                on_complete(true);
+                return res;
+            }
+        }
+
+        if res.is_ok() && should_capture && !cap_overflow {
+            self.http_cache.store(
+                options.session_id,
+                &options.method,
+                &options.url,
+                cap_status,
+                &cap_reason,
+                &cap_headers,
+                cap_body,
+            );
+        }
+
+        res
+    }
+
+    fn execute_streaming_uncached<H, D, C, K>(
         &mut self,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
@@ -302,6 +588,7 @@ impl HttpClientEngine {
                 if let Ok(true) = Http3Client::execute_streaming(
                     &h3_host,
                     h3_port,
+                    &self.dns_resolver,
                     options,
                     body_ring,
                     &mut on_headers,
@@ -319,7 +606,38 @@ impl HttpClientEngine {
 
         let pool_key = PoolKey::new(options.session_id, &host, port, is_tls);
 
-        // 1. Check connection pool or establish new connection
+        // 0. Check pooled HTTP/2 sessions first (avoids TCP + TLS + H2 preface handshakes)
+        if let Some(pooled_h2) = self.h2_pool.get(&pool_key) {
+            perf.proto = "h2";
+            perf.reused = true;
+            match Self::execute_h2_session(
+                &self.cookie_jar,
+                &self.alt_svc_registry,
+                &mut self.h2_pool,
+                pooled_h2.socket,
+                &pool_key,
+                options,
+                &parsed_url,
+                &host,
+                port,
+                body_ring,
+                &mut perf,
+                &mut on_headers,
+                &mut on_data_chunk,
+                &mut on_complete,
+                &mut is_cancelled,
+            ) {
+                Ok(res) => return Ok(res),
+                Err(e) if perf.status != 0 => return Err(e),
+                Err(_) => {
+                    // Pooled H2 connection went stale before headers; fall through to fresh connection
+                    perf.reused = false;
+                    perf.proto = "h1";
+                }
+            }
+        }
+
+        // 1. Check HTTP/1.1 connection pool or establish new connection
         let mut stream = if let Some(pooled) = self.pool.get(&pool_key) {
             perf.reused = true;
             pooled.socket
@@ -377,89 +695,25 @@ impl HttpClientEngine {
                 let alpn = tls_conn.alpn_protocol().map(|s| s.to_vec());
                 if alpn.as_deref() == Some(b"h2") {
                     perf.proto = "h2";
-                    let tls_stream = StreamOwned::new(tls_conn, tcp);
-
-                    // Preload matching cookies from RFC 6265 CookieJar and merge with request headers
-                    let mut h2_options = options.clone();
-                    let mut cookie_map: HashMap<String, String> = HashMap::new();
-                    if let Some(cookie_val) = self.cookie_jar.get_cookie_header(options.session_id, &parsed_url) {
-                        for part in cookie_val.split(';') {
-                            let trimmed = part.trim();
-                            if let Some((ck, cv)) = trimmed.split_once('=') {
-                                cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
-                            }
-                        }
-                    }
-                    for (k, v) in &options.headers {
-                        if k.eq_ignore_ascii_case("cookie") {
-                            for part in v.split(';') {
-                                let trimmed = part.trim();
-                                if let Some((ck, cv)) = trimmed.split_once('=') {
-                                    cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
-                                }
-                            }
-                        }
-                    }
-                    if !cookie_map.is_empty() {
-                        let mut cookie_pairs: Vec<String> = cookie_map
-                            .into_iter()
-                            .map(|(k, v)| format!("{}={}", k, v))
-                            .collect();
-                        cookie_pairs.sort();
-                        h2_options.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
-                        h2_options.headers.push(("cookie".to_string(), cookie_pairs.join("; ")));
-                    }
-
-                    let cookie_jar = self.cookie_jar.clone();
-                    let alt_svc_registry = self.alt_svc_registry.clone();
-                    let session_id = options.session_id;
-                    let parsed_url_clone = parsed_url.clone();
-                    let host_clone = host.clone();
-
-                    let req_ready_at = Instant::now();
-                    let headers_at = Cell::new(None::<Instant>);
-                    let ttfb_ms_cell = Cell::new(0.0_f64);
-                    let body_ms_cell = Cell::new(0.0_f64);
-                    let status_cell = Cell::new(0_u16);
-
-                    let headers_at_ref = &headers_at;
-                    let ttfb_ms_ref = &ttfb_ms_cell;
-                    let status_ref = &status_cell;
-                    let headers_at_ref_2 = &headers_at;
-                    let body_ms_ref = &body_ms_cell;
-
-                    let res = super::h2::Http2Client::execute_streaming(
-                        tls_stream,
-                        &h2_options,
+                    let tls_stream = ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp)));
+                    let h2_session = super::h2::H2Session::new(tls_stream)?;
+                    return Self::execute_h2_session(
+                        &self.cookie_jar,
+                        &self.alt_svc_registry,
+                        &mut self.h2_pool,
+                        h2_session,
+                        &pool_key,
+                        options,
+                        &parsed_url,
+                        &host,
+                        port,
                         body_ring,
-                        move |status, reason, headers| {
-                            headers_at_ref.set(Some(Instant::now()));
-                            ttfb_ms_ref.set(req_ready_at.elapsed().as_secs_f64() * 1000.0);
-                            status_ref.set(status);
-                            for (k, v) in headers {
-                                if k.eq_ignore_ascii_case("set-cookie") {
-                                    cookie_jar.process_set_cookie(session_id, &parsed_url_clone, v);
-                                }
-                                if k.eq_ignore_ascii_case("alt-svc") {
-                                    alt_svc_registry.insert(&host_clone, port, v);
-                                }
-                            }
-                            on_headers(status, reason, headers);
-                        },
-                        on_data_chunk,
-                        move |keep_alive| {
-                            if let Some(h_at) = headers_at_ref_2.get() {
-                                body_ms_ref.set(h_at.elapsed().as_secs_f64() * 1000.0);
-                            }
-                            on_complete(keep_alive);
-                        },
-                        is_cancelled,
+                        &mut perf,
+                        &mut on_headers,
+                        &mut on_data_chunk,
+                        &mut on_complete,
+                        &mut is_cancelled,
                     );
-
-                    perf.ttfb_ms = ttfb_ms_cell.get();
-                    perf.body_ms = body_ms_cell.get();
-                    perf.status = status_cell.get();
-                    return res;
                 }
 
                 ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp)))

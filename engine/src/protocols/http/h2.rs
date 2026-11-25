@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use h2_sans_io::{
-    H2Codec, H2Event, H2Header, HpackDecoder, HpackEncoder, CONNECTION_PREFACE,
+    settings_id, H2Codec, H2Event, H2Header, HpackDecoder, HpackEncoder, CONNECTION_PREFACE,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use url::Url;
@@ -113,12 +113,55 @@ fn is_hop_by_hop_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("host")
 }
 
-pub struct Http2Client;
+/// Persistent HTTP/2 connection session that can be pooled and reused across multiple
+/// sequential requests on the same origin without repeating TCP/TLS/H2 handshakes.
+pub struct H2Session<S> {
+    pub stream: S,
+    pub codec: H2Codec,
+    pub encoder: HpackEncoder,
+    pub decoder: HpackDecoder,
+    pub next_stream_id: u32,
+    pub peer_max_frame_size: u32,
+    pub goaway_received: bool,
+}
 
-impl Http2Client {
-    /// Execute an HTTP/2 request with progressive streaming using `h2-sans-io` (zero async runtime).
-    pub fn execute_streaming<S, H, D, C, K>(
-        mut stream: S,
+impl<S: Read + Write> H2Session<S> {
+    /// Initialize a new HTTP/2 session by sending the client connection preface and initial SETTINGS.
+    pub fn new(mut stream: S) -> Result<Self, String> {
+        stream
+            .write_all(CONNECTION_PREFACE)
+            .map_err(|e| format!("h2 preface write failed: {}", e))?;
+        stream
+            .write_all(&H2Codec::create_settings_with_window(1024 * 1024))
+            .map_err(|e| format!("h2 settings write failed: {}", e))?;
+        stream
+            .write_all(&H2Codec::create_window_update(0, 1024 * 1024))
+            .map_err(|e| format!("h2 window update write failed: {}", e))?;
+        stream
+            .flush()
+            .map_err(|e| format!("h2 preface flush failed: {}", e))?;
+
+        let mut codec = H2Codec::new();
+        codec.set_preface_received(true);
+
+        Ok(Self {
+            stream,
+            codec,
+            encoder: HpackEncoder::new(),
+            decoder: HpackDecoder::new(),
+            next_stream_id: 1,
+            peer_max_frame_size: 16384,
+            goaway_received: false,
+        })
+    }
+
+    pub fn is_reusable(&self) -> bool {
+        !self.goaway_received && self.next_stream_id < u32::MAX - 2
+    }
+
+    /// Execute a single HTTP/2 request/response stream on this persistent session.
+    pub fn execute_request<H, D, C, K>(
+        &mut self,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         mut on_headers: H,
@@ -127,12 +170,15 @@ impl Http2Client {
         mut is_cancelled: K,
     ) -> Result<bool, String>
     where
-        S: Read + Write,
         H: FnMut(u16, &str, &[(String, String)]),
         D: FnMut(&[u8]),
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
+        if self.goaway_received {
+            return Err("h2 session received GOAWAY".to_string());
+        }
+
         let parsed_url = Url::parse(&options.url)
             .map_err(|e| format!("Invalid URL for h2: {}", e))?;
         let scheme = parsed_url.scheme();
@@ -173,46 +219,33 @@ impl Http2Client {
             h2_headers.push(H2Header::new("accept-encoding", "gzip, deflate, br, zstd"));
         }
 
-        let mut encoder = HpackEncoder::new();
-        let header_block = encoder.encode(&h2_headers);
+        let header_block = self.encoder.encode(&h2_headers);
 
-        // 2. Send client connection preface, SETTINGS, connection window update, and request frames
-        stream
-            .write_all(CONNECTION_PREFACE)
-            .map_err(|e| format!("h2 preface write failed: {}", e))?;
-        stream
-            .write_all(&H2Codec::create_settings_with_window(1024 * 1024))
-            .map_err(|e| format!("h2 settings write failed: {}", e))?;
-        stream
-            .write_all(&H2Codec::create_window_update(0, 1024 * 1024))
-            .map_err(|e| format!("h2 window update write failed: {}", e))?;
+        // 2. Allocate stream ID and send request HEADERS (+ optional DATA) frames
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.saturating_add(2);
 
-        let stream_id: u32 = 1;
-        let max_frame_size: u32 = 16384;
+        let max_frame_size = self.peer_max_frame_size;
         let has_body = options.body.as_ref().map_or(false, |b| !b.is_empty());
         for frame in H2Codec::create_headers_frames(stream_id, &header_block, !has_body, max_frame_size) {
-            stream
+            self.stream
                 .write_all(&frame)
                 .map_err(|e| format!("h2 headers write failed: {}", e))?;
         }
         if let Some(ref body) = options.body {
             if !body.is_empty() {
                 for frame in H2Codec::create_data_frames(stream_id, body, true, max_frame_size) {
-                    stream
+                    self.stream
                         .write_all(&frame)
                         .map_err(|e| format!("h2 data write failed: {}", e))?;
                 }
             }
         }
-        stream
+        self.stream
             .flush()
             .map_err(|e| format!("h2 flush failed: {}", e))?;
 
         // 3. Progressive frame read & decode loop
-        let mut codec = H2Codec::new();
-        codec.set_preface_received(true);
-        let mut decoder = HpackDecoder::new();
-
         let mut read_buf = [0u8; 16384];
         let mut headers_dispatched = false;
         let mut stream_ended = false;
@@ -220,20 +253,23 @@ impl Http2Client {
 
         while !stream_ended {
             if is_cancelled() {
+                self.goaway_received = true;
                 return Ok(headers_dispatched);
             }
 
             if let Some(ring) = body_ring {
                 while ring.should_stop_reading() && !ring.is_closed.load(Ordering::Acquire) {
                     if is_cancelled() {
+                        self.goaway_received = true;
                         return Ok(headers_dispatched);
                     }
                     ring.wait_drain(5);
                 }
             }
 
-            let n = match stream.read(&mut read_buf) {
+            let n = match self.stream.read(&mut read_buf) {
                 Ok(0) => {
+                    self.goaway_received = true;
                     if headers_dispatched {
                         break;
                     }
@@ -244,31 +280,47 @@ impl Http2Client {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     continue;
                 }
-                Err(e) => return Err(format!("h2 read error: {}", e)),
+                Err(e) => {
+                    self.goaway_received = true;
+                    return Err(format!("h2 read error: {}", e));
+                }
             };
 
-            let events = codec
+            let events = self
+                .codec
                 .process(&read_buf[..n])
-                .map_err(|e| format!("h2 frame decode error: {}", e))?;
+                .map_err(|e| {
+                    self.goaway_received = true;
+                    format!("h2 frame decode error: {}", e)
+                })?;
 
             for event in events {
                 match event {
-                    H2Event::Settings { ack: false, .. } => {
-                        let _ = stream.write_all(&H2Codec::create_settings_ack());
-                        let _ = stream.flush();
+                    H2Event::Settings { ack: false, settings } => {
+                        for (id, val) in settings {
+                            if id == settings_id::MAX_FRAME_SIZE && val >= 16384 && val <= 16_777_215 {
+                                self.peer_max_frame_size = val;
+                            }
+                        }
+                        let _ = self.stream.write_all(&H2Codec::create_settings_ack());
+                        let _ = self.stream.flush();
                     }
                     H2Event::Ping { ack: false, data } => {
-                        let _ = stream.write_all(&H2Codec::create_ping_ack(data));
-                        let _ = stream.flush();
+                        let _ = self.stream.write_all(&H2Codec::create_ping_ack(data));
+                        let _ = self.stream.flush();
                     }
                     H2Event::Headers {
                         stream_id: ev_sid,
                         header_block,
                         end_stream,
                     } if ev_sid == stream_id => {
-                        let decoded = decoder
+                        let decoded = self
+                            .decoder
                             .decode(&header_block)
-                            .map_err(|e| format!("h2 HPACK decode error: {}", e))?;
+                            .map_err(|e| {
+                                self.goaway_received = true;
+                                format!("h2 HPACK decode error: {}", e)
+                            })?;
 
                         let mut status: u16 = 200;
                         let mut headers_vec = Vec::with_capacity(decoded.len());
@@ -284,7 +336,6 @@ impl Http2Client {
                             }
                         }
 
-                        // Skip 1xx informational headers
                         if (100..200).contains(&status) {
                             continue;
                         }
@@ -334,9 +385,9 @@ impl Http2Client {
                     } if ev_sid == stream_id => {
                         if !data.is_empty() {
                             let len_u32 = data.len() as u32;
-                            let _ = stream.write_all(&H2Codec::create_window_update(0, len_u32));
-                            let _ = stream.write_all(&H2Codec::create_window_update(stream_id, len_u32));
-                            let _ = stream.flush();
+                            let _ = self.stream.write_all(&H2Codec::create_window_update(0, len_u32));
+                            let _ = self.stream.write_all(&H2Codec::create_window_update(stream_id, len_u32));
+                            let _ = self.stream.flush();
 
                             if let Some(ref mut dec) = decompressor {
                                 dec.feed(&data, |decompressed_slice| {
@@ -364,6 +415,7 @@ impl Http2Client {
                         return Err(format!("h2 stream reset (error code {})", error_code));
                     }
                     H2Event::GoAway { error_code, .. } => {
+                        self.goaway_received = true;
                         if !headers_dispatched {
                             return Err(format!("h2 GOAWAY before headers (error code {})", error_code));
                         }
@@ -386,6 +438,38 @@ impl Http2Client {
 
         on_complete(true);
         Ok(headers_dispatched)
+    }
+}
+
+pub struct Http2Client;
+
+impl Http2Client {
+    /// Execute an HTTP/2 request with progressive streaming using `h2-sans-io` (zero async runtime).
+    pub fn execute_streaming<S, H, D, C, K>(
+        stream: S,
+        options: &HttpRequestOptions,
+        body_ring: Option<&BodyRingDescriptor>,
+        on_headers: H,
+        on_data_chunk: D,
+        on_complete: C,
+        is_cancelled: K,
+    ) -> Result<bool, String>
+    where
+        S: Read + Write,
+        H: FnMut(u16, &str, &[(String, String)]),
+        D: FnMut(&[u8]),
+        C: FnMut(bool),
+        K: FnMut() -> bool,
+    {
+        let mut session = H2Session::new(stream)?;
+        session.execute_request(
+            options,
+            body_ring,
+            on_headers,
+            on_data_chunk,
+            on_complete,
+            is_cancelled,
+        )
     }
 }
 
@@ -605,5 +689,91 @@ mod tests {
         assert!(!got_headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn test_h2_session_reuse_multiple_streams() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local h2 reuse server");
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut codec = H2Codec::new();
+            let mut enc = HpackEncoder::new();
+            let mut buf = [0u8; 4096];
+            let mut handled = 0;
+
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                let events = codec.process(&buf[..n]).expect("server decode");
+                for ev in events {
+                    if let H2Event::Settings { ack: false, .. } = ev {
+                        conn.write_all(&H2Codec::create_settings()).unwrap();
+                        conn.write_all(&H2Codec::create_settings_ack()).unwrap();
+                        conn.flush().unwrap();
+                    } else if let H2Event::Headers { stream_id, .. } = ev {
+                        handled += 1;
+                        let resp_hdrs = vec![
+                            H2Header::new(":status", "200"),
+                            H2Header::new("content-type", "text/plain"),
+                        ];
+                        let block = enc.encode(&resp_hdrs);
+                        conn.write_all(&H2Codec::create_headers_frame(stream_id, &block, false))
+                            .unwrap();
+                        let payload = format!("stream-{}", stream_id);
+                        for f in H2Codec::create_data_frames(stream_id, payload.as_bytes(), true, 16384) {
+                            conn.write_all(&f).unwrap();
+                        }
+                        conn.flush().unwrap();
+                        if handled == 2 {
+                            let _ = conn.shutdown(Shutdown::Write);
+                            while conn.read(&mut buf).unwrap_or(0) > 0 {}
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let client_tcp = TcpStream::connect(addr).expect("connect");
+        let mut session = H2Session::new(client_tcp).expect("H2Session::new");
+        assert_eq!(session.next_stream_id, 1);
+
+        let mut body1 = Vec::new();
+        let opts1 = HttpRequestOptions::new("GET", &format!("http://{}/one", addr));
+        session
+            .execute_request(
+                &opts1,
+                None,
+                |status, _, _| assert_eq!(status, 200),
+                |c| body1.extend_from_slice(c),
+                |_| {},
+                || false,
+            )
+            .expect("first h2 stream");
+        assert_eq!(body1, b"stream-1");
+        assert_eq!(session.next_stream_id, 3);
+        assert!(session.is_reusable());
+
+        let mut body2 = Vec::new();
+        let opts2 = HttpRequestOptions::new("GET", &format!("http://{}/two", addr));
+        session
+            .execute_request(
+                &opts2,
+                None,
+                |status, _, _| assert_eq!(status, 200),
+                |c| body2.extend_from_slice(c),
+                |_| {},
+                || false,
+            )
+            .expect("second reused h2 stream");
+        assert_eq!(body2, b"stream-3");
+        assert_eq!(session.next_stream_id, 5);
+
+        drop(session);
+        server_thread.join().expect("server join");
     }
 }

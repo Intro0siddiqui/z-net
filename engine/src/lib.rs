@@ -361,7 +361,7 @@ fn load_pem_certs(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>>
 
 /// Build the client trust store from Mozilla's compiled-in root bundle
 /// supplemented by the host system's root certificates (/etc/ssl/certs/ca-certificates.crt).
-fn root_store() -> RootCertStore {
+pub(crate) fn root_store() -> RootCertStore {
     let mut store = RootCertStore::empty();
     store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for cert in load_pem_certs("/etc/ssl/certs/ca-certificates.crt") {
@@ -1254,7 +1254,7 @@ pub extern "C" fn net_http3_connect(
     // rely on QUIC's built-in certificate verification (which can be
     // enabled per-connection via `ClientConfig`).
     let provider = Arc::new(quinn_proto::rustls::crypto::ring::default_provider());
-    let roots = quinn_proto::rustls::RootCertStore::empty();
+    let roots = root_store();
     let rustls_client_config =
         quinn_proto::rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&quinn_proto::rustls::version::TLS13])

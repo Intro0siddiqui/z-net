@@ -6,7 +6,7 @@
 pub mod qpack;
 
 use std::io::ErrorKind;
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::UdpSocket;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +80,7 @@ impl Http3Client {
     pub fn execute_streaming<H, D, C, K>(
         host: &str,
         port: u16,
+        dns_resolver: &crate::protocols::dns::DnsResolver,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         mut on_headers: H,
@@ -94,12 +95,11 @@ impl Http3Client {
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
-        let addr_str = format!("{}:{}", host, port);
-        let server_addr = addr_str
-            .to_socket_addrs()
-            .map_err(|e| format!("DNS resolution failed for {}: {}", addr_str, e))?
-            .next()
-            .ok_or(format!("No address found for {}", addr_str))?;
+        let addrs = dns_resolver.resolve(host, port)?;
+        let server_addr = addrs
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| format!("No IPv4 address found for {}:{}", host, port))?;
 
         let socket = UdpSocket::bind("0.0.0.0:0")
             .map_err(|e| format!("UDP bind failed: {}", e))?;
@@ -111,7 +111,7 @@ impl Http3Client {
         let mut endpoint = quinn_proto::Endpoint::new(endpoint_config, None, false, None);
 
         let provider = Arc::new(quinn_proto::rustls::crypto::ring::default_provider());
-        let roots = quinn_proto::rustls::RootCertStore::empty();
+        let roots = crate::root_store();
         let mut rustls_client_config =
             quinn_proto::rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&quinn_proto::rustls::version::TLS13])
