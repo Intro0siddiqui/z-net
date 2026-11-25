@@ -22,14 +22,14 @@ impl QpackCodec {
         buf.push(0x00);
         buf.push(0x00);
 
-        // 2. Encode Pseudo-headers
+        // 2. Encode Pseudo-headers (RFC 9204 §4.5.2: 1 | T=1 | 6-bit static index => 0xC0 | idx)
         // :method
         if method.eq_ignore_ascii_case("GET") {
             // Static index 17: :method GET
-            buf.push(0x80 | 17);
+            buf.push(0xC0 | 17);
         } else if method.eq_ignore_ascii_case("POST") {
             // Static index 20: :method POST
-            buf.push(0x80 | 20);
+            buf.push(0xC0 | 20);
         } else {
             Self::encode_literal(&mut buf, ":method", method);
         }
@@ -37,10 +37,10 @@ impl QpackCodec {
         // :scheme
         if scheme.eq_ignore_ascii_case("https") {
             // Static index 22: :scheme https
-            buf.push(0x80 | 22);
+            buf.push(0xC0 | 22);
         } else if scheme.eq_ignore_ascii_case("http") {
             // Static index 23: :scheme http
-            buf.push(0x80 | 23);
+            buf.push(0xC0 | 23);
         } else {
             Self::encode_literal(&mut buf, ":scheme", scheme);
         }
@@ -51,7 +51,7 @@ impl QpackCodec {
         // :path
         if path == "/" {
             // Static index 1: :path /
-            buf.push(0x80 | 1);
+            buf.push(0xC0 | 1);
         } else {
             Self::encode_literal(&mut buf, ":path", path);
         }
@@ -62,7 +62,7 @@ impl QpackCodec {
             // Fast paths for common static headers
             if lower_name == "accept-encoding" && value == "gzip, deflate, br" {
                 // Static index 31
-                buf.push(0x80 | 31);
+                buf.push(0xC0 | 31);
             } else {
                 Self::encode_literal(&mut buf, &lower_name, value);
             }
@@ -104,114 +104,237 @@ impl QpackCodec {
         buf.push(val as u8);
     }
 
-    /// Decode QPACK encoded response headers into status code and header list.
+    /// Decode QPACK encoded response headers into status code and header list (RFC 9204 §4.5).
     pub fn decode_response_headers(data: &[u8]) -> Result<(u16, Vec<(String, String)>), String> {
         if data.len() < 2 {
             return Err("QPACK data too short for prefix".to_string());
         }
 
-        // Skip Required Insert Count & Delta Base (2 bytes)
-        let mut pos = 2;
+        let mut pos = 0;
+        // 1. Encoded Field Section Prefix (§4.5.1):
+        //    Required Insert Count (8-bit prefix) + S (1-bit) | Delta Base (7-bit prefix)
+        let _req_insert_count = Self::decode_prefix_int(data, &mut pos, 8)?;
+        let _delta_base = Self::decode_prefix_int(data, &mut pos, 7)?;
+
         let mut status_code: u16 = 200;
         let mut headers = Vec::new();
 
         while pos < data.len() {
             let b = data[pos];
             if b & 0x80 != 0 {
-                // Indexed Field Line (RFC 9204 Section 4.5.2)
-                let static_idx = b & 0x3F; // assuming T=1 (static table)
-                pos += 1;
-                match static_idx {
-                    24 => status_code = 100,
-                    25 => status_code = 200,
-                    26 => status_code = 204,
-                    27 => status_code = 206,
-                    28 => status_code = 304,
-                    29 => status_code = 400,
-                    30 => status_code = 403,
-                    31 => status_code = 404,
-                    32 => status_code = 425,
-                    33 => status_code = 429,
-                    34 => status_code = 500,
-                    35 => status_code = 502,
-                    36 => status_code = 503,
-                    _ => {}
+                // §4.5.2 Indexed Field Line: 1 | T | Index (6-bit prefix)
+                let is_static = (b & 0x40) != 0;
+                let idx = Self::decode_prefix_int(data, &mut pos, 6)? as usize;
+                if is_static {
+                    if let Some(&(name, val)) = STATIC_TABLE.get(idx) {
+                        if name == ":status" {
+                            if let Ok(st) = val.parse::<u16>() {
+                                status_code = st;
+                            }
+                        } else if !name.starts_with(':') {
+                            headers.push((name.to_string(), val.to_string()));
+                        }
+                    }
                 }
-            } else if b & 0x40 != 0 {
-                // Literal Field Line with Name Reference (Section 4.5.3)
-                // Skip or advance
-                pos += 1;
-            } else if b & 0x20 != 0 {
-                // Literal Field Line with Literal Name (Section 4.5.4)
-                let name_len_prefix = (b & 0x07) as usize;
-                pos += 1;
-                let name_len = if name_len_prefix == 7 {
-                    let (val, adv) = Self::decode_integer(&data[pos..])?;
-                    pos += adv;
-                    val as usize + 7
-                } else {
-                    name_len_prefix
-                };
-
-                if pos + name_len > data.len() {
-                    return Err("Unexpected EOF in QPACK name".to_string());
+            } else if b & 0xC0 == 0x40 {
+                // §4.5.4 Literal Field Line with Name Reference: 01 | N | T | NameIndex (4-bit prefix)
+                let is_static = (b & 0x10) != 0;
+                let name_idx = Self::decode_prefix_int(data, &mut pos, 4)? as usize;
+                let value = Self::decode_string(data, &mut pos, 7)?;
+                if is_static {
+                    if let Some(&(name, _)) = STATIC_TABLE.get(name_idx) {
+                        if name == ":status" {
+                            if let Ok(st) = value.parse::<u16>() {
+                                status_code = st;
+                            }
+                        } else if !name.starts_with(':') {
+                            headers.push((name.to_string(), value));
+                        }
+                    }
                 }
-                let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
-                pos += name_len;
-
-                if pos >= data.len() {
-                    return Err("Unexpected EOF in QPACK val prefix".to_string());
-                }
-                let val_prefix = (data[pos] & 0x7F) as usize;
-                pos += 1;
-                let val_len = if val_prefix == 127 {
-                    let (val, adv) = Self::decode_integer(&data[pos..])?;
-                    pos += adv;
-                    val as usize + 127
-                } else {
-                    val_prefix
-                };
-
-                if pos + val_len > data.len() {
-                    return Err("Unexpected EOF in QPACK val".to_string());
-                }
-                let value = String::from_utf8_lossy(&data[pos..pos + val_len]).to_string();
-                pos += val_len;
-
+            } else if b & 0xE0 == 0x20 {
+                // §4.5.6 Literal Field Line with Literal Name: 001 | N | H | NameLen (3-bit prefix)
+                let name = Self::decode_string(data, &mut pos, 3)?;
+                let value = Self::decode_string(data, &mut pos, 7)?;
                 if name == ":status" {
                     if let Ok(st) = value.parse::<u16>() {
                         status_code = st;
                     }
-                } else {
+                } else if !name.starts_with(':') {
                     headers.push((name, value));
                 }
+            } else if b & 0xF0 == 0x10 {
+                // §4.5.3 Indexed Field Line with Post-Base Index: 0001 | Index (4-bit prefix)
+                let _idx = Self::decode_prefix_int(data, &mut pos, 4)?;
             } else {
-                // Fallback advance
-                pos += 1;
+                // §4.5.5 Literal Field Line with Post-Base Name Reference: 0000 | N | NameIndex (3-bit prefix)
+                let _name_idx = Self::decode_prefix_int(data, &mut pos, 3)?;
+                let _value = Self::decode_string(data, &mut pos, 7)?;
             }
         }
 
         Ok((status_code, headers))
     }
 
-    fn decode_integer(slice: &[u8]) -> Result<(u64, usize), String> {
-        let mut val: u64 = 0;
-        let mut shift = 0;
-        let mut count = 0;
-        for &b in slice {
-            count += 1;
-            val |= ((b & 0x7F) as u64) << shift;
+    fn decode_prefix_int(data: &[u8], pos: &mut usize, prefix_bits: u8) -> Result<u64, String> {
+        if *pos >= data.len() {
+            return Err("Unexpected EOF in QPACK prefix integer".to_string());
+        }
+        let mask = ((1u16 << prefix_bits) - 1) as u8;
+        let mut val = (data[*pos] & mask) as u64;
+        *pos += 1;
+        if val < mask as u64 {
+            return Ok(val);
+        }
+        let mut shift = 0u32;
+        loop {
+            if *pos >= data.len() {
+                return Err("Incomplete integer in QPACK decode".to_string());
+            }
+            let b = data[*pos];
+            *pos += 1;
+            val = val
+                .checked_add(((b & 0x7F) as u64) << shift)
+                .ok_or_else(|| "Integer overflow in QPACK decode".to_string())?;
             if b & 0x80 == 0 {
-                return Ok((val, count));
+                return Ok(val);
             }
             shift += 7;
-            if shift >= 64 {
+            if shift >= 63 {
                 return Err("Integer overflow in QPACK decode".to_string());
             }
         }
-        Err("Incomplete integer in QPACK decode".to_string())
+    }
+
+    fn decode_string(data: &[u8], pos: &mut usize, prefix_bits: u8) -> Result<String, String> {
+        if *pos >= data.len() {
+            return Err("Unexpected EOF in QPACK string header".to_string());
+        }
+        let huffman = (data[*pos] & (1u8 << prefix_bits)) != 0;
+        let len = Self::decode_prefix_int(data, pos, prefix_bits)? as usize;
+        if *pos + len > data.len() {
+            return Err(format!(
+                "Unexpected EOF in QPACK string (need {} bytes, have {})",
+                len,
+                data.len() - *pos
+            ));
+        }
+        let slice = &data[*pos..*pos + len];
+        *pos += len;
+        if huffman {
+            let mut dec = fluke_hpack::huffman::HuffmanDecoder::new();
+            let decoded = dec
+                .decode(slice)
+                .map_err(|e| format!("QPACK Huffman decode error: {:?}", e))?;
+            Ok(String::from_utf8_lossy(&decoded).to_string())
+        } else {
+            Ok(String::from_utf8_lossy(slice).to_string())
+        }
     }
 }
+
+/// RFC 9204 Appendix A Static Table (99 entries, indices 0..98).
+const STATIC_TABLE: [(&str, &str); 99] = [
+    (":authority", ""),
+    (":path", "/"),
+    ("age", "0"),
+    ("content-disposition", ""),
+    ("content-length", "0"),
+    ("cookie", ""),
+    ("date", ""),
+    ("etag", ""),
+    ("if-modified-since", ""),
+    ("if-none-match", ""),
+    ("last-modified", ""),
+    ("link", ""),
+    ("location", ""),
+    ("referer", ""),
+    ("set-cookie", ""),
+    (":method", "CONNECT"),
+    (":method", "DELETE"),
+    (":method", "GET"),
+    (":method", "HEAD"),
+    (":method", "OPTIONS"),
+    (":method", "POST"),
+    (":method", "PUT"),
+    (":scheme", "http"),
+    (":scheme", "https"),
+    (":status", "103"),
+    (":status", "200"),
+    (":status", "304"),
+    (":status", "404"),
+    (":status", "503"),
+    ("accept", "*/*"),
+    ("accept", "application/dns-message"),
+    ("accept-encoding", "gzip, deflate, br"),
+    ("accept-ranges", "bytes"),
+    ("access-control-allow-headers", "cache-control"),
+    ("access-control-allow-headers", "content-type"),
+    ("access-control-allow-origin", "*"),
+    ("cache-control", "max-age=0"),
+    ("cache-control", "max-age=2592000"),
+    ("cache-control", "max-age=604800"),
+    ("cache-control", "no-cache"),
+    ("cache-control", "no-store"),
+    ("cache-control", "public, max-age=31536000"),
+    ("content-encoding", "br"),
+    ("content-encoding", "gzip"),
+    ("content-type", "application/dns-message"),
+    ("content-type", "application/javascript"),
+    ("content-type", "application/json"),
+    ("content-type", "application/x-www-form-urlencoded"),
+    ("content-type", "image/gif"),
+    ("content-type", "image/jpeg"),
+    ("content-type", "image/png"),
+    ("content-type", "text/css"),
+    ("content-type", "text/html; charset=utf-8"),
+    ("content-type", "text/plain"),
+    ("content-type", "text/plain;charset=utf-8"),
+    ("range", "bytes=0-"),
+    ("strict-transport-security", "max-age=31536000"),
+    ("strict-transport-security", "max-age=31536000; includesubdomains"),
+    ("strict-transport-security", "max-age=31536000; includesubdomains; preload"),
+    ("vary", "accept-encoding"),
+    ("vary", "origin"),
+    ("x-content-type-options", "nosniff"),
+    ("x-xss-protection", "1; mode=block"),
+    (":status", "100"),
+    (":status", "204"),
+    (":status", "206"),
+    (":status", "302"),
+    (":status", "400"),
+    (":status", "403"),
+    (":status", "421"),
+    (":status", "425"),
+    (":status", "500"),
+    ("accept-language", ""),
+    ("access-control-allow-credentials", "FALSE"),
+    ("access-control-allow-credentials", "TRUE"),
+    ("access-control-allow-headers", "*"),
+    ("access-control-allow-methods", "get"),
+    ("access-control-allow-methods", "get, post, options"),
+    ("access-control-allow-methods", "options"),
+    ("access-control-expose-headers", "content-length"),
+    ("access-control-request-headers", "content-type"),
+    ("access-control-request-method", "get"),
+    ("access-control-request-method", "post"),
+    ("alt-svc", "clear"),
+    ("authorization", ""),
+    ("content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"),
+    ("early-data", "1"),
+    ("expect-ct", ""),
+    ("forwarded", ""),
+    ("if-range", ""),
+    ("origin", ""),
+    ("purpose", "prefetch"),
+    ("server", ""),
+    ("timing-allow-origin", "*"),
+    ("upgrade-insecure-requests", "1"),
+    ("user-agent", ""),
+    ("x-forwarded-for", ""),
+    ("x-frame-options", "deny"),
+    ("x-frame-options", "sameorigin"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -232,15 +355,33 @@ mod tests {
         assert!(!encoded.is_empty());
         assert_eq!(encoded[0], 0x00);
         assert_eq!(encoded[1], 0x00);
+        // Verify T=1 (static table) bit is set on indexed pseudo-headers
+        assert_eq!(encoded[2], 0xC0 | 17); // :method GET
+        assert_eq!(encoded[3], 0xC0 | 22); // :scheme https
     }
 
     #[test]
     fn test_qpack_decode_response_static_200() {
-        // Prefix: 0x00, 0x00, Static Index 25 (0x80 | 25)
-        let data = vec![0x00, 0x00, 0x80 | 25];
+        // Prefix: 0x00, 0x00, Static Index 25 (1 | T=1 | 25 => 0xC0 | 25)
+        let data = vec![0x00, 0x00, 0xC0 | 25];
         let (status, headers) = QpackCodec::decode_response_headers(&data).expect("decode");
         assert_eq!(status, 200);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_qpack_decode_response_name_ref_and_huffman() {
+        // Static index 25 (:status 200) + Literal with Name Reference (server, T=1, idx=92 => 0101_1111 + (92-15))
+        // 0x5F, 77 -> "gws" (plain)
+        let mut data = vec![0x00, 0x00, 0xC0 | 25];
+        data.push(0x5F); // 01 | N=0 | T=1 | 15
+        data.push(92 - 15); // index 92 ("server")
+        data.push(3); // H=0, len=3
+        data.extend_from_slice(b"gws");
+
+        let (status, headers) = QpackCodec::decode_response_headers(&data).expect("decode");
+        assert_eq!(status, 200);
+        assert_eq!(headers, vec![("server".to_string(), "gws".to_string())]);
     }
 
     #[test]

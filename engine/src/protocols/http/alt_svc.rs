@@ -17,9 +17,17 @@ pub struct AltSvcEntry {
     pub persist: bool,
 }
 
+/// Per-origin broken-state tracking for Happy Eyeballs v3 demotion.
+#[derive(Debug, Clone, Copy)]
+struct BrokenOriginState {
+    failure_count: u32,
+    broken_until: Instant,
+}
+
 /// Registry storing Alt-Svc records indexed by origin `host:port`.
 pub struct AltSvcRegistry {
     entries: Mutex<HashMap<String, Vec<AltSvcEntry>>>,
+    broken_origins: Mutex<HashMap<String, BrokenOriginState>>,
 }
 
 impl Default for AltSvcRegistry {
@@ -32,13 +40,44 @@ impl AltSvcRegistry {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            broken_origins: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Clear all cached alternative services.
+    /// Clear all cached alternative services and broken-origin demotions.
     pub fn clear(&self) {
         if let Ok(mut lock) = self.entries.lock() {
             lock.clear();
+        }
+        if let Ok(mut lock) = self.broken_origins.lock() {
+            lock.clear();
+        }
+    }
+
+    /// Mark an origin (`host:port`) as broken for HTTP/3 with exponential backoff
+    /// (60s -> 120s -> 300s).
+    pub fn mark_broken(&self, origin_host: &str, origin_port: u16) {
+        let key = format!("{}:{}", origin_host.to_ascii_lowercase(), origin_port);
+        if let Ok(mut lock) = self.broken_origins.lock() {
+            let state = lock.entry(key).or_insert_with(|| BrokenOriginState {
+                failure_count: 0,
+                broken_until: Instant::now(),
+            });
+            state.failure_count = state.failure_count.saturating_add(1);
+            let backoff_secs = match state.failure_count {
+                1 => 60,
+                2 => 120,
+                _ => 300,
+            };
+            state.broken_until = Instant::now() + Duration::from_secs(backoff_secs);
+        }
+    }
+
+    /// Reset broken-origin state for (`host:port`) on HTTP/3 success.
+    pub fn mark_healthy(&self, origin_host: &str, origin_port: u16) {
+        let key = format!("{}:{}", origin_host.to_ascii_lowercase(), origin_port);
+        if let Ok(mut lock) = self.broken_origins.lock() {
+            lock.remove(&key);
         }
     }
 
@@ -157,10 +196,19 @@ impl AltSvcRegistry {
         results
     }
 
-    /// Retrieve the highest-priority HTTP/3 alternative service target if available and unexpired.
+    /// Retrieve the highest-priority HTTP/3 alternative service target if available,
+    /// unexpired, and not currently demoted as broken.
     pub fn get_h3_target(&self, origin_host: &str, origin_port: u16) -> Option<(String, u16)> {
         let key = format!("{}:{}", origin_host.to_ascii_lowercase(), origin_port);
         let now = Instant::now();
+
+        if let Ok(broken_lock) = self.broken_origins.lock() {
+            if let Some(state) = broken_lock.get(&key) {
+                if now < state.broken_until {
+                    return None;
+                }
+            }
+        }
 
         let mut lock = self.entries.lock().ok()?;
         let list = lock.get_mut(&key)?;
@@ -237,5 +285,101 @@ mod tests {
         registry.insert("fast.com", 443, "h3=\":443\"; ma=0");
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(registry.get_h3_target("fast.com", 443), None);
+    }
+
+    #[test]
+    fn test_broken_origin_demotion_and_exponential_backoff() {
+        let registry = AltSvcRegistry::new();
+        registry.insert("quic.example.com", 443, "h3=\":443\"; ma=86400");
+        assert_eq!(
+            registry.get_h3_target("quic.example.com", 443),
+            Some(("quic.example.com".to_string(), 443))
+        );
+
+        // 1st failure -> 60s backoff
+        registry.mark_broken("quic.example.com", 443);
+        assert_eq!(registry.get_h3_target("quic.example.com", 443), None);
+        {
+            let lock = registry.broken_origins.lock().unwrap();
+            let state = lock.get("quic.example.com:443").unwrap();
+            assert_eq!(state.failure_count, 1);
+            let rem = state.broken_until.saturating_duration_since(Instant::now());
+            assert!(rem >= Duration::from_secs(55) && rem <= Duration::from_secs(60));
+        }
+
+        // Re-inserting Alt-Svc header must NOT clear broken demotion
+        registry.insert("quic.example.com", 443, "h3=\":443\"; ma=86400");
+        assert_eq!(registry.get_h3_target("quic.example.com", 443), None);
+
+        // 2nd failure -> 120s backoff
+        registry.mark_broken("quic.example.com", 443);
+        {
+            let lock = registry.broken_origins.lock().unwrap();
+            let state = lock.get("quic.example.com:443").unwrap();
+            assert_eq!(state.failure_count, 2);
+            let rem = state.broken_until.saturating_duration_since(Instant::now());
+            assert!(rem >= Duration::from_secs(115) && rem <= Duration::from_secs(120));
+        }
+
+        // 3rd failure -> 300s backoff
+        registry.mark_broken("quic.example.com", 443);
+        {
+            let lock = registry.broken_origins.lock().unwrap();
+            let state = lock.get("quic.example.com:443").unwrap();
+            assert_eq!(state.failure_count, 3);
+            let rem = state.broken_until.saturating_duration_since(Instant::now());
+            assert!(rem >= Duration::from_secs(295) && rem <= Duration::from_secs(300));
+        }
+
+        // 4th failure -> capped at 300s backoff
+        registry.mark_broken("quic.example.com", 443);
+        {
+            let lock = registry.broken_origins.lock().unwrap();
+            let state = lock.get("quic.example.com:443").unwrap();
+            assert_eq!(state.failure_count, 4);
+            let rem = state.broken_until.saturating_duration_since(Instant::now());
+            assert!(rem >= Duration::from_secs(295) && rem <= Duration::from_secs(300));
+        }
+    }
+
+    #[test]
+    fn test_broken_origin_recovery_and_backoff_expiry() {
+        let registry = AltSvcRegistry::new();
+        registry.insert("recover.example.com", 443, "h3=\":443\"; ma=86400");
+
+        // Demote once (60s)
+        registry.mark_broken("recover.example.com", 443);
+        assert_eq!(registry.get_h3_target("recover.example.com", 443), None);
+
+        // Simulate backoff window elapsing without mark_healthy
+        {
+            let mut lock = registry.broken_origins.lock().unwrap();
+            let state = lock.get_mut("recover.example.com:443").unwrap();
+            state.broken_until = Instant::now() - Duration::from_secs(1);
+        }
+        assert_eq!(
+            registry.get_h3_target("recover.example.com", 443),
+            Some(("recover.example.com".to_string(), 443))
+        );
+
+        // Failing again after expiry advances backoff to 120s (failure_count == 2)
+        registry.mark_broken("recover.example.com", 443);
+        assert_eq!(registry.get_h3_target("recover.example.com", 443), None);
+        {
+            let lock = registry.broken_origins.lock().unwrap();
+            assert_eq!(lock.get("recover.example.com:443").unwrap().failure_count, 2);
+        }
+
+        // mark_healthy resets failure_count and restores target immediately
+        registry.mark_healthy("recover.example.com", 443);
+        assert_eq!(
+            registry.get_h3_target("recover.example.com", 443),
+            Some(("recover.example.com".to_string(), 443))
+        );
+        assert!(!registry
+            .broken_origins
+            .lock()
+            .unwrap()
+            .contains_key("recover.example.com:443"));
     }
 }

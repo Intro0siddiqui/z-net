@@ -49,8 +49,12 @@ impl Drop for PerfTelemetry {
     }
 }
 
+use compio_buf::BufResult;
+use compio_driver::op::{Connect, Interest, PollOnce};
+use compio_driver::{AsRawFd, Key, Proactor, PushEntry, SharedFd};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use socket2::{Domain, Protocol, SockAddr, Socket as Socket2, Type};
 use url::Url;
 
 use super::alt_svc::AltSvcRegistry;
@@ -145,6 +149,86 @@ impl Write for ActiveStream {
     }
 }
 
+const HE3_CAD: Duration = Duration::from_millis(75);
+
+enum He3Winner {
+    H3 {
+        quic_state: crate::protocols::http3::QuicHandshakeState,
+        udp_socket: std::net::UdpSocket,
+        h3_ms: f64,
+    },
+    H2OrH1 {
+        tls_conn: ClientConnection,
+        tcp_stream: TcpStream,
+        h3_ms: f64,
+        h2_ms: f64,
+        demoted: bool,
+    },
+}
+
+enum TcpTlsState {
+    NotStarted,
+    Connecting(Key<Connect<SharedFd<Socket2>>>),
+    Handshaking {
+        tls: ClientConnection,
+        poll_key: Option<Key<PollOnce<SharedFd<Socket2>>>>,
+    },
+    Failed(String),
+}
+
+/// Drive a non-blocking `rustls::ClientConnection` TLS handshake until it either
+/// completes (`Ok(None)`) or needs socket readiness (`Ok(Some(Interest))`).
+fn step_tls_handshake(
+    tls: &mut ClientConnection,
+    sock: &Socket2,
+) -> Result<Option<Interest>, String> {
+    let mut io_ref = sock;
+    loop {
+        let mut progressed = false;
+        while tls.wants_write() {
+            match tls.write_tls(&mut io_ref) {
+                Ok(0) => break,
+                Ok(_) => progressed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(Some(Interest::Writable));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("TLS write failed: {}", e)),
+            }
+        }
+        if !tls.is_handshaking() {
+            return Ok(None);
+        }
+        if tls.wants_read() {
+            match tls.read_tls(&mut io_ref) {
+                Ok(0) => return Err("TLS EOF during handshake".to_string()),
+                Ok(_) => {
+                    tls.process_new_packets()
+                        .map_err(|e| format!("TLS handshake error: {}", e))?;
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !tls.is_handshaking() {
+                        return Ok(None);
+                    }
+                    if tls.wants_write() {
+                        continue;
+                    }
+                    return Ok(Some(Interest::Readable));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("TLS read failed: {}", e)),
+            }
+        }
+        if !tls.is_handshaking() {
+            return Ok(None);
+        }
+        if !progressed {
+            return Ok(Some(Interest::Readable));
+        }
+    }
+}
+
 /// Standalone HTTP client engine orchestrating connections, pooling, serialization, cookies, and streaming.
 pub struct HttpClientEngine {
     tls_config: Arc<ClientConfig>,
@@ -206,6 +290,496 @@ impl HttpClientEngine {
         *tcp_ms = tcp_start.elapsed().as_secs_f64() * 1000.0;
 
         Err(format!("Could not connect to {}:{}", host, port))
+    }
+
+    /// Single-threaded `compio-driver::Proactor`-driven Happy Eyeballs v3 race.
+    ///
+    /// Starts the QUIC UDP handshake first, then after `cad` (75 ms) — or immediately if
+    /// QUIC fails early — starts TCP Connect + `rustls::ClientConnection` TLS handshake in
+    /// the same Proactor loop. Whichever completes handshake first wins.
+    #[allow(clippy::too_many_arguments)]
+    fn race_happy_eyeballs_v3<K>(
+        host: &str,
+        port: u16,
+        h3_host: &str,
+        h3_port: u16,
+        dns_resolver: &DnsResolver,
+        tls_config: &Arc<ClientConfig>,
+        timeout: Duration,
+        cad: Duration,
+        is_cancelled: &mut K,
+        dns_ms: &mut f64,
+    ) -> Result<He3Winner, String>
+    where
+        K: FnMut() -> bool,
+    {
+        use crate::protocols::http3::QuicHandshakeState;
+
+        let is_ip_literal = host.parse::<std::net::IpAddr>().is_ok();
+        let dns_start = Instant::now();
+        let tcp_addrs = dns_resolver.resolve(host, port)?;
+        if !is_ip_literal {
+            *dns_ms = dns_start.elapsed().as_secs_f64() * 1000.0;
+        }
+        let tcp_addr = tcp_addrs
+            .iter()
+            .copied()
+            .find(|a| a.is_ipv4())
+            .or_else(|| tcp_addrs.first().copied())
+            .ok_or_else(|| format!("No addresses resolved for {}:{}", host, port))?;
+
+        let h3_addr = if h3_host.eq_ignore_ascii_case(host) {
+            let mut a = tcp_addr;
+            a.set_port(h3_port);
+            a
+        } else {
+            let h3_addrs = dns_resolver.resolve(h3_host, h3_port)?;
+            h3_addrs
+                .iter()
+                .copied()
+                .find(|a| a.is_ipv4())
+                .or_else(|| h3_addrs.first().copied())
+                .ok_or_else(|| format!("No addresses resolved for {}:{}", h3_host, h3_port))?
+        };
+
+        let mut proactor = Proactor::new()
+            .map_err(|e| format!("Proactor::new failed in HEv3 race: {}", e))?;
+
+        let race_start = Instant::now();
+        let cad_deadline = race_start + cad;
+        let total_deadline = race_start + timeout;
+
+        // 1. Start QUIC (quinn-proto) UDP handshake first
+        let mut quic_opt: Option<(QuicHandshakeState, SharedFd<std::net::UdpSocket>)> = None;
+        let mut udp_poll_key: Option<Key<PollOnce<SharedFd<std::net::UdpSocket>>>> = None;
+        let mut h3_failed = false;
+        let mut h3_elapsed_ms = 0.0_f64;
+
+        match QuicHandshakeState::start(h3_addr, host) {
+            Ok((mut quic_state, udp_sock)) => {
+                let udp_fd = SharedFd::new(udp_sock);
+                if let Err(e) = proactor.attach(udp_fd.as_raw_fd()) {
+                    h3_failed = true;
+                    h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("[ZNET-HE3] proactor attach UDP failed: {}", e);
+                } else {
+                    quic_state.flush_transmits(&udp_fd, race_start);
+                    match proactor.push(PollOnce::new(udp_fd.clone(), Interest::Readable)) {
+                        PushEntry::Pending(k) => udp_poll_key = Some(k),
+                        PushEntry::Ready(_) => {
+                            if let Err(_) = quic_state.drain_udp(&udp_fd, race_start) {
+                                h3_failed = true;
+                                h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                            } else {
+                                quic_state.flush_transmits(&udp_fd, race_start);
+                                match quic_state.poll_handshake_step(race_start) {
+                                    Ok(true) => {
+                                        let h3_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                                        let udp_socket = match udp_fd.try_unwrap() {
+                                            Ok(s) => s,
+                                            Err(shared) => shared
+                                                .try_clone()
+                                                .map_err(|e| format!("UDP clone failed: {}", e))?,
+                                        };
+                                        return Ok(He3Winner::H3 {
+                                            quic_state,
+                                            udp_socket,
+                                            h3_ms,
+                                        });
+                                    }
+                                    Ok(false) => {
+                                        if let PushEntry::Pending(k) = proactor
+                                            .push(PollOnce::new(udp_fd.clone(), Interest::Readable))
+                                        {
+                                            udp_poll_key = Some(k);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        h3_failed = true;
+                                        h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !h3_failed {
+                        quic_opt = Some((quic_state, udp_fd));
+                    }
+                }
+            }
+            Err(_) => {
+                h3_failed = true;
+                h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+
+        let mut tcp_fd_opt: Option<SharedFd<Socket2>> = None;
+        let mut tcp_state = TcpTlsState::NotStarted;
+        let mut tcp_start: Option<Instant> = None;
+
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid TLS server name: {}", e))?;
+
+        let finish_tcp_win = |tcp_fd: SharedFd<Socket2>,
+                              tls_conn: ClientConnection,
+                              h3_ms: f64,
+                              h2_ms: f64,
+                              proactor: &mut Proactor,
+                              udp_poll_key: &mut Option<Key<PollOnce<SharedFd<std::net::UdpSocket>>>>,
+                              quic_opt: &mut Option<(QuicHandshakeState, SharedFd<std::net::UdpSocket>)>|
+         -> Result<He3Winner, String> {
+            if let Some(k) = udp_poll_key.take() {
+                let _ = proactor.cancel(k);
+            }
+            *quic_opt = None;
+
+            let sock2 = match tcp_fd.try_unwrap() {
+                Ok(s) => s,
+                Err(shared) => shared
+                    .try_clone()
+                    .map_err(|e| format!("TCP socket clone failed: {}", e))?,
+            };
+            let tcp_stream: TcpStream = sock2.into();
+            let _ = tcp_stream.set_nonblocking(false);
+            let _ = tcp_stream.set_nodelay(true);
+            let _ = tcp_stream.set_read_timeout(Some(timeout));
+            let _ = tcp_stream.set_write_timeout(Some(timeout));
+
+            Ok(He3Winner::H2OrH1 {
+                tls_conn,
+                tcp_stream,
+                h3_ms,
+                h2_ms,
+                demoted: true,
+            })
+        };
+
+        loop {
+            if is_cancelled() {
+                if let Some(k) = udp_poll_key.take() {
+                    let _ = proactor.cancel(k);
+                }
+                match tcp_state {
+                    TcpTlsState::Connecting(k) => {
+                        let _ = proactor.cancel(k);
+                    }
+                    TcpTlsState::Handshaking { poll_key: Some(k), .. } => {
+                        let _ = proactor.cancel(k);
+                    }
+                    _ => {}
+                }
+                return Err("Request cancelled during HEv3 race".to_string());
+            }
+
+            let now = Instant::now();
+            if now > total_deadline {
+                if let Some(k) = udp_poll_key.take() {
+                    let _ = proactor.cancel(k);
+                }
+                match tcp_state {
+                    TcpTlsState::Connecting(k) => {
+                        let _ = proactor.cancel(k);
+                    }
+                    TcpTlsState::Handshaking { poll_key: Some(k), .. } => {
+                        let _ = proactor.cancel(k);
+                    }
+                    _ => {}
+                }
+                return Err(format!("HEv3 connection timed out for {}:{}", host, port));
+            }
+
+            // Start TCP Connect + TLS leg once CAD (75ms) elapses or QUIC fails early
+            if matches!(tcp_state, TcpTlsState::NotStarted) && (now >= cad_deadline || h3_failed) {
+                tcp_start = Some(now);
+                let domain = Domain::for_address(tcp_addr);
+                match Socket2::new(domain, Type::STREAM, Some(Protocol::TCP)) {
+                    Ok(sock) => {
+                        let _ = sock.set_nonblocking(true);
+                        let _ = sock.set_tcp_nodelay(true);
+                        let tcp_fd = SharedFd::new(sock);
+                        if let Err(e) = proactor.attach(tcp_fd.as_raw_fd()) {
+                            tcp_state = TcpTlsState::Failed(format!("TCP attach failed: {}", e));
+                        } else {
+                            tcp_fd_opt = Some(tcp_fd.clone());
+                            match proactor.push(Connect::new(tcp_fd.clone(), SockAddr::from(tcp_addr))) {
+                                PushEntry::Pending(k) => {
+                                    tcp_state = TcpTlsState::Connecting(k);
+                                }
+                                PushEntry::Ready(BufResult(Ok(_), _)) => {
+                                    match ClientConnection::new(tls_config.clone(), server_name.clone()) {
+                                        Ok(mut tls) => match step_tls_handshake(&mut tls, &tcp_fd) {
+                                            Ok(None) => {
+                                                let h2_ms = tcp_start
+                                                    .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                                                    .unwrap_or(0.0);
+                                                let h3_ms = if h3_failed {
+                                                    h3_elapsed_ms
+                                                } else {
+                                                    race_start.elapsed().as_secs_f64() * 1000.0
+                                                };
+                                                return finish_tcp_win(
+                                                    tcp_fd_opt.take().unwrap(),
+                                                    tls,
+                                                    h3_ms,
+                                                    h2_ms,
+                                                    &mut proactor,
+                                                    &mut udp_poll_key,
+                                                    &mut quic_opt,
+                                                );
+                                            }
+                                            Ok(Some(interest)) => {
+                                                let poll_key = match proactor
+                                                    .push(PollOnce::new(tcp_fd.clone(), interest))
+                                                {
+                                                    PushEntry::Pending(k) => Some(k),
+                                                    PushEntry::Ready(_) => None,
+                                                };
+                                                tcp_state = TcpTlsState::Handshaking { tls, poll_key };
+                                            }
+                                            Err(e) => tcp_state = TcpTlsState::Failed(e),
+                                        },
+                                        Err(e) => {
+                                            tcp_state = TcpTlsState::Failed(format!(
+                                                "TLS init failed: {}",
+                                                e
+                                            ));
+                                        }
+                                    }
+                                }
+                                PushEntry::Ready(BufResult(Err(e), _)) => {
+                                    tcp_state = TcpTlsState::Failed(format!("TCP connect failed: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tcp_state = TcpTlsState::Failed(format!("TCP socket create failed: {}", e));
+                    }
+                }
+            }
+
+            if let TcpTlsState::Failed(ref err) = tcp_state {
+                let h3_grace_deadline = race_start + Duration::from_millis(250);
+                if h3_failed || now >= h3_grace_deadline {
+                    if let Some(k) = udp_poll_key.take() {
+                        let _ = proactor.cancel(k);
+                    }
+                    return Err(err.clone());
+                }
+            }
+
+            // Compute next wakeup deadline for Proactor::poll
+            let mut wait_dur = total_deadline.saturating_duration_since(now).min(Duration::from_millis(25));
+            if matches!(tcp_state, TcpTlsState::Failed(_)) && !h3_failed {
+                let h3_grace_deadline = race_start + Duration::from_millis(250);
+                wait_dur = wait_dur.min(h3_grace_deadline.saturating_duration_since(now));
+            }
+            if matches!(tcp_state, TcpTlsState::NotStarted) && !h3_failed {
+                wait_dur = wait_dur.min(cad_deadline.saturating_duration_since(now));
+            }
+            if !h3_failed {
+                if let Some((ref mut q, _)) = quic_opt {
+                    if let Some(qt) = q.connection.poll_timeout() {
+                        wait_dur = wait_dur.min(qt.saturating_duration_since(now));
+                    }
+                }
+            }
+
+            if let Err(e) = proactor.poll(Some(wait_dur)) {
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                ) {
+                    return Err(format!("Proactor::poll error: {}", e));
+                }
+            }
+
+            let now = Instant::now();
+
+            // Drive QUIC leg
+            if !h3_failed {
+                if let Some((mut quic_state, udp_fd)) = quic_opt.take() {
+                    let mut udp_ready = false;
+                    if let Some(k) = udp_poll_key.take() {
+                        match proactor.pop(k) {
+                            PushEntry::Ready(_) => udp_ready = true,
+                            PushEntry::Pending(k) => udp_poll_key = Some(k),
+                        }
+                    } else {
+                        udp_ready = true;
+                    }
+
+                    if udp_ready {
+                        if let Err(_) = quic_state.drain_udp(&udp_fd, now) {
+                            h3_failed = true;
+                            h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                        }
+                    }
+
+                    if !h3_failed {
+                        quic_state.flush_transmits(&udp_fd, now);
+                        match quic_state.poll_handshake_step(now) {
+                            Ok(true) => {
+                                let h3_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                                if let Some(k) = udp_poll_key.take() {
+                                    let _ = proactor.cancel(k);
+                                }
+                                match tcp_state {
+                                    TcpTlsState::Connecting(k) => {
+                                        let _ = proactor.cancel(k);
+                                    }
+                                    TcpTlsState::Handshaking { poll_key: Some(k), .. } => {
+                                        let _ = proactor.cancel(k);
+                                    }
+                                    _ => {}
+                                }
+                                drop(tcp_fd_opt.take());
+
+                                let udp_socket = match udp_fd.try_unwrap() {
+                                    Ok(s) => s,
+                                    Err(shared) => shared
+                                        .try_clone()
+                                        .map_err(|e| format!("UDP clone failed: {}", e))?,
+                                };
+                                return Ok(He3Winner::H3 {
+                                    quic_state,
+                                    udp_socket,
+                                    h3_ms,
+                                });
+                            }
+                            Ok(false) => {
+                                quic_state.flush_transmits(&udp_fd, now);
+                                if udp_poll_key.is_none() {
+                                    if let PushEntry::Pending(k) =
+                                        proactor.push(PollOnce::new(udp_fd.clone(), Interest::Readable))
+                                    {
+                                        udp_poll_key = Some(k);
+                                    }
+                                }
+                                quic_opt = Some((quic_state, udp_fd));
+                            }
+                            Err(_) => {
+                                h3_failed = true;
+                                h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                                if let Some(k) = udp_poll_key.take() {
+                                    let _ = proactor.cancel(k);
+                                }
+                            }
+                        }
+                    } else if let Some(k) = udp_poll_key.take() {
+                        let _ = proactor.cancel(k);
+                    }
+                }
+            }
+
+            // Drive TCP/TLS leg
+            match std::mem::replace(&mut tcp_state, TcpTlsState::NotStarted) {
+                TcpTlsState::NotStarted => {}
+                TcpTlsState::Failed(e) => {
+                    tcp_state = TcpTlsState::Failed(e);
+                }
+                TcpTlsState::Connecting(k) => match proactor.pop(k) {
+                    PushEntry::Pending(k) => {
+                        tcp_state = TcpTlsState::Connecting(k);
+                    }
+                    PushEntry::Ready(BufResult(Ok(_), _)) => {
+                        let tcp_fd = tcp_fd_opt.as_ref().unwrap();
+                        match ClientConnection::new(tls_config.clone(), server_name.clone()) {
+                            Ok(mut tls) => match step_tls_handshake(&mut tls, tcp_fd) {
+                                Ok(None) => {
+                                    let h2_ms = tcp_start
+                                        .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                                        .unwrap_or(0.0);
+                                    let h3_ms = if h3_failed {
+                                        h3_elapsed_ms
+                                    } else {
+                                        race_start.elapsed().as_secs_f64() * 1000.0
+                                    };
+                                    return finish_tcp_win(
+                                        tcp_fd_opt.take().unwrap(),
+                                        tls,
+                                        h3_ms,
+                                        h2_ms,
+                                        &mut proactor,
+                                        &mut udp_poll_key,
+                                        &mut quic_opt,
+                                    );
+                                }
+                                Ok(Some(interest)) => {
+                                    let poll_key = match proactor
+                                        .push(PollOnce::new(tcp_fd.clone(), interest))
+                                    {
+                                        PushEntry::Pending(k) => Some(k),
+                                        PushEntry::Ready(_) => None,
+                                    };
+                                    tcp_state = TcpTlsState::Handshaking { tls, poll_key };
+                                }
+                                Err(e) => tcp_state = TcpTlsState::Failed(e),
+                            },
+                            Err(e) => {
+                                tcp_state = TcpTlsState::Failed(format!("TLS init failed: {}", e));
+                            }
+                        }
+                    }
+                    PushEntry::Ready(BufResult(Err(e), _)) => {
+                        tcp_state = TcpTlsState::Failed(format!("TCP connect failed: {}", e));
+                    }
+                },
+                TcpTlsState::Handshaking { mut tls, poll_key } => {
+                    let mut ready = poll_key.is_none();
+                    let mut still_pending = None;
+                    if let Some(k) = poll_key {
+                        match proactor.pop(k) {
+                            PushEntry::Ready(_) => ready = true,
+                            PushEntry::Pending(k) => still_pending = Some(k),
+                        }
+                    }
+
+                    if ready {
+                        let tcp_fd = tcp_fd_opt.as_ref().unwrap();
+                        match step_tls_handshake(&mut tls, tcp_fd) {
+                            Ok(None) => {
+                                let h2_ms = tcp_start
+                                    .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                                    .unwrap_or(0.0);
+                                let h3_ms = if h3_failed {
+                                    h3_elapsed_ms
+                                } else {
+                                    race_start.elapsed().as_secs_f64() * 1000.0
+                                };
+                                return finish_tcp_win(
+                                    tcp_fd_opt.take().unwrap(),
+                                    tls,
+                                    h3_ms,
+                                    h2_ms,
+                                    &mut proactor,
+                                    &mut udp_poll_key,
+                                    &mut quic_opt,
+                                );
+                            }
+                            Ok(Some(interest)) => {
+                                let next_key = match proactor
+                                    .push(PollOnce::new(tcp_fd.clone(), interest))
+                                {
+                                    PushEntry::Pending(k) => Some(k),
+                                    PushEntry::Ready(_) => None,
+                                };
+                                tcp_state = TcpTlsState::Handshaking {
+                                    tls,
+                                    poll_key: next_key,
+                                };
+                            }
+                            Err(e) => tcp_state = TcpTlsState::Failed(e),
+                        }
+                    } else {
+                        tcp_state = TcpTlsState::Handshaking {
+                            tls,
+                            poll_key: still_pending,
+                        };
+                    }
+                }
+            }
+        }
     }
 
     /// Clear pooled connections and cookies for a specific session.
@@ -581,32 +1155,9 @@ impl HttpClientEngine {
                 port: 0,
             });
 
-        // Fast-path HTTP/3 execution if direct TLS connection and host advertised Alt-Svc
-        if is_tls && proxy_rule.scheme == ProxyScheme::Direct {
-            if let Some((h3_host, h3_port)) = self.alt_svc_registry.get_h3_target(&host, port) {
-                let h3_timeout = Duration::from_millis(250);
-                if let Ok(true) = Http3Client::execute_streaming(
-                    &h3_host,
-                    h3_port,
-                    &self.dns_resolver,
-                    options,
-                    body_ring,
-                    &mut on_headers,
-                    &mut on_data_chunk,
-                    &mut on_complete,
-                    &mut is_cancelled,
-                    h3_timeout,
-                ) {
-                    perf.proto = "h3";
-                    return Ok(true);
-                }
-                // Seamlessly fall back to TCP TLS streaming
-            }
-        }
-
         let pool_key = PoolKey::new(options.session_id, &host, port, is_tls);
 
-        // 0. Check pooled HTTP/2 sessions first (avoids TCP + TLS + H2 preface handshakes)
+        // 0. Check pooled HTTP/2 sessions FIRST before any H3 attempt (skips HEv3 race if warm H2Session exists)
         if let Some(pooled_h2) = self.h2_pool.get(&pool_key) {
             perf.proto = "h2";
             perf.reused = true;
@@ -637,8 +1188,109 @@ impl HttpClientEngine {
             }
         }
 
+        let mut preconnected_tls_stream: Option<ActiveStream> = None;
+
+        // 0b. Happy Eyeballs v3 race (Proactor-driven QUIC + TCP/TLS with 75ms CAD) if direct HTTPS & active Alt-Svc
+        if is_tls && proxy_rule.scheme == ProxyScheme::Direct {
+            if let Some((h3_host, h3_port)) = self.alt_svc_registry.get_h3_target(&host, port) {
+                let cad_ms = HE3_CAD.as_secs_f64() * 1000.0;
+                match Self::race_happy_eyeballs_v3(
+                    &host,
+                    port,
+                    &h3_host,
+                    h3_port,
+                    &self.dns_resolver,
+                    &self.tls_config,
+                    options.timeout,
+                    HE3_CAD,
+                    &mut is_cancelled,
+                    &mut perf.dns_ms,
+                ) {
+                    Ok(He3Winner::H3 {
+                        quic_state,
+                        udp_socket,
+                        h3_ms,
+                    }) => {
+                        self.alt_svc_registry.mark_healthy(&host, port);
+                        eprintln!(
+                            "[ZNET-HE3] origin={}:{} cad_ms={:.1} h3_ms={:.1} h2_ms=0.0 winner=h3 demoted=false",
+                            host, port, cad_ms, h3_ms
+                        );
+                        perf.tcp_tls_ms = h3_ms;
+                        match Http3Client::execute_connected_streaming(
+                            quic_state,
+                            udp_socket,
+                            &host,
+                            options,
+                            body_ring,
+                            &mut on_headers,
+                            &mut on_data_chunk,
+                            &mut on_complete,
+                            &mut is_cancelled,
+                        ) {
+                            Ok(true) => {
+                                perf.proto = "h3";
+                                return Ok(true);
+                            }
+                            Ok(false) | Err(_) => {
+                                // H3 stream failed after handshake; demote origin and fall back to TCP/TLS
+                                self.alt_svc_registry.mark_broken(&host, port);
+                            }
+                        }
+                    }
+                    Ok(He3Winner::H2OrH1 {
+                        tls_conn,
+                        tcp_stream,
+                        h3_ms,
+                        h2_ms,
+                        demoted,
+                    }) => {
+                        if demoted {
+                            self.alt_svc_registry.mark_broken(&host, port);
+                        }
+                        eprintln!(
+                            "[ZNET-HE3] origin={}:{} cad_ms={:.1} h3_ms={:.1} h2_ms={:.1} winner=h2 demoted={}",
+                            host, port, cad_ms, h3_ms, h2_ms, demoted
+                        );
+                        perf.tcp_tls_ms = h2_ms;
+                        let alpn = tls_conn.alpn_protocol().map(|s| s.to_vec());
+                        let tls_stream =
+                            ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp_stream)));
+                        if alpn.as_deref() == Some(b"h2") {
+                            perf.proto = "h2";
+                            let h2_session = super::h2::H2Session::new(tls_stream)?;
+                            return Self::execute_h2_session(
+                                &self.cookie_jar,
+                                &self.alt_svc_registry,
+                                &mut self.h2_pool,
+                                h2_session,
+                                &pool_key,
+                                options,
+                                &parsed_url,
+                                &host,
+                                port,
+                                body_ring,
+                                &mut perf,
+                                &mut on_headers,
+                                &mut on_data_chunk,
+                                &mut on_complete,
+                                &mut is_cancelled,
+                            );
+                        }
+                        preconnected_tls_stream = Some(tls_stream);
+                    }
+                    Err(_) => {
+                        // Both legs failed or timed out in HEv3 race; demote H3 and fall through to standard path
+                        self.alt_svc_registry.mark_broken(&host, port);
+                    }
+                }
+            }
+        }
+
         // 1. Check HTTP/1.1 connection pool or establish new connection
-        let mut stream = if let Some(pooled) = self.pool.get(&pool_key) {
+        let mut stream = if let Some(s) = preconnected_tls_stream {
+            s
+        } else if let Some(pooled) = self.pool.get(&pool_key) {
             perf.reused = true;
             pooled.socket
         } else {
@@ -1623,5 +2275,133 @@ mod tests {
         assert_eq!(received_body, b"SOCKS5");
 
         proxy_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_he3_race_blackholed_udp_triggers_cad_and_demotes_origin() {
+        // Bind a UDP socket that never responds (blackholed QUIC)
+        let udp_blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_port = udp_blackhole.local_addr().unwrap().port();
+
+        // Bind and immediately drop a TCP listener to get an unused closed port
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        drop(tcp_listener);
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut client = HttpClientEngine::new(tls_cfg);
+        client.alt_svc_registry.insert(
+            "127.0.0.1",
+            tcp_port,
+            &format!("h3=\":{}\"; ma=86400", udp_port),
+        );
+        assert!(client.alt_svc_registry.get_h3_target("127.0.0.1", tcp_port).is_some());
+
+        let url = format!("https://127.0.0.1:{}/he3_test", tcp_port);
+        let mut opts = HttpRequestOptions::new("GET", &url);
+        opts.timeout = Duration::from_secs(2);
+
+        let start = Instant::now();
+        let res = client.execute_streaming(&opts, None, |_, _, _| {}, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err());
+        // Should have waited ~75ms CAD before trying TCP (and failed quickly, well under 2s)
+        assert!(elapsed >= Duration::from_millis(65), "elapsed {:?} < 65ms", elapsed);
+        assert!(elapsed < Duration::from_millis(1500), "elapsed {:?} >= 1500ms", elapsed);
+        // Origin must be demoted after H3 failed/timed out in the race
+        assert_eq!(client.alt_svc_registry.get_h3_target("127.0.0.1", tcp_port), None);
+    }
+
+    #[test]
+    fn test_he3_race_warm_h2_pool_skips_h3_race() {
+        use h2_sans_io::{H2Codec, H2Event, H2Header, HpackEncoder};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut codec = H2Codec::new();
+            let mut encoder = HpackEncoder::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if let Ok(events) = codec.process(&buf[..n]) {
+                    for ev in events {
+                        if let H2Event::Settings { ack: false, .. } = ev {
+                            let _ = stream.write_all(&H2Codec::create_settings());
+                            let _ = stream.write_all(&H2Codec::create_settings_ack());
+                            let _ = stream.flush();
+                        } else if let H2Event::Headers { stream_id, .. } = ev {
+                            let hdrs = vec![H2Header::new(":status", "200")];
+                            let hdr_block = encoder.encode(&hdrs);
+                            let _ = stream.write_all(&H2Codec::create_headers_frame(
+                                stream_id,
+                                &hdr_block,
+                                false,
+                            ));
+                            for f in H2Codec::create_data_frames(stream_id, b"WARM_H2", true, 16384)
+                            {
+                                let _ = stream.write_all(&f);
+                            }
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
+                            while stream.read(&mut buf).unwrap_or(0) > 0 {}
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut client = HttpClientEngine::new(tls_cfg);
+
+        // Register an active Alt-Svc H3 target on a blackholed port
+        client
+            .alt_svc_registry
+            .insert("127.0.0.1", port, "h3=\":443\"; ma=86400");
+
+        // Pre-populate h2_pool with a warm H2Session for (0, "127.0.0.1", port, true)
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let h2_session = super::super::h2::H2Session::new(ActiveStream::Plain(tcp)).unwrap();
+        let pool_key = PoolKey::new(0, "127.0.0.1", port, true);
+        client.h2_pool.put(pool_key, h2_session, true);
+
+        let url = format!("https://127.0.0.1:{}/warm_h2", port);
+        let opts = HttpRequestOptions::new("GET", &url);
+        let mut body = Vec::new();
+        let res = client.execute_streaming(
+            &opts,
+            None,
+            |_, _, _| {},
+            |chunk| body.extend_from_slice(chunk),
+            |_| {},
+        );
+
+        assert!(res.is_ok(), "warm H2 failed: {:?}", res);
+        assert_eq!(body, b"WARM_H2");
+        // H3 race was skipped, so Alt-Svc target must remain healthy (not demoted)
+        assert_eq!(
+            client.alt_svc_registry.get_h3_target("127.0.0.1", port),
+            Some(("127.0.0.1".to_string(), 443))
+        );
+
+        drop(client);
+        server_thread.join().unwrap();
     }
 }
