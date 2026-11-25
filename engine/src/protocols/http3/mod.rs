@@ -69,6 +69,15 @@ pub fn build_http3_frame(frame_type: u64, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Build the RFC 9114 §6.2.1 HTTP/3 client control stream initialization bytes:
+/// unidirectional stream type `0x00` (Control Stream) followed by a `SETTINGS` frame (`0x04`).
+pub fn build_control_stream_init() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4);
+    encode_varint(0x00, &mut buf);
+    buf.extend_from_slice(&build_http3_frame(0x04, &[]));
+    buf
+}
+
 pub struct Http3Client;
 
 impl Http3Client {
@@ -183,7 +192,19 @@ impl Http3Client {
             }
         }
 
-        // 2. Open bidirectional request stream
+        // 2. Open mandatory RFC 9114 §6.2.1 unidirectional control stream (0x00) and send SETTINGS (0x04).
+        // Kept open for the lifetime of the connection (must NOT call send.finish()).
+        let ctrl_stream_id = connection
+            .streams()
+            .open(quinn_proto::Dir::Uni)
+            .ok_or("Failed to open QUIC unidirectional control stream".to_string())?;
+        {
+            let ctrl_init = build_control_stream_init();
+            let mut ctrl_send = connection.send_stream(ctrl_stream_id);
+            let _ = ctrl_send.write(&ctrl_init);
+        }
+
+        // 3. Open bidirectional request stream
         let stream_id = connection.streams().open(quinn_proto::Dir::Bi)
             .ok_or("Failed to open QUIC bidirectional stream".to_string())?;
 
@@ -304,9 +325,14 @@ impl Http3Client {
 
                 if frame_type == 0x01 && !headers_dispatched {
                     // HEADERS frame
-                    if let Ok((status, headers)) = QpackCodec::decode_response_headers(payload) {
-                        on_headers(status, "OK", &headers);
-                        headers_dispatched = true;
+                    match QpackCodec::decode_response_headers(payload) {
+                        Ok((status, headers)) => {
+                            on_headers(status, "OK", &headers);
+                            headers_dispatched = true;
+                        }
+                        Err(e) => {
+                            eprintln!("[ZNET-H3] {} QPACK header decode failed: {}", options.url, e);
+                        }
                     }
                 } else if frame_type == 0x00 {
                     // DATA frame
@@ -331,10 +357,22 @@ impl Http3Client {
             }
 
             if connection.is_closed() || connection.is_drained() {
+                if !headers_dispatched {
+                    eprintln!(
+                        "[ZNET-H3] {} QUIC closed/drained before headers (closed={}, drained={})",
+                        options.url,
+                        connection.is_closed(),
+                        connection.is_drained()
+                    );
+                }
                 stream_finished = true;
             }
         }
 
+        if !headers_dispatched {
+            eprintln!("[ZNET-H3] {} falling back to H2 (no headers dispatched)", options.url);
+            return Err("HTTP/3 stream closed before response headers were received".to_string());
+        }
         on_complete(false);
         Ok(true)
     }
@@ -365,5 +403,12 @@ mod tests {
         let (flen, llen) = decode_varint(&frame[tlen..]).unwrap();
         assert_eq!(flen, payload.len() as u64);
         assert_eq!(&frame[tlen + llen..], payload);
+    }
+
+    #[test]
+    fn test_build_control_stream_init() {
+        let init = build_control_stream_init();
+        // Stream type 0x00 (Control) + Frame type 0x04 (SETTINGS) + Length 0x00
+        assert_eq!(init, vec![0x00, 0x04, 0x00]);
     }
 }
