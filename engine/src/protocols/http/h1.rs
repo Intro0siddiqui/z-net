@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 /// Result of feeding bytes into the HTTP/1.1 response state machine.
 #[derive(Debug, PartialEq)]
 pub enum Http1FeedResult {
@@ -300,11 +298,11 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
-/// Builds an HTTP/1.1 wire-formatted request.
+/// Builds an HTTP/1.1 wire-formatted request with strict insertion-order header preservation.
 pub struct Http1RequestBuilder<'a> {
     method: &'a str,
     path: &'a str,
-    headers: HashMap<String, String>,
+    headers: Vec<(String, String)>,
     body: Option<&'a [u8]>,
 }
 
@@ -313,13 +311,14 @@ impl<'a> Http1RequestBuilder<'a> {
         Self {
             method,
             path,
-            headers: HashMap::new(),
+            headers: Vec::new(),
             body: None,
         }
     }
 
+    /// Append a header while preserving exact insertion order.
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        self.headers.insert(name.to_string(), value.to_string());
+        self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
@@ -328,7 +327,7 @@ impl<'a> Http1RequestBuilder<'a> {
         self
     }
 
-    /// Serialize into the HTTP/1.1 wire protocol buffer.
+    /// Serialize into the HTTP/1.1 wire protocol buffer, preserving outgoing header order.
     pub fn serialize(mut self, host: &str, keep_alive: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
 
@@ -339,14 +338,14 @@ impl<'a> Http1RequestBuilder<'a> {
         out.extend_from_slice(b" HTTP/1.1\r\n");
 
         // 2. Host Header (RFC 7230 mandatory)
-        if !self.headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+        if !self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
             out.extend_from_slice(b"Host: ");
             out.extend_from_slice(host.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
 
         // 3. Connection Header
-        if !self.headers.keys().any(|k| k.eq_ignore_ascii_case("connection")) {
+        if !self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")) {
             if keep_alive {
                 out.extend_from_slice(b"Connection: keep-alive\r\n");
             } else {
@@ -356,14 +355,14 @@ impl<'a> Http1RequestBuilder<'a> {
 
         // 4. Body Content-Length
         if let Some(b) = self.body {
-            if !self.headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")) {
+            if !self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
                 let cl = format!("Content-Length: {}\r\n", b.len());
                 out.extend_from_slice(cl.as_bytes());
             }
         }
 
-        // 5. User custom headers
-        for (k, v) in self.headers.drain() {
+        // 5. User custom headers in exact insertion order
+        for (k, v) in self.headers.drain(..) {
             out.extend_from_slice(k.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(v.as_bytes());
@@ -397,6 +396,33 @@ mod tests {
         assert!(req_str.contains("Connection: keep-alive\r\n"));
         assert!(req_str.contains("User-Agent: Zawra/1.0\r\n"));
         assert!(req_str.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_h1_request_builder_preserves_header_order() {
+        let req = Http1RequestBuilder::new("GET", "/fingerprint")
+            .header("Host", "example.com")
+            .header("Connection", "keep-alive")
+            .header("sec-ch-ua", "\"Chromium\";v=\"131\"")
+            .header("sec-ch-ua-mobile", "?0")
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Accept", "text/html,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .serialize("example.com", true);
+
+        let req_str = String::from_utf8(req).unwrap();
+        let expected = concat!(
+            "GET /fingerprint HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Connection: keep-alive\r\n",
+            "sec-ch-ua: \"Chromium\";v=\"131\"\r\n",
+            "sec-ch-ua-mobile: ?0\r\n",
+            "User-Agent: Mozilla/5.0\r\n",
+            "Accept: text/html,*/*;q=0.8\r\n",
+            "Accept-Language: en-US,en;q=0.9\r\n",
+            "\r\n"
+        );
+        assert_eq!(req_str, expected);
     }
 
     #[test]
@@ -441,7 +467,7 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n6\r\npedia \r\nE\r\nin \r\n\r\nchunks.\r\n0\r\n\r\n";
 
         let events = parser.feed(raw).expect("parse chunked");
-        
+
         let mut combined_body = Vec::new();
         let mut completed = false;
 
@@ -486,7 +512,7 @@ mod tests {
     #[test]
     fn test_chunked_streaming_across_network_packets() {
         let mut parser = Http1ResponseParser::new();
-        
+
         // Packet 1: Partial headers
         let ev1 = parser.feed(b"HTTP/1.1 200 OK\r\nTransfer-").unwrap();
         assert_eq!(ev1, vec![Http1FeedResult::NeedMoreData]);
