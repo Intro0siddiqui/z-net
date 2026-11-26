@@ -28,6 +28,7 @@ pub mod protocols {
     pub mod dns;
     pub mod websocket;
     pub mod quic;
+    pub mod tls;
 }
 
 pub mod security {
@@ -386,7 +387,10 @@ impl NetEngine {
             .with_root_certificates(root_store())
             .with_no_client_auth();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config.resumption = rustls::client::Resumption::in_memory_sessions(1024);
+        let rustls_session_store = Arc::new(
+            protocols::tls::PersistentRustlsSessionStore::new_default(1024),
+        );
+        config.resumption = rustls_session_store.into_resumption();
         config.enable_early_data = true;
             
         let tls_cfg = Arc::new(config);
@@ -1253,18 +1257,8 @@ pub extern "C" fn net_http3_connect(
     // store; for the engine scaffolding we use the empty store and
     // rely on QUIC's built-in certificate verification (which can be
     // enabled per-connection via `ClientConfig`).
-    let provider = Arc::new(quinn_proto::rustls::crypto::ring::default_provider());
-    let roots = root_store();
-    let rustls_client_config =
-        quinn_proto::rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&quinn_proto::rustls::version::TLS13])
-            .expect("TLS 1.3 supported")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    let quic_crypto = match quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client_config)) {
-        Ok(c) => Arc::new(c),
-        Err(_) => return null_mut(),
-    };
+    // Reuse the shared QuicClientConfig hosted on HttpClientEngine (avoids per-connection CA disk parse)
+    let quic_crypto = engine.http_engine.quic_crypto().clone();
 
     let mut transport = quinn_proto::TransportConfig::default();
     transport.max_idle_timeout(quinn_proto::IdleTimeout::try_from(
