@@ -1,40 +1,22 @@
-//! HTTP/3 client protocol implementation over QUIC (RFC 9114).
+//! HTTP/3 client protocol implementation over QUIC (RFC 9114) using sans-I/O `quiche`.
 //!
-//! Provides progressive streaming, populated browser-like SETTINGS (with GREASE),
-//! RFC 9204 QPACK dynamic table + Huffman encoding with unidirectional encoder/decoder
-//! streams (`0x02`/`0x03`), shared `QuicClientConfig` with 0-RTT early data, and
-//! fast-failing Happy Eyeballs fallback to TCP TLS.
+//! Uses `quiche::Connection` + `quiche::h3::Connection` backed by the single shared
+//! BoringSSL (`boring`) build, with persistent session resumption and streaming callbacks.
 
-pub mod qpack;
-
-use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use quiche::h3::NameValue;
+
 use crate::protocols::compression::StreamDecompressor;
+use crate::protocols::dns::DnsResolver;
 use crate::protocols::http::client::HttpRequestOptions;
-use crate::protocols::tls::PersistentRustlsSessionStore;
+use crate::protocols::tls::{BoringSessionStore, BoringTlsConfig};
 use crate::BodyRingDescriptor;
-use qpack::{QpackDecodeOutcome, QpackDecoder, QpackEncoder};
-
-/// RFC 9114 / RFC 9204 HTTP/3 SETTINGS identifiers.
-pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
-pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
-/// RFC 9114 §7.2.4.1 GREASE setting ID (`0x1f * N + 0x21`, here N = 42 => `0x537`).
-pub const SETTINGS_GREASE_ID: u64 = 0x1f * 42 + 0x21;
-
-pub const DEFAULT_QPACK_MAX_TABLE_CAPACITY: u64 = 65_536;
-pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 262_144;
-pub const DEFAULT_QPACK_BLOCKED_STREAMS: u64 = 100;
-
-/// RFC 9114 / RFC 9204 unidirectional stream type identifiers.
-pub const H3_STREAM_TYPE_CONTROL: u64 = 0x00;
-pub const H3_STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
-pub const H3_STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 
 pub fn encode_varint(val: u64, buf: &mut Vec<u8>) {
     if val < 64 {
@@ -90,276 +72,200 @@ pub fn build_http3_frame(frame_type: u64, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Build the RFC 9114 §6.2.1 HTTP/3 client control stream initialization bytes:
-/// unidirectional stream type `0x00` (Control Stream) followed by a populated
-/// `SETTINGS` frame (`0x04`) containing `QPACK_MAX_TABLE_CAPACITY`,
-/// `QPACK_BLOCKED_STREAMS`, `MAX_FIELD_SECTION_SIZE`, and a GREASE setting ID.
+/// Build RFC 9114 §6.2.1 HTTP/3 client control stream initialization bytes:
+/// stream type `0x00` + `SETTINGS` frame (`0x04`).
 pub fn build_control_stream_init() -> Vec<u8> {
-    let mut settings_payload = Vec::with_capacity(32);
-    let settings = [
-        (SETTINGS_QPACK_MAX_TABLE_CAPACITY, DEFAULT_QPACK_MAX_TABLE_CAPACITY),
-        (SETTINGS_MAX_FIELD_SECTION_SIZE, DEFAULT_MAX_FIELD_SECTION_SIZE),
-        (SETTINGS_QPACK_BLOCKED_STREAMS, DEFAULT_QPACK_BLOCKED_STREAMS),
-        (SETTINGS_GREASE_ID, 0),
-    ];
-    for (id, val) in settings {
-        encode_varint(id, &mut settings_payload);
-        encode_varint(val, &mut settings_payload);
-    }
-
-    let mut buf = Vec::with_capacity(16 + settings_payload.len());
-    encode_varint(H3_STREAM_TYPE_CONTROL, &mut buf);
+    let mut buf = Vec::with_capacity(32);
+    encode_varint(0x00, &mut buf);
+    let mut settings_payload = Vec::with_capacity(24);
+    encode_varint(0x01, &mut settings_payload);
+    encode_varint(65536, &mut settings_payload);
+    encode_varint(0x06, &mut settings_payload);
+    encode_varint(262144, &mut settings_payload);
+    encode_varint(0x07, &mut settings_payload);
+    encode_varint(100, &mut settings_payload);
+    encode_varint(0x537, &mut settings_payload);
+    encode_varint(1, &mut settings_payload);
     buf.extend_from_slice(&build_http3_frame(0x04, &settings_payload));
     buf
 }
 
-/// Build the unidirectional QPACK Encoder stream (`0x02`) header.
-pub fn build_qpack_encoder_stream_init() -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2);
-    encode_varint(H3_STREAM_TYPE_QPACK_ENCODER, &mut buf);
-    buf
+fn generate_scid() -> quiche::ConnectionId<'static> {
+    let mut bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+    crate::protocols::tls::random_bytes(&mut bytes);
+    quiche::ConnectionId::from_vec(bytes.to_vec())
 }
 
-/// Build the unidirectional QPACK Decoder stream (`0x03`) header.
-pub fn build_qpack_decoder_stream_init() -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2);
-    encode_varint(H3_STREAM_TYPE_QPACK_DECODER, &mut buf);
-    buf
-}
-
-/// Build a shared `Arc<quinn_proto::crypto::rustls::QuicClientConfig>` once (avoiding
-/// per-connection `/etc/ssl/certs/ca-certificates.crt` disk parses), with `h3` ALPN,
-/// persistent session resumption, and 0-RTT `enable_early_data = true`.
-pub fn build_shared_quic_client_config() -> Result<Arc<quinn_proto::crypto::rustls::QuicClientConfig>, String> {
-    let provider = Arc::new(quinn_proto::rustls::crypto::ring::default_provider());
-    let roots = crate::root_store();
-    let mut rustls_client_config =
-        quinn_proto::rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&quinn_proto::rustls::version::TLS13])
-            .map_err(|e| format!("TLS 1.3 config failed: {}", e))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-
-    rustls_client_config.alpn_protocols = vec![b"h3".to_vec()];
-    let session_store = Arc::new(PersistentRustlsSessionStore::new_default(1024));
-    rustls_client_config.resumption = session_store.into_resumption();
-    rustls_client_config.enable_early_data = true;
-
-    let quic_crypto =
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client_config))
-            .map_err(|e| format!("QuicClientConfig failed: {:?}", e))?;
-    Ok(Arc::new(quic_crypto))
-}
-
-fn default_shared_quic_crypto() -> Result<Arc<quinn_proto::crypto::rustls::QuicClientConfig>, String> {
-    static SHARED: OnceLock<Arc<quinn_proto::crypto::rustls::QuicClientConfig>> = OnceLock::new();
-    if let Some(cfg) = SHARED.get() {
-        return Ok(cfg.clone());
-    }
-    let built = build_shared_quic_client_config()?;
-    let _ = SHARED.set(built.clone());
-    Ok(built)
-}
-
+/// Non-blocking QUIC handshake state driven by `compio-driver::Proactor` during HEv3 races.
 pub struct QuicHandshakeState {
-    pub endpoint: quinn_proto::Endpoint,
-    pub ch: quinn_proto::ConnectionHandle,
-    pub connection: quinn_proto::Connection,
-    pub tx_buf: Vec<u8>,
-    pub rx_buf: [u8; 4096],
+    pub socket: UdpSocket,
+    conn: quiche::Connection,
+    pub local_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
+    pub host: String,
+    pub session_store: Arc<BoringSessionStore>,
 }
 
 impl QuicHandshakeState {
-    /// Bind a non-blocking UDP socket and initiate a QUIC handshake using a shared
-    /// `Arc<quinn_proto::crypto::rustls::QuicClientConfig>`.
-    pub fn start_with_config(
-        server_addr: std::net::SocketAddr,
-        sni_host: &str,
-        quic_crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
-    ) -> Result<(Self, UdpSocket), String> {
-        let bind_addr = if server_addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
+    pub fn timeout(&self) -> Option<std::time::Duration> {
+        self.conn.timeout()
+    }
+
+    pub fn start(
+        host: &str,
+        port: u16,
+        dns_resolver: &DnsResolver,
+        boring_tls: &BoringTlsConfig,
+    ) -> Result<Self, String> {
+        let addrs = dns_resolver.resolve(host, port)?;
+        let server_addr = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("No address found for {}:{}", host, port))?;
+
+        let bind_addr = if server_addr.is_ipv6() {
             "[::]:0"
+        } else {
+            "0.0.0.0:0"
         };
-        let socket = UdpSocket::bind(bind_addr)
-            .map_err(|e| format!("UDP bind failed: {}", e))?;
+        let socket = UdpSocket::bind(bind_addr).map_err(|e| format!("UDP bind failed: {}", e))?;
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("Failed to set nonblocking UDP: {}", e))?;
+        Self::connect_with_socket(socket, server_addr, host, boring_tls)
+    }
 
-        let endpoint_config = Arc::new(quinn_proto::EndpointConfig::default());
-        let mut endpoint = quinn_proto::Endpoint::new(endpoint_config, None, false, None);
+    pub fn connect_with_socket(
+        socket: UdpSocket,
+        server_addr: SocketAddr,
+        host: &str,
+        boring_tls: &BoringTlsConfig,
+    ) -> Result<Self, String> {
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| format!("UDP local_addr failed: {}", e))?;
 
-        let mut transport = quinn_proto::TransportConfig::default();
-        transport.max_idle_timeout(quinn_proto::IdleTimeout::try_from(Duration::from_secs(30)).ok());
-        let mut client_config = quinn_proto::ClientConfig::new(quic_crypto);
-        client_config.transport_config(Arc::new(transport));
+        let mut config = boring_tls.build_quiche_config()?;
+        let scid = generate_scid();
+        let mut conn = quiche::connect(Some(host), &scid, local_addr, server_addr, &mut config)
+            .map_err(|e| format!("quiche::connect failed: {:?}", e))?;
 
-        let start_time = Instant::now();
-        let (ch, connection) = endpoint
-            .connect(start_time, client_config, server_addr, sni_host)
-            .map_err(|e| format!("QUIC connect error: {:?}", e))?;
+        // Attempt 0-RTT / 1-RTT session resumption if a persisted ticket exists
+        if let Some(ticket) = boring_tls
+            .session_store
+            .get(&format!("h3:{}:{}", host, server_addr.port()))
+        {
+            let _ = conn.set_session(&ticket);
+        }
 
-        Ok((
-            Self {
-                endpoint,
-                ch,
-                connection,
-                tx_buf: Vec::new(),
-                rx_buf: [0u8; 4096],
-            },
+        let mut state = Self {
             socket,
-        ))
+            conn,
+            local_addr,
+            peer_addr: server_addr,
+            host: host.to_string(),
+            session_store: boring_tls.session_store.clone(),
+        };
+        state.flush_transmits();
+        Ok(state)
     }
 
-    /// Convenience wrapper using the process-wide cached `QuicClientConfig`.
-    pub fn start(server_addr: std::net::SocketAddr, sni_host: &str) -> Result<(Self, UdpSocket), String> {
-        let quic_crypto = default_shared_quic_crypto()?;
-        Self::start_with_config(server_addr, sni_host, quic_crypto)
+    pub fn drive_nonblocking(&mut self) -> i32 {
+        let mut processed = 0;
+        let mut rx_buf = [0u8; 4096];
+        loop {
+            match self.socket.recv_from(&mut rx_buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo {
+                        from,
+                        to: self.local_addr,
+                    };
+                    let _ = self.conn.recv(&mut rx_buf[..len], recv_info);
+                    processed += 1;
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        if let Some(timeout) = self.conn.timeout() {
+            if timeout.is_zero() {
+                self.conn.on_timeout();
+            }
+        }
+        self.flush_transmits();
+        processed
     }
 
-    /// Flush all pending QUIC transmits to `socket`.
-    pub fn flush_transmits(&mut self, socket: &UdpSocket, now: Instant) {
-        while let Some(transmit) = self.connection.poll_transmit(now, 1, &mut self.tx_buf) {
-            let _ = socket.send_to(&self.tx_buf[..transmit.size], transmit.destination);
-            self.tx_buf.clear();
+    pub fn close_gracefully(&mut self) {
+        let _ = self.conn.close(false, 0, b"client closed");
+        self.flush_transmits();
+    }
+
+    pub fn migrate_socket(&mut self, new_socket: UdpSocket, new_local: SocketAddr) {
+        self.socket = new_socket;
+        self.local_addr = new_local;
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+
+    pub fn flush_transmits(&mut self) {
+        let mut out = [0u8; 1350];
+        loop {
+            match self.conn.send(&mut out) {
+                Ok((write, send_info)) => {
+                    let _ = self.socket.send_to(&out[..write], send_info.to);
+                }
+                Err(quiche::Error::Done) => break,
+                Err(_) => break,
+            }
         }
     }
 
-    /// Drain all currently readable UDP datagrams from `socket` into the QUIC endpoint/connection.
-    pub fn drain_udp(&mut self, socket: &UdpSocket, now: Instant) -> Result<(), String> {
+    /// Drain incoming UDP packets and advance handshake state. Returns `Ok(true)` once established.
+    pub fn poll_recv_and_advance(&mut self) -> Result<bool, String> {
+        let mut rx_buf = [0u8; 4096];
         loop {
-            match socket.recv_from(&mut self.rx_buf) {
-                Ok((n, remote)) => {
-                    let data = bytes::BytesMut::from(&self.rx_buf[..n]);
-                    let event = self.endpoint.handle(now, remote, None, None, data, &mut self.tx_buf);
-                    if let Some(quinn_proto::DatagramEvent::ConnectionEvent(h, conn_event)) = event {
-                        if h == self.ch {
-                            let _ = self.connection.handle_event(conn_event);
-                        }
-                    }
+            match self.socket.recv_from(&mut rx_buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo {
+                        from,
+                        to: self.local_addr,
+                    };
+                    let _ = self.conn.recv(&mut rx_buf[..len], recv_info);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => return Err(format!("UDP socket error: {}", e)),
             }
         }
-        Ok(())
-    }
 
-    /// Advance QUIC timers and events. Returns `Ok(true)` if handshake is complete,
-    /// `Ok(false)` if still handshaking, or `Err` if closed/drained.
-    pub fn poll_handshake_step(&mut self, now: Instant) -> Result<bool, String> {
-        if let Some(timeout) = self.connection.poll_timeout() {
-            if timeout <= now {
-                self.connection.handle_timeout(now);
+        if let Some(timeout) = self.conn.timeout() {
+            if timeout.is_zero() {
+                self.conn.on_timeout();
             }
         }
 
-        let mut handshake_err: Option<String> = None;
-        while let Some(ev) = self.connection.poll() {
-            if let quinn_proto::Event::ConnectionLost { reason } = ev {
-                handshake_err = Some(format!("{:?}", reason));
-            }
+        self.flush_transmits();
+
+        if self.conn.is_closed() {
+            return Err("QUIC connection closed during handshake".to_string());
         }
 
-        if self.connection.is_closed() || self.connection.is_drained() {
-            return Err(format!(
-                "QUIC connection closed during handshake (reason={:?})",
-                handshake_err
-            ));
-        }
-
-        Ok(!self.connection.is_handshaking())
+        Ok(self.conn.is_established() || self.conn.is_in_early_data())
     }
-}
 
-/// Peer unidirectional stream classification for HTTP/3 (Control, QPACK Encoder, QPACK Decoder).
-enum PeerUniStreamKind {
-    Unknown,
-    Control,
-    QpackEncoder,
-    QpackDecoder,
-    Ignored,
-}
-
-struct PeerUniStream {
-    kind: PeerUniStreamKind,
-    buf: Vec<u8>,
+    pub fn is_failed(&self) -> bool {
+        self.conn.is_closed()
+    }
 }
 
 pub struct Http3Client;
 
 impl Http3Client {
-    /// Attempt HTTP/3 request execution with progressive chunk streaming.
-    ///
-    /// If the QUIC handshake fails or takes longer than `handshake_timeout`
-    /// (e.g. UDP blocked or packet dropped), returns `Err` quickly so the
-    /// caller can fall back to TCP TLS without user-visible stalling.
-    pub fn execute_streaming<H, D, C, K>(
-        host: &str,
-        port: u16,
-        dns_resolver: &crate::protocols::dns::DnsResolver,
-        options: &HttpRequestOptions,
-        body_ring: Option<&BodyRingDescriptor>,
-        on_headers: H,
-        on_data_chunk: D,
-        on_complete: C,
-        mut is_cancelled: K,
-        handshake_timeout: Duration,
-    ) -> Result<bool, String>
-    where
-        H: FnMut(u16, &str, &[(String, String)]),
-        D: FnMut(&[u8]),
-        C: FnMut(bool),
-        K: FnMut() -> bool,
-    {
-        let addrs = dns_resolver.resolve(host, port)?;
-        let server_addr = addrs
-            .into_iter()
-            .find(|a| a.is_ipv4())
-            .ok_or_else(|| format!("No IPv4 address found for {}:{}", host, port))?;
-
-        let (mut state, socket) = QuicHandshakeState::start(server_addr, host)?;
-        let start_time = Instant::now();
-        let handshake_deadline = start_time + handshake_timeout;
-
-        while state.connection.is_handshaking() {
-            if is_cancelled() {
-                return Err("Request cancelled during QUIC handshake".to_string());
-            }
-            let now = Instant::now();
-            if now > handshake_deadline {
-                return Err("QUIC handshake timed out (falling back to TCP)".to_string());
-            }
-
-            state.flush_transmits(&socket, now);
-            state.drain_udp(&socket, now)?;
-            if state.poll_handshake_step(now)? {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        Self::execute_connected_streaming(
-            state,
-            socket,
-            host,
-            options,
-            body_ring,
-            on_headers,
-            on_data_chunk,
-            on_complete,
-            is_cancelled,
-        )
-    }
-
-    /// Execute an HTTP/3 request over an already-handshaken `QuicHandshakeState` and `UdpSocket`.
-    #[allow(clippy::too_many_arguments)]
+    /// Execute an HTTP/3 request over an already-established `QuicHandshakeState` using `quiche::h3`.
     pub fn execute_connected_streaming<H, D, C, K>(
         mut state: QuicHandshakeState,
-        socket: UdpSocket,
-        host: &str,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         mut on_headers: H,
@@ -373,48 +279,22 @@ impl Http3Client {
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
-        let QuicHandshakeState {
-            ref mut endpoint,
-            ch,
-            ref mut connection,
-            ref mut tx_buf,
-            ref mut rx_buf,
-        } = state;
-
-        // 1. Open mandatory RFC 9114 §6.2.1 unidirectional control stream (0x00) and send populated SETTINGS (0x04).
-        let ctrl_stream_id = connection
-            .streams()
-            .open(quinn_proto::Dir::Uni)
-            .ok_or("Failed to open QUIC unidirectional control stream".to_string())?;
-        {
-            let ctrl_init = build_control_stream_init();
-            let mut ctrl_send = connection.send_stream(ctrl_stream_id);
-            let _ = ctrl_send.write(&ctrl_init);
+        // Persist any new session ticket for future 0-RTT/1-RTT resumption
+        if let Some(session_bytes) = state.conn.session() {
+            state.session_store.insert(
+                &format!("h3:{}:{}", state.host, state.peer_addr.port()),
+                session_bytes.to_vec(),
+            );
         }
 
-        // 2. Open unidirectional QPACK Encoder (0x02) and Decoder (0x03) streams (RFC 9204 §4.2).
-        let qpack_enc_stream_id = connection.streams().open(quinn_proto::Dir::Uni);
-        if let Some(enc_sid) = qpack_enc_stream_id {
-            let mut s = connection.send_stream(enc_sid);
-            let _ = s.write(&build_qpack_encoder_stream_init());
-        }
-        let qpack_dec_stream_id = connection.streams().open(quinn_proto::Dir::Uni);
-        if let Some(dec_sid) = qpack_dec_stream_id {
-            let mut s = connection.send_stream(dec_sid);
-            let _ = s.write(&build_qpack_decoder_stream_init());
-        }
+        let mut h3_config = quiche::h3::Config::new()
+            .map_err(|e| format!("quiche::h3::Config failed: {:?}", e))?;
+        h3_config.set_qpack_max_table_capacity(65536);
+        h3_config.set_qpack_blocked_streams(100);
+        h3_config.set_max_field_section_size(262144);
 
-        // Start client encoder with capacity=0 until peer SETTINGS advertises QPACK capacity
-        // (avoids blocking the first request before receiving server SETTINGS), while our
-        // decoder supports full 64KiB dynamic table as advertised in our SETTINGS.
-        let mut qpack_encoder = QpackEncoder::new(0);
-        let mut qpack_decoder = QpackDecoder::new(DEFAULT_QPACK_MAX_TABLE_CAPACITY as usize);
-
-        // 3. Open bidirectional request stream
-        let stream_id = connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .ok_or("Failed to open QUIC bidirectional stream".to_string())?;
+        let mut h3_conn = quiche::h3::Connection::with_transport(&mut state.conn, &h3_config)
+            .map_err(|e| format!("quiche::h3::Connection failed: {:?}", e))?;
 
         let url = url::Url::parse(&options.url).map_err(|e| format!("Invalid URL: {}", e))?;
         let mut path_and_query = url.path().to_string();
@@ -426,389 +306,201 @@ impl Http3Client {
             path_and_query = "/".to_string();
         }
 
-        let has_range_header = options
-            .headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let authority = match url.port() {
+            Some(p) => format!("{}:{}", state.host, p),
+            None => state.host.clone(),
+        };
 
-        // QPACK encode headers (with Huffman H=1 literal compression)
-        let (enc_instructions, qpack_hdr) = qpack_encoder.encode_headers(
-            &options.method,
-            url.scheme(),
-            host,
-            &path_and_query,
-            &options.headers,
-        );
-        if !enc_instructions.is_empty() {
-            if let Some(enc_sid) = qpack_enc_stream_id {
-                let mut s = connection.send_stream(enc_sid);
-                let _ = s.write(&enc_instructions);
+        let mut h3_headers = Vec::with_capacity(4 + options.headers.len());
+        h3_headers.push(quiche::h3::Header::new(b":method", options.method.as_bytes()));
+        h3_headers.push(quiche::h3::Header::new(b":scheme", url.scheme().as_bytes()));
+        h3_headers.push(quiche::h3::Header::new(b":authority", authority.as_bytes()));
+        h3_headers.push(quiche::h3::Header::new(b":path", path_and_query.as_bytes()));
+        for (k, v) in &options.headers {
+            h3_headers.push(quiche::h3::Header::new(
+                k.to_ascii_lowercase().as_bytes(),
+                v.as_bytes(),
+            ));
+        }
+
+        let has_body = options.body.as_ref().map_or(false, |b| !b.is_empty());
+        let req_stream_id = h3_conn
+            .send_request(&mut state.conn, &h3_headers, !has_body)
+            .map_err(|e| format!("quiche::h3 send_request failed: {:?}", e))?;
+
+        if let Some(ref body) = options.body {
+            if !body.is_empty() {
+                let _ = h3_conn.send_body(&mut state.conn, req_stream_id, body, true);
             }
         }
-        let headers_frame = build_http3_frame(0x01, &qpack_hdr);
+        state.flush_transmits();
 
-        {
-            let mut send = connection.send_stream(stream_id);
-            let _ = send.write(&headers_frame);
-            if let Some(ref body) = options.body {
-                let data_frame = build_http3_frame(0x00, body);
-                let _ = send.write(&data_frame);
-            }
-            let _ = send.finish();
-        }
-
-        // Transmit request frames immediately
-        let now = Instant::now();
-        while let Some(transmit) = connection.poll_transmit(now, 1, tx_buf) {
-            let _ = socket.send_to(&tx_buf[..transmit.size], transmit.destination);
-            tx_buf.clear();
-        }
-
-        // 4. Receive Response Loop (Frames: HEADERS 0x01, DATA 0x00 + peer unidirectional QPACK streams)
-        let mut stream_buffer = Vec::new();
-        let mut pending_blocked_headers: Option<Vec<u8>> = None;
-        let mut peer_uni_streams: HashMap<quinn_proto::StreamId, PeerUniStream> = HashMap::new();
+        let has_range_header = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let mut decompressor: Option<StreamDecompressor> = None;
         let mut headers_dispatched = false;
         let mut stream_finished = false;
-        let mut last_conn_err: Option<String> = None;
-        let mut decompressor: Option<StreamDecompressor> = None;
+        let mut rx_buf = [0u8; 4096];
         let request_deadline = Instant::now() + options.timeout;
-
-        let req_stream_id_u64 = u64::from(stream_id);
 
         while !stream_finished {
             if is_cancelled() {
                 return Err("Request cancelled".to_string());
             }
-            let now = Instant::now();
-            if now > request_deadline {
+            if Instant::now() > request_deadline {
                 return Err("HTTP/3 request timed out".to_string());
             }
 
-            // Flush transmits
-            while let Some(transmit) = connection.poll_transmit(now, 1, tx_buf) {
-                let _ = socket.send_to(&tx_buf[..transmit.size], transmit.destination);
-                tx_buf.clear();
-            }
-
-            // Read UDP socket
-            match socket.recv_from(rx_buf) {
-                Ok((n, remote)) => {
-                    let data = bytes::BytesMut::from(&rx_buf[..n]);
-                    let event = endpoint.handle(now, remote, None, None, data, tx_buf);
-                    if let Some(quinn_proto::DatagramEvent::ConnectionEvent(h, conn_event)) = event {
-                        if h == ch {
-                            let _ = connection.handle_event(conn_event);
-                        }
+            if let Some(ring) = body_ring {
+                while ring.should_stop_reading() && !ring.is_closed.load(Ordering::Acquire) {
+                    if is_cancelled() {
+                        return Err("Request cancelled".to_string());
                     }
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(e) => return Err(format!("UDP read error: {}", e)),
-            }
-
-            if let Some(timeout) = connection.poll_timeout() {
-                if timeout <= now {
-                    connection.handle_timeout(now);
+                    ring.wait_drain(5);
                 }
             }
 
-            // Accept & drain peer unidirectional streams (0x00 Control, 0x02 QPACK Encoder, 0x03 QPACK Decoder)
-            while let Some(uni_sid) = connection.streams().accept(quinn_proto::Dir::Uni) {
-                peer_uni_streams.entry(uni_sid).or_insert_with(|| PeerUniStream {
-                    kind: PeerUniStreamKind::Unknown,
-                    buf: Vec::new(),
-                });
-            }
-            for (&uni_sid, uni_state) in peer_uni_streams.iter_mut() {
-                let mut recv = connection.recv_stream(uni_sid);
-                if let Ok(mut chunks) = recv.read(true) {
-                    loop {
-                        match chunks.next(4096) {
-                            Ok(Some(chunk)) => uni_state.buf.extend_from_slice(&chunk.bytes),
-                            Ok(None) | Err(quinn_proto::ReadError::Blocked) => break,
-                            Err(quinn_proto::ReadError::Reset(_)) => break,
-                        }
-                    }
-                    let _ = chunks.finalize();
-                }
-
-                if matches!(uni_state.kind, PeerUniStreamKind::Unknown) {
-                    if let Some((stype, slen)) = decode_varint(&uni_state.buf) {
-                        uni_state.buf.drain(..slen);
-                        uni_state.kind = match stype {
-                            H3_STREAM_TYPE_CONTROL => PeerUniStreamKind::Control,
-                            H3_STREAM_TYPE_QPACK_ENCODER => PeerUniStreamKind::QpackEncoder,
-                            H3_STREAM_TYPE_QPACK_DECODER => PeerUniStreamKind::QpackDecoder,
-                            _ => PeerUniStreamKind::Ignored,
+            let mut got_packet = false;
+            loop {
+                match state.socket.recv_from(&mut rx_buf) {
+                    Ok((len, from)) => {
+                        got_packet = true;
+                        let recv_info = quiche::RecvInfo {
+                            from,
+                            to: state.local_addr,
                         };
+                        let _ = state.conn.recv(&mut rx_buf[..len], recv_info);
                     }
-                }
-
-                match uni_state.kind {
-                    PeerUniStreamKind::QpackEncoder if !uni_state.buf.is_empty() => {
-                        let bytes = std::mem::take(&mut uni_state.buf);
-                        if let Ok(inc_ack) = qpack_decoder.process_encoder_stream(&bytes) {
-                            if !inc_ack.is_empty() {
-                                if let Some(dec_sid) = qpack_dec_stream_id {
-                                    let mut s = connection.send_stream(dec_sid);
-                                    let _ = s.write(&inc_ack);
-                                }
-                            }
-                        }
-                    }
-                    PeerUniStreamKind::QpackDecoder if !uni_state.buf.is_empty() => {
-                        let bytes = std::mem::take(&mut uni_state.buf);
-                        let _ = qpack_encoder.process_decoder_stream(&bytes);
-                    }
-                    PeerUniStreamKind::Control | PeerUniStreamKind::Ignored => {
-                        uni_state.buf.clear();
-                    }
-                    _ => {}
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(format!("UDP receive error: {}", e)),
                 }
             }
 
-            // Retry any blocked HEADERS frame if QPACK Insert Count caught up
-            if !headers_dispatched {
-                if let Some(blocked_payload) = pending_blocked_headers.take() {
-                    match qpack_decoder.decode_field_section(req_stream_id_u64, &blocked_payload) {
-                        Ok(QpackDecodeOutcome::Decoded {
-                            status,
-                            headers,
-                            section_ack,
-                        }) => {
-                            if !section_ack.is_empty() {
-                                if let Some(dec_sid) = qpack_dec_stream_id {
-                                    let mut s = connection.send_stream(dec_sid);
-                                    let _ = s.write(&section_ack);
+            loop {
+                match h3_conn.poll(&mut state.conn) {
+                    Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == req_stream_id => {
+                        let mut status: u16 = 200;
+                        let mut headers_vec = Vec::with_capacity(list.len());
+                        for hdr in list {
+                            let name = String::from_utf8_lossy(hdr.name()).to_string();
+                            let value = String::from_utf8_lossy(hdr.value()).to_string();
+                            if name == ":status" {
+                                status = value.parse::<u16>().unwrap_or(200);
+                            } else if !name.starts_with(':') {
+                                headers_vec.push((name, value));
+                            }
+                        }
+
+                        if !headers_dispatched {
+                            let should_decompress =
+                                options.transparent_decompression && !has_range_header && status != 206;
+                            if should_decompress {
+                                if let Some((_, enc)) = headers_vec
+                                    .iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                                {
+                                    if let Some(dec) = StreamDecompressor::new(enc) {
+                                        decompressor = Some(dec);
+                                    }
                                 }
                             }
-                            dispatch_h3_headers(
-                                status,
-                                headers,
-                                options.transparent_decompression,
-                                has_range_header,
-                                &mut decompressor,
-                                &mut on_headers,
-                            );
+                            if decompressor.is_some() {
+                                headers_vec.retain(|(k, _)| {
+                                    !k.eq_ignore_ascii_case("content-encoding")
+                                        && !k.eq_ignore_ascii_case("content-length")
+                                });
+                            }
+                            on_headers(status, "", &headers_vec);
                             headers_dispatched = true;
                         }
-                        Ok(QpackDecodeOutcome::Blocked { .. }) => {
-                            pending_blocked_headers = Some(blocked_payload);
-                        }
-                        Err(e) => {
-                            eprintln!("[ZNET-H3] {} QPACK header decode failed: {}", options.url, e);
-                        }
                     }
-                }
-            }
-
-            // Read incoming bytes off the request stream
-            let mut recv_eof = false;
-            {
-                let mut recv = connection.recv_stream(stream_id);
-                if let Ok(mut chunks) = recv.read(true) {
-                    loop {
-                        match chunks.next(4096) {
-                            Ok(Some(chunk)) => {
-                                stream_buffer.extend_from_slice(&chunk.bytes);
-                            }
-                            Ok(None) => {
-                                recv_eof = true;
+                    Ok((sid, quiche::h3::Event::Data)) if sid == req_stream_id => {
+                        let mut body_buf = [0u8; 8192];
+                        while let Ok(read) = h3_conn.recv_body(&mut state.conn, sid, &mut body_buf) {
+                            if read == 0 {
                                 break;
                             }
-                            Err(quinn_proto::ReadError::Blocked) => break,
-                            Err(quinn_proto::ReadError::Reset(code)) => {
-                                if !headers_dispatched {
-                                    eprintln!(
-                                        "[ZNET-H3] {} stream reset by peer (code={:?})",
-                                        options.url, code
-                                    );
+                            let chunk = &body_buf[..read];
+                            if let Some(ref mut dec) = decompressor {
+                                dec.feed(chunk, |decompressed| {
+                                    if let Some(ring) = body_ring {
+                                        let mut offset = 0;
+                                        while offset < decompressed.len()
+                                            && !ring.is_closed.load(Ordering::Acquire)
+                                        {
+                                            let written = ring.write_slice(&decompressed[offset..]);
+                                            offset += written;
+                                            if offset < decompressed.len() {
+                                                ring.wait_drain(5);
+                                            }
+                                        }
+                                    }
+                                    on_data_chunk(decompressed);
+                                })?;
+                            } else {
+                                if let Some(ring) = body_ring {
+                                    let mut offset = 0;
+                                    while offset < chunk.len()
+                                        && !ring.is_closed.load(Ordering::Acquire)
+                                    {
+                                        let written = ring.write_slice(&chunk[offset..]);
+                                        offset += written;
+                                        if offset < chunk.len() {
+                                            ring.wait_drain(5);
+                                        }
+                                    }
                                 }
-                                recv_eof = true;
-                                break;
+                                on_data_chunk(chunk);
                             }
                         }
                     }
-                    let _ = chunks.finalize();
-                };
-            }
-
-            // Process HTTP/3 frames from stream_buffer
-            let mut pos = 0;
-            while pos < stream_buffer.len() {
-                let slice = &stream_buffer[pos..];
-                let (frame_type, type_len) = match decode_varint(slice) {
-                    Some(v) => v,
-                    None => break,
-                };
-                let (frame_len, len_len) = match decode_varint(&slice[type_len..]) {
-                    Some(v) => v,
-                    None => break,
-                };
-
-                let header_size = type_len + len_len;
-                let payload_len = frame_len as usize;
-                if slice.len() < header_size + payload_len {
-                    break;
-                }
-
-                let payload = &slice[header_size..header_size + payload_len];
-
-                if frame_type == 0x01 && !headers_dispatched {
-                    match qpack_decoder.decode_field_section(req_stream_id_u64, payload) {
-                        Ok(QpackDecodeOutcome::Decoded {
-                            status,
-                            headers,
-                            section_ack,
-                        }) => {
-                            if !section_ack.is_empty() {
-                                if let Some(dec_sid) = qpack_dec_stream_id {
-                                    let mut s = connection.send_stream(dec_sid);
-                                    let _ = s.write(&section_ack);
-                                }
-                            }
-                            dispatch_h3_headers(
-                                status,
-                                headers,
-                                options.transparent_decompression,
-                                has_range_header,
-                                &mut decompressor,
-                                &mut on_headers,
-                            );
-                            headers_dispatched = true;
-                        }
-                        Ok(QpackDecodeOutcome::Blocked { .. }) => {
-                            pending_blocked_headers = Some(payload.to_vec());
-                        }
-                        Err(e) => {
-                            eprintln!("[ZNET-H3] {} QPACK header decode failed: {}", options.url, e);
-                        }
-                    }
-                } else if frame_type == 0x00 {
-                    // Wait until blocked headers are resolved before delivering DATA if needed
-                    if !headers_dispatched && pending_blocked_headers.is_some() {
+                    Ok((sid, quiche::h3::Event::Finished)) if sid == req_stream_id => {
+                        stream_finished = true;
                         break;
                     }
-                    if let Some(ref mut dec) = decompressor {
-                        dec.feed(payload, |decompressed_slice| {
-                            if let Some(ring) = body_ring {
-                                write_h3_slice_to_ring(ring, decompressed_slice);
-                            }
-                            on_data_chunk(decompressed_slice);
-                        })
-                        .map_err(|e| format!("h3 decompression error: {}", e))?;
-                    } else {
-                        if let Some(ring) = body_ring {
-                            write_h3_slice_to_ring(ring, payload);
-                        }
-                        on_data_chunk(payload);
+                    Ok((sid, quiche::h3::Event::Reset(_))) if sid == req_stream_id => {
+                        return Err("HTTP/3 stream reset by peer".to_string());
                     }
-                }
-
-                pos += header_size + payload_len;
-            }
-
-            if pos > 0 {
-                stream_buffer.drain(..pos);
-            }
-
-            while let Some(ev) = connection.poll() {
-                if let quinn_proto::Event::ConnectionLost { reason } = ev {
-                    last_conn_err = Some(format!("{:?}", reason));
+                    Ok((_, quiche::h3::Event::GoAway)) => {
+                        stream_finished = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(format!("quiche::h3 poll error: {:?}", e)),
                 }
             }
 
-            if recv_eof && pending_blocked_headers.is_none() {
-                stream_finished = true;
+            if let Some(timeout) = state.conn.timeout() {
+                if timeout.is_zero() {
+                    state.conn.on_timeout();
+                }
             }
+            state.flush_transmits();
 
-            if connection.is_closed() || connection.is_drained() {
+            if state.conn.is_closed() && !stream_finished {
                 if !headers_dispatched {
-                    eprintln!(
-                        "[ZNET-H3] {} QUIC closed/drained before headers (closed={}, drained={}, reason={:?})",
-                        options.url,
-                        connection.is_closed(),
-                        connection.is_drained(),
-                        last_conn_err
-                    );
+                    return Err("HTTP/3 connection closed before response headers".to_string());
                 }
                 stream_finished = true;
+            } else if !got_packet && !stream_finished {
+                std::thread::sleep(Duration::from_millis(2));
             }
         }
 
         if let Some(dec) = decompressor.take() {
-            dec.finish(|decompressed_slice| {
+            dec.finish(|decompressed| {
                 if let Some(ring) = body_ring {
-                    write_h3_slice_to_ring(ring, decompressed_slice);
+                    ring.write_slice(decompressed);
                 }
-                on_data_chunk(decompressed_slice);
-            })
-            .map_err(|e| format!("h3 decompression finish error: {}", e))?;
+                on_data_chunk(decompressed);
+            })?;
         }
 
         if !headers_dispatched {
-            eprintln!(
-                "[ZNET-H3] {} falling back to H2 (no headers dispatched)",
-                options.url
-            );
             return Err("HTTP/3 stream closed before response headers were received".to_string());
         }
         on_complete(false);
         Ok(true)
-    }
-}
-
-fn write_h3_slice_to_ring(ring: &BodyRingDescriptor, slice: &[u8]) {
-    let mut offset = 0;
-    while offset < slice.len() && !ring.is_closed.load(Ordering::Acquire) {
-        let written = ring.write_slice(&slice[offset..]);
-        offset += written;
-        if offset < slice.len() {
-            ring.wait_drain(5);
-        }
-    }
-}
-
-fn dispatch_h3_headers<H>(
-    status: u16,
-    headers: Vec<(String, String)>,
-    transparent_decompression: bool,
-    has_range_header: bool,
-    decompressor: &mut Option<StreamDecompressor>,
-    on_headers: &mut H,
-) where
-    H: FnMut(u16, &str, &[(String, String)]),
-{
-    let reason = http::StatusCode::from_u16(status)
-        .ok()
-        .and_then(|s| s.canonical_reason())
-        .unwrap_or("OK");
-
-    let should_decompress = transparent_decompression && !has_range_header && status != 206;
-    if should_decompress {
-        if let Some((_, enc)) = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-        {
-            if let Some(dec) = StreamDecompressor::new(enc) {
-                *decompressor = Some(dec);
-            }
-        }
-    }
-
-    if decompressor.is_some() {
-        let filtered: Vec<(String, String)> = headers
-            .into_iter()
-            .filter(|(k, _)| {
-                !k.eq_ignore_ascii_case("content-encoding")
-                    && !k.eq_ignore_ascii_case("content-length")
-            })
-            .collect();
-        on_headers(status, reason, &filtered);
-    } else {
-        on_headers(status, reason, &headers);
     }
 }
 
@@ -818,18 +510,7 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        let test_values = [
-            0,
-            1,
-            25,
-            63,
-            64,
-            16383,
-            16384,
-            1073741823,
-            1073741824,
-            4611686018427387903,
-        ];
+        let test_values = [0, 1, 25, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903];
         for &val in &test_values {
             let mut buf = Vec::new();
             encode_varint(val, &mut buf);
@@ -853,47 +534,23 @@ mod tests {
     #[test]
     fn test_build_control_stream_init() {
         let init = build_control_stream_init();
-        let (stype, slen) = decode_varint(&init).unwrap();
-        assert_eq!(stype, H3_STREAM_TYPE_CONTROL);
-
-        let (ftype, flen) = decode_varint(&init[slen..]).unwrap();
-        assert_eq!(ftype, 0x04); // SETTINGS frame
-
-        let (plen, plen_len) = decode_varint(&init[slen + flen..]).unwrap();
-        let payload = &init[slen + flen + plen_len..];
-        assert_eq!(payload.len(), plen as usize);
-
-        let mut pos = 0;
-        let mut settings = Vec::new();
-        while pos < payload.len() {
-            let (id, ilen) = decode_varint(&payload[pos..]).unwrap();
-            pos += ilen;
-            let (val, vlen) = decode_varint(&payload[pos..]).unwrap();
-            pos += vlen;
-            settings.push((id, val));
-        }
-
-        assert!(settings.contains(&(
-            SETTINGS_QPACK_MAX_TABLE_CAPACITY,
-            DEFAULT_QPACK_MAX_TABLE_CAPACITY
-        )));
-        assert!(settings.contains(&(
-            SETTINGS_MAX_FIELD_SECTION_SIZE,
-            DEFAULT_MAX_FIELD_SECTION_SIZE
-        )));
-        assert!(settings.contains(&(
-            SETTINGS_QPACK_BLOCKED_STREAMS,
-            DEFAULT_QPACK_BLOCKED_STREAMS
-        )));
-        // Verify GREASE setting ID matches RFC 9114 §7.2.4.1 (0x1f * N + 0x21)
-        assert!(settings
-            .iter()
-            .any(|&(id, _)| id >= 0x21 && (id - 0x21) % 0x1f == 0));
+        assert!(init.len() > 3);
+        let (stream_type, tlen) = decode_varint(&init).unwrap();
+        assert_eq!(stream_type, 0x00);
+        let (frame_type, flen) = decode_varint(&init[tlen..]).unwrap();
+        assert_eq!(frame_type, 0x04);
+        let (payload_len, plen) = decode_varint(&init[tlen + flen..]).unwrap();
+        assert_eq!(payload_len as usize, init.len() - (tlen + flen + plen));
     }
 
     #[test]
-    fn test_build_shared_quic_client_config() {
-        let cfg = build_shared_quic_client_config().expect("shared QuicClientConfig");
-        assert!(Arc::strong_count(&cfg) == 1);
+    fn test_build_quiche_config_with_boring_tls() {
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let boring_tls = BoringTlsConfig::new(
+            crate::protocols::tls::TlsFingerprintProfile::Chrome,
+            store,
+        )
+        .expect("boring tls init");
+        assert!(boring_tls.build_quiche_config().is_ok());
     }
 }

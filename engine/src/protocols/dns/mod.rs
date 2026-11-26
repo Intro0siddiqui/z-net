@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::ClientConfig;
+use crate::protocols::tls::BoringTlsConfig;
 
 use cache::DnsCache;
 use doh::DohClient;
@@ -49,11 +49,11 @@ pub struct DnsResolver {
     pub config: DnsResolverConfig,
     pub cache: Arc<DnsCache>,
     pub nameservers: Vec<SocketAddr>,
-    tls_config: Arc<ClientConfig>,
+    tls_config: Arc<BoringTlsConfig>,
 }
 
 impl DnsResolver {
-    pub fn new(tls_config: Arc<ClientConfig>, config: DnsResolverConfig) -> Self {
+    pub fn new(tls_config: Arc<BoringTlsConfig>, config: DnsResolverConfig) -> Self {
         let nameservers = udp::parse_nameservers();
         Self {
             config,
@@ -192,8 +192,7 @@ mod tests {
 
     #[test]
     fn test_dns_resolver_ip_literal() {
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(crate::protocols::tls::TlsFingerprintProfile::Chrome, Arc::new(crate::protocols::tls::BoringSessionStore::in_memory())).unwrap());
         let resolver = DnsResolver::new(tls_cfg, DnsResolverConfig::default());
 
         let res = resolver.resolve("127.0.0.1", 8080).expect("resolve ip literal");
@@ -205,8 +204,7 @@ mod tests {
 
     #[test]
     fn test_dns_resolver_hosts_localhost() {
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(crate::protocols::tls::TlsFingerprintProfile::Chrome, Arc::new(crate::protocols::tls::BoringSessionStore::in_memory())).unwrap());
         let resolver = DnsResolver::new(tls_cfg, DnsResolverConfig::default());
 
         let res = resolver.resolve("localhost", 80).expect("resolve localhost");
@@ -216,8 +214,7 @@ mod tests {
 
     #[test]
     fn test_dns_resolver_cache_integration() {
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(crate::protocols::tls::TlsFingerprintProfile::Chrome, Arc::new(crate::protocols::tls::BoringSessionStore::in_memory())).unwrap());
         let resolver = DnsResolver::new(tls_cfg, DnsResolverConfig::default());
 
         // Pre-populate cache
@@ -230,8 +227,7 @@ mod tests {
 
     #[test]
     fn test_dns_resolver_native_resolution() {
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(crate::protocols::tls::TlsFingerprintProfile::Chrome, Arc::new(crate::protocols::tls::BoringSessionStore::in_memory())).unwrap());
         let resolver = DnsResolver::new(tls_cfg, DnsResolverConfig::default());
 
         let t0 = std::time::Instant::now();

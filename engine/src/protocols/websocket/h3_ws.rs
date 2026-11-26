@@ -5,9 +5,41 @@
 
 use std::collections::VecDeque;
 
-use crate::protocols::http3::qpack::QpackCodec;
 use crate::protocols::http3::build_http3_frame;
 use super::frame::WebSocketFrame;
+
+fn encode_qpack_literal_headers(headers: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = vec![0x00, 0x00]; // Required Insert Count = 0, Delta Base = 0
+    for (k, v) in headers {
+        // Literal Field Line With Literal Name (N=0, H=0, 3-bit prefix for name len)
+        let kb = k.as_bytes();
+        let vb = v.as_bytes();
+        out.push(0x20 | (kb.len().min(7) as u8));
+        if kb.len() >= 7 {
+            out.push((kb.len() - 7) as u8);
+        }
+        out.extend_from_slice(kb);
+        out.push(vb.len().min(127) as u8);
+        out.extend_from_slice(vb);
+    }
+    out
+}
+
+fn decode_qpack_status(payload: &[u8]) -> Result<u16, String> {
+    if payload.len() < 3 {
+        return Err("QPACK payload too short".to_string());
+    }
+    // Static table index 25 = :status 200 (0xC0 | 25 = 0xD9)
+    if payload[2] == 0xD9 {
+        return Ok(200);
+    }
+    if let Ok(s) = std::str::from_utf8(payload) {
+        if s.contains("200") {
+            return Ok(200);
+        }
+    }
+    Err("Non-200 status in QPACK response".to_string())
+}
 
 pub struct H3WebSocketHandshake;
 
@@ -31,13 +63,16 @@ impl H3WebSocketHandshake {
             headers.push((k.clone(), v.clone()));
         }
 
-        let qpack_hdr = QpackCodec::encode_headers(
-            "CONNECT",
-            "https",
-            authority,
-            path,
-            &headers,
-        );
+        let mut hdr_refs: Vec<(&str, &str)> = vec![
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", authority),
+            (":path", path),
+        ];
+        for (k, v) in &headers {
+            hdr_refs.push((k.as_str(), v.as_str()));
+        }
+        let qpack_hdr = encode_qpack_literal_headers(&hdr_refs);
 
         // Frame Type 0x01: HEADERS
         build_http3_frame(0x01, &qpack_hdr)
@@ -45,7 +80,7 @@ impl H3WebSocketHandshake {
 
     /// Verify server response for Extended CONNECT. Returns Ok(status) if 200 OK.
     pub fn verify_connect_response(payload: &[u8]) -> Result<u16, String> {
-        let (status, _) = QpackCodec::decode_response_headers(payload)
+        let status = decode_qpack_status(payload)
             .map_err(|e| format!("Failed to decode H3 response headers: {}", e))?;
 
         if status == 200 {

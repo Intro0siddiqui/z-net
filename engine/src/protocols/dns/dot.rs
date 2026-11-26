@@ -5,20 +5,19 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use crate::protocols::tls::BoringTlsConfig;
 
 use super::wire::{DnsRecord, DnsRecordType, DnsWireCodec};
 
 pub struct DotClient {
-    tls_config: Arc<ClientConfig>,
+    tls_config: Arc<BoringTlsConfig>,
     server_addr: String, // e.g. "1.1.1.1:853"
     server_name: String, // e.g. "cloudflare-dns.com" or "1.1.1.1"
     timeout: Duration,
 }
 
 impl DotClient {
-    pub fn new(tls_config: Arc<ClientConfig>, server_addr: &str, server_name: &str) -> Self {
+    pub fn new(tls_config: Arc<BoringTlsConfig>, server_addr: &str, server_name: &str) -> Self {
         Self {
             tls_config,
             server_addr: server_addr.to_string(),
@@ -46,14 +45,10 @@ impl DotClient {
         }
         let tcp = tcp.ok_or(format!("Could not connect to DoT server {}", self.server_addr))?;
 
-        let server_name = ServerName::try_from(self.server_name.as_str())
-            .map_err(|e| format!("Invalid DoT TLS server name: {}", e))?
-            .to_owned();
-
-        let tls_conn = ClientConnection::new(self.tls_config.clone(), server_name)
-            .map_err(|e| format!("DoT TLS handshake init failed: {}", e))?;
-
-        let mut stream = StreamOwned::new(tls_conn, tcp);
+        let mut stream = self
+            .tls_config
+            .connect_blocking(&self.server_name, tcp, Some(b"\x08http/1.1"))
+            .map_err(|e| format!("DoT TLS handshake failed: {}", e))?;
 
         // Encode RFC 1035 query
         let query_id = (std::time::SystemTime::now()

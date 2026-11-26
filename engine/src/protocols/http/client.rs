@@ -52,7 +52,6 @@ impl Drop for PerfTelemetry {
 use compio_buf::BufResult;
 use compio_driver::op::{Connect, Interest, PollOnce};
 use compio_driver::{AsRawFd, Key, Proactor, PushEntry, SharedFd};
-use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use socket2::{Domain, Protocol, SockAddr, Socket as Socket2, Type};
 use url::Url;
 
@@ -63,9 +62,9 @@ use super::pool::{ConnectionPool, PoolKey};
 use crate::protocols::compression::{decompress_payload, StreamDecompressor};
 use crate::protocols::dns::{DnsResolver, DnsResolverConfig};
 use super::h2::{is_hop_by_hop_header, H2Session, SharedH2Session};
-use crate::protocols::http3::{build_shared_quic_client_config, Http3Client};
+use crate::protocols::http3::Http3Client;
 use crate::protocols::tls::{
-    step_boring_handshake, BoringIo, BoringSessionStore, BoringTlsConfig,
+    step_boring_handshake, BoringIo, BoringMidHandshake, BoringStream, BoringTlsConfig,
     NonBlockingHandshakeStep, TlsFingerprintProfile,
 };
 use crate::protocols::proxy::{
@@ -125,9 +124,7 @@ impl HttpRequestOptions {
 
 enum ActiveStream {
     Plain(TcpStream),
-    BoringTls(Box<boring::ssl::SslStream<BoringIo>>),
-    #[allow(dead_code)]
-    RustlsTls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    BoringTls(Box<BoringStream>),
 }
 
 impl Read for ActiveStream {
@@ -135,7 +132,6 @@ impl Read for ActiveStream {
         match self {
             Self::Plain(s) => s.read(buf),
             Self::BoringTls(s) => s.read(buf),
-            Self::RustlsTls(s) => s.read(buf),
         }
     }
 }
@@ -145,7 +141,6 @@ impl Write for ActiveStream {
         match self {
             Self::Plain(s) => s.write(buf),
             Self::BoringTls(s) => s.write(buf),
-            Self::RustlsTls(s) => s.write(buf),
         }
     }
 
@@ -153,7 +148,6 @@ impl Write for ActiveStream {
         match self {
             Self::Plain(s) => s.flush(),
             Self::BoringTls(s) => s.flush(),
-            Self::RustlsTls(s) => s.flush(),
         }
     }
 }
@@ -179,7 +173,7 @@ enum TcpTlsState {
     NotStarted,
     Connecting(Key<Connect<SharedFd<Socket2>>>),
     Handshaking {
-        mid: boring::ssl::MidHandshakeSslStream<BoringIo>,
+        mid: BoringMidHandshake,
         poll_key: Option<Key<PollOnce<SharedFd<Socket2>>>>,
     },
     Failed(String),
@@ -229,10 +223,7 @@ impl SharedH2Pool {
 
 /// Standalone HTTP client engine orchestrating connections, pooling, serialization, cookies, and streaming.
 pub struct HttpClientEngine {
-    #[allow(dead_code)]
-    tls_config: Arc<ClientConfig>,
     boring_tls: Arc<BoringTlsConfig>,
-    quic_crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
     pool: ConnectionPool<ActiveStream>,
     h2_pool: SharedH2Pool,
     pub http_cache: super::cache::HttpCache,
@@ -243,22 +234,13 @@ pub struct HttpClientEngine {
 }
 
 impl HttpClientEngine {
-    pub fn new(tls_config: Arc<ClientConfig>) -> Self {
+    pub fn new(boring_tls: Arc<BoringTlsConfig>) -> Self {
         let dns_resolver = Arc::new(DnsResolver::new(
-            tls_config.clone(),
+            boring_tls.clone(),
             DnsResolverConfig::default(),
         ));
-        let boring_store = Arc::new(BoringSessionStore::new_default());
-        let boring_tls = Arc::new(
-            BoringTlsConfig::new(TlsFingerprintProfile::Chrome, boring_store)
-                .expect("BoringSSL client config must initialize"),
-        );
-        let quic_crypto = build_shared_quic_client_config()
-            .expect("Shared QUIC client config must initialize");
         Self {
-            tls_config,
             boring_tls,
-            quic_crypto,
             pool: ConnectionPool::new(6, Duration::from_secs(60)),
             h2_pool: SharedH2Pool::new(Duration::from_secs(60)),
             http_cache: super::cache::HttpCache::new(512, 4 * 1024 * 1024),
@@ -269,12 +251,7 @@ impl HttpClientEngine {
         }
     }
 
-    /// Access the shared `Arc<quinn_proto::crypto::rustls::QuicClientConfig>` hosted on this engine.
-    pub fn quic_crypto(&self) -> &Arc<quinn_proto::crypto::rustls::QuicClientConfig> {
-        &self.quic_crypto
-    }
-
-    /// Access the BoringSSL TLS configuration used for TCP/TLS connections.
+    /// Access the BoringSSL TLS configuration used for TCP/TLS and QUIC/HTTP3 connections.
     pub fn boring_tls(&self) -> &Arc<BoringTlsConfig> {
         &self.boring_tls
     }
@@ -332,7 +309,6 @@ impl HttpClientEngine {
         h3_port: u16,
         dns_resolver: &DnsResolver,
         boring_tls: &Arc<BoringTlsConfig>,
-        quic_crypto: &Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
         timeout: Duration,
         cad: Duration,
         is_cancelled: &mut K,
@@ -377,31 +353,26 @@ impl HttpClientEngine {
         let cad_deadline = race_start + cad;
         let total_deadline = race_start + timeout;
 
-        // 1. Start QUIC (quinn-proto) UDP handshake first
+        // 1. Start QUIC (quiche) UDP handshake first
         let mut quic_opt: Option<(QuicHandshakeState, SharedFd<std::net::UdpSocket>)> = None;
         let mut udp_poll_key: Option<Key<PollOnce<SharedFd<std::net::UdpSocket>>>> = None;
         let mut h3_failed = false;
         let mut h3_elapsed_ms = 0.0_f64;
 
-        match QuicHandshakeState::start_with_config(h3_addr, host, quic_crypto.clone()) {
-            Ok((mut quic_state, udp_sock)) => {
-                let udp_fd = SharedFd::new(udp_sock);
+        match QuicHandshakeState::start(host, h3_addr.port(), dns_resolver, boring_tls) {
+            Ok(mut quic_state) => {
+                let udp_fd = SharedFd::new(quic_state.socket.try_clone().map_err(|e| format!("UDP clone: {}", e))?);
                 if let Err(e) = proactor.attach(udp_fd.as_raw_fd()) {
                     h3_failed = true;
                     h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[ZNET-HE3] proactor attach UDP failed: {}", e);
                 } else {
-                    quic_state.flush_transmits(&udp_fd, race_start);
+                    quic_state.flush_transmits();
                     match proactor.push(PollOnce::new(udp_fd.clone(), Interest::Readable)) {
                         PushEntry::Pending(k) => udp_poll_key = Some(k),
                         PushEntry::Ready(_) => {
-                            if let Err(_) = quic_state.drain_udp(&udp_fd, race_start) {
-                                h3_failed = true;
-                                h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
-                            } else {
-                                quic_state.flush_transmits(&udp_fd, race_start);
-                                match quic_state.poll_handshake_step(race_start) {
-                                    Ok(true) => {
+                            match quic_state.poll_recv_and_advance() {
+                                Ok(true) => {
                                         let h3_ms = race_start.elapsed().as_secs_f64() * 1000.0;
                                         let udp_socket = match udp_fd.try_unwrap() {
                                             Ok(s) => s,
@@ -427,7 +398,6 @@ impl HttpClientEngine {
                                         h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
                                     }
                                 }
-                            }
                         }
                     }
                     if !h3_failed {
@@ -445,7 +415,7 @@ impl HttpClientEngine {
         let mut tcp_state = TcpTlsState::NotStarted;
         let mut tcp_start: Option<Instant> = None;
 
-        let finish_tcp_win = |ssl_stream: boring::ssl::SslStream<BoringIo>,
+        let finish_tcp_win = |ssl_stream: BoringStream,
                               h3_ms: f64,
                               h2_ms: f64,
                               proactor: &mut Proactor,
@@ -592,8 +562,8 @@ impl HttpClientEngine {
             }
             if !h3_failed {
                 if let Some((ref mut q, _)) = quic_opt {
-                    if let Some(qt) = q.connection.poll_timeout() {
-                        wait_dur = wait_dur.min(qt.saturating_duration_since(now));
+                    if let Some(qt) = q.timeout() {
+                        wait_dur = wait_dur.min(qt);
                     }
                 }
             }
@@ -607,31 +577,19 @@ impl HttpClientEngine {
                 }
             }
 
-            let now = Instant::now();
+            let _now = Instant::now();
 
             // Drive QUIC leg
             if !h3_failed {
                 if let Some((mut quic_state, udp_fd)) = quic_opt.take() {
-                    let mut udp_ready = false;
                     if let Some(k) = udp_poll_key.take() {
-                        match proactor.pop(k) {
-                            PushEntry::Ready(_) => udp_ready = true,
-                            PushEntry::Pending(k) => udp_poll_key = Some(k),
-                        }
-                    } else {
-                        udp_ready = true;
-                    }
-
-                    if udp_ready {
-                        if let Err(_) = quic_state.drain_udp(&udp_fd, now) {
-                            h3_failed = true;
-                            h3_elapsed_ms = race_start.elapsed().as_secs_f64() * 1000.0;
+                        if let PushEntry::Pending(k) = proactor.pop(k) {
+                            udp_poll_key = Some(k);
                         }
                     }
 
                     if !h3_failed {
-                        quic_state.flush_transmits(&udp_fd, now);
-                        match quic_state.poll_handshake_step(now) {
+                        match quic_state.poll_recv_and_advance() {
                             Ok(true) => {
                                 let h3_ms = race_start.elapsed().as_secs_f64() * 1000.0;
                                 if let Some(k) = udp_poll_key.take() {
@@ -661,7 +619,7 @@ impl HttpClientEngine {
                                 });
                             }
                             Ok(false) => {
-                                quic_state.flush_transmits(&udp_fd, now);
+                                quic_state.flush_transmits();
                                 if udp_poll_key.is_none() {
                                     if let PushEntry::Pending(k) =
                                         proactor.push(PollOnce::new(udp_fd.clone(), Interest::Readable))
@@ -1244,7 +1202,6 @@ impl HttpClientEngine {
                     h3_port,
                     &self.dns_resolver,
                     &self.boring_tls,
-                    &self.quic_crypto,
                     options.timeout,
                     HE3_CAD,
                     &mut is_cancelled,
@@ -1275,10 +1232,9 @@ impl HttpClientEngine {
                         let body_ms_cell = Cell::new(0.0_f64);
                         let status_cell = Cell::new(0_u16);
 
+                        drop(udp_socket);
                         let h3_res = Http3Client::execute_connected_streaming(
                             quic_state,
-                            udp_socket,
-                            &host,
                             &h3_options,
                             body_ring,
                             |status, reason, headers| {
@@ -1744,6 +1700,7 @@ impl HttpClientEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::tls::BoringSessionStore;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
@@ -1776,9 +1733,8 @@ mod tests {
             }
         });
 
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
 
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/chunked", port);
@@ -1854,9 +1810,8 @@ mod tests {
             }
         });
 
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
 
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/auth", port);
@@ -1893,8 +1848,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/video.mp4", port);
         let opts = HttpRequestOptions::new("GET", &url)
@@ -1924,8 +1879,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/stream", port);
         let opts = HttpRequestOptions::new("GET", &url);
@@ -1971,8 +1926,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/cookie_test", port);
         let parsed_url = Url::parse(&url).unwrap();
@@ -2006,8 +1961,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/multi_cookie", port);
         let parsed_url = Url::parse(&url).unwrap();
@@ -2090,8 +2045,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/gzip_stream", port);
         let opts = HttpRequestOptions::new("GET", &url);
@@ -2151,8 +2106,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/raw_gzip", port);
         let mut opts = HttpRequestOptions::new("GET", &url);
@@ -2201,8 +2156,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         let url = format!("http://127.0.0.1:{}/alt_svc_test", port);
         let opts = HttpRequestOptions::new("GET", &url);
@@ -2249,8 +2204,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
 
         let mut cfg = ProxyConfig::new();
@@ -2320,8 +2275,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
 
         let mut cfg = ProxyConfig::new();
@@ -2363,12 +2318,8 @@ mod tests {
         let tcp_port = tcp_listener.local_addr().unwrap().port();
         drop(tcp_listener);
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         client.alt_svc_registry.insert(
             "127.0.0.1",
@@ -2438,12 +2389,8 @@ mod tests {
             }
         });
 
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
 
         // Register an active Alt-Svc H3 target on a blackholed port
@@ -2525,15 +2472,11 @@ mod tests {
 
     #[test]
     fn test_http_client_engine_hoists_shared_quic_and_boring_tls() {
-        let roots = rustls::RootCertStore::empty();
-        let tls_cfg = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
         assert_eq!(client.boring_tls().profile, TlsFingerprintProfile::Chrome);
-        assert!(Arc::strong_count(client.quic_crypto()) >= 1);
+        assert!(Arc::strong_count(client.boring_tls()) >= 1);
         client
             .set_tls_profile(TlsFingerprintProfile::Firefox)
             .expect("switch to Firefox profile");

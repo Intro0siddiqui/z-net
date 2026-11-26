@@ -1,6 +1,6 @@
 //! Lean Network Engine - Zero-Copy Rust Protocol Daemon
 //! 
-//! A single-threaded async I/O engine using mio and rustls.
+//! A single-threaded async I/O engine using compio-driver and BoringSSL/quiche.
 //! Exposes C ABI for Zig integration.
 
 use std::ffi::{c_char, c_void, c_uchar};
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use std::net::{TcpStream, UdpSocket};
 use compio_driver::{AsRawFd, Proactor};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use crate::protocols::tls::{BoringSessionStore, BoringTlsConfig, TlsFingerprintProfile};
 
 pub mod protocols {
     pub mod http;
@@ -219,7 +219,7 @@ struct Connection {
     host: String,
     #[allow(dead_code)]
     port: u16,
-    tlsconn: Option<ClientConnection>,
+    tlsconn: Option<crate::protocols::tls::BoringTcpStream>,
 }
 
 impl Connection {
@@ -242,12 +242,11 @@ impl Connection {
 pub type TlsHandle = *mut c_void;
 
 /// Standalone TLS connection state. Owns a blocking `std::net::TcpStream`
-/// and a rustls `ClientConnection`. The TcpStream is intentionally
+/// and a BoringSSL `SslStream`. The TcpStream is intentionally
 /// blocking because DNS-over-TLS and other direct TLS users are
 /// low-throughput, latency-tolerant, and benefit from a simpler API.
 pub struct TlsState {
-    stream: std::net::TcpStream,
-    tls: ClientConnection,
+    tls: crate::protocols::tls::BoringTcpStream,
     #[allow(dead_code)]
     host: String,
     #[allow(dead_code)]
@@ -256,7 +255,7 @@ pub struct TlsState {
 }
 
 impl TlsState {
-    fn new(host: String, port: u16, config: Arc<ClientConfig>) -> Result<Self, NetError> {
+    fn new(host: String, port: u16, config: Arc<BoringTlsConfig>) -> Result<Self, NetError> {
         let addrs = match format!("{}:{}", host, port).to_socket_addrs() {
             Ok(a) => a,
             Err(_) => return Err(NetError::IoError),
@@ -275,20 +274,11 @@ impl TlsState {
         };
         let _ = stream.set_nodelay(true);
 
-        // Reuse the engine's client config so the trust anchors and the
-        // resumption session store are shared across connections.
-        let server_name = match rustls::pki_types::ServerName::try_from(host.as_str()) {
-            Ok(name) => name.to_owned(),
-            Err(_) => return Err(NetError::TlsError),
-        };
-
-        let tls = match ClientConnection::new(config, server_name) {
-            Ok(c) => c,
-            Err(_) => return Err(NetError::TlsError),
-        };
+        let tls = config
+            .connect_blocking(&host, stream, Some(b"\x02h2\x08http/1.1"))
+            .map_err(|_| NetError::TlsError)?;
 
         Ok(Self {
-            stream,
             tls,
             host,
             port,
@@ -304,109 +294,40 @@ pub struct NetEngine {
     next_tls_id: usize,
     tls_states: HashMap<usize, Box<TlsState>>,
     next_conn_id: usize,
-    tls_config: Arc<ClientConfig>,
+    tls_config: Arc<BoringTlsConfig>,
     pub http_engine: protocols::http::client::HttpClientEngine,
     body_rings: HashMap<u64, *mut BodyRingDescriptor>,
     conn_body_rings: HashMap<usize, u64>,
-    quic_endpoints: HashMap<usize, QuicEndpointEntry>,
-    quic_conns: HashMap<usize, QuicConnectionEntry>,
+    quic_conns: HashMap<usize, crate::protocols::http3::QuicHandshakeState>,
     next_quic_id: usize,
     pub last_error: std::sync::Mutex<Option<String>>,
 }
 
-/// Owned state for a single QUIC endpoint.
-#[allow(dead_code)]
-struct QuicEndpointEntry {
-    socket: UdpSocket,
-    endpoint: std::sync::Mutex<quinn_proto::Endpoint>,
-    server_addr: std::net::SocketAddr,
-    local_addr: std::net::SocketAddr,
-}
-
-/// Per-connection QUIC state. Quinn-proto identifies connections via
-/// `ConnectionHandle` (an index into the `Endpoint`'s slab). We cache
-/// the `Connection` so we can poll the streams and emit transmits.
-#[allow(dead_code)]
-struct QuicConnectionEntry {
-    handle: quinn_proto::ConnectionHandle,
-    connection: quinn_proto::Connection,
-    remote: std::net::SocketAddr,
-}
-
 /// Helper to parse PEM certificates from a file on disk (e.g. system CA bundle).
-fn load_pem_certs(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
-    let mut certs = Vec::new();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        let mut in_cert = false;
-        let mut b64 = String::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line == "-----BEGIN CERTIFICATE-----" {
-                in_cert = true;
-                b64.clear();
-            } else if line == "-----END CERTIFICATE-----" {
-                if in_cert {
-                    use base64::Engine;
-                    if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(&b64) {
-                        certs.push(rustls::pki_types::CertificateDer::from(der));
-                    }
-                    in_cert = false;
-                }
-            } else if in_cert {
-                b64.push_str(line);
-            }
-        }
-    }
-    certs
-}
-
-/// Build the client trust store from Mozilla's compiled-in root bundle
-/// supplemented by the host system's root certificates (/etc/ssl/certs/ca-certificates.crt).
-pub(crate) fn root_store() -> RootCertStore {
-    let mut store = RootCertStore::empty();
-    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for cert in load_pem_certs("/etc/ssl/certs/ca-certificates.crt") {
-        let _ = store.add(cert);
-    }
-    store
-}
-
 impl NetEngine {
     fn new() -> Result<Self, NetError> {
         let proactor = Proactor::new().map_err(|e| {
             eprintln!("[z-net] Proactor::new failed: {:?}", e);
             NetError::IoError
         })?;
-        
-        // Install default crypto provider for rustls 0.23
-        #[cfg(feature = "ring")]
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        
-        // Setup default TLS config with ALPN for HTTP/2 and HTTP/1.1 streaming and full session resumption
-        let mut config = ClientConfig::builder()
-            .with_root_certificates(root_store())
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let rustls_session_store = Arc::new(
-            protocols::tls::PersistentRustlsSessionStore::new_default(1024),
+
+        let boring_store = Arc::new(BoringSessionStore::new_default());
+        let boring_tls = Arc::new(
+            BoringTlsConfig::new(TlsFingerprintProfile::Chrome, boring_store)
+                .map_err(|_| NetError::TlsError)?,
         );
-        config.resumption = rustls_session_store.into_resumption();
-        config.enable_early_data = true;
-            
-        let tls_cfg = Arc::new(config);
-        let http_engine = protocols::http::client::HttpClientEngine::new(tls_cfg.clone());
-            
+        let http_engine = protocols::http::client::HttpClientEngine::new(boring_tls.clone());
+
         Ok(Self {
             proactor,
             connections: HashMap::new(),
             next_tls_id: 1,
             tls_states: HashMap::new(),
             next_conn_id: 1,
-            tls_config: tls_cfg,
+            tls_config: boring_tls,
             http_engine,
             body_rings: HashMap::new(),
             conn_body_rings: HashMap::new(),
-            quic_endpoints: HashMap::new(),
             quic_conns: HashMap::new(),
             next_quic_id: 1,
             last_error: std::sync::Mutex::new(None),
@@ -519,8 +440,8 @@ pub extern "C" fn net_connect_tls(
     
     // Initialize TLS if explicitly requested
     if use_tls {
-        if let Ok(server_name) = rustls::pki_types::ServerName::try_from(conn.host.as_str()) {
-            if let Ok(tls) = ClientConnection::new(engine.tls_config.clone(), server_name.to_owned()) {
+        if let Ok(cloned) = conn.stream.try_clone() {
+            if let Ok(tls) = engine.tls_config.connect_blocking(&conn.host, cloned, Some(b"\x02h2\x08http/1.1")) {
                 conn.tlsconn = Some(tls);
             }
         }
@@ -556,7 +477,7 @@ pub extern "C" fn net_conn_alpn_protocol(
     let conn_id = conn_handle as usize;
     if let Some(conn) = engine.connections.get(&conn_id) {
         if let Some(ref tls) = conn.tlsconn {
-            if let Some(alpn) = tls.alpn_protocol() {
+            if let Some(alpn) = tls.ssl().selected_alpn_protocol() {
                 let to_copy = alpn.len().min(out_buf_len);
                 unsafe {
                     std::ptr::copy_nonoverlapping(alpn.as_ptr(), out_buf, to_copy);
@@ -661,26 +582,7 @@ pub extern "C" fn net_read(
     let dst = unsafe { from_raw_parts_mut(buffer, buffer_len) };
     
     if let Some(ref mut tlsconn) = connection.tlsconn {
-        // 1. Try to read from socket and feed to TLS
-        match connection.stream.read(&mut connection.read_buf) {
-            Ok(0) => return NS_ERROR_FAILURE,
-            Ok(n) => {
-                let mut cursor = std::io::Cursor::new(&connection.read_buf[..n]);
-                if tlsconn.read_tls(&mut cursor).is_err() {
-                    return NS_ERROR_FAILURE;
-                }
-                if tlsconn.process_new_packets().is_err() {
-                    return NS_ERROR_FAILURE;
-                }
-            }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                // No new data, check if we have pending plaintext
-            }
-            Err(_) => return NS_ERROR_FAILURE,
-        }
-        
-        // 2. Read plaintext from TLS
-        match tlsconn.reader().read(dst) {
+        match tlsconn.read(dst) {
             Ok(n) => {
                 unsafe {
                     if !bytes_read.is_null() {
@@ -689,13 +591,10 @@ pub extern "C" fn net_read(
                 }
                 return NS_OK;
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                return NS_ERROR_FAILURE;
-            }
             Err(_) => return NS_ERROR_FAILURE,
         }
     }
-    
+
     // Non-TLS path
     match connection.stream.read(dst) {
         Ok(n) => {
@@ -735,29 +634,20 @@ pub extern "C" fn net_write(
     let src = unsafe { from_raw_parts(data, data_len) };
     
     if let Some(ref mut tlsconn) = connection.tlsconn {
-        // 1. Write plaintext to TLS
-        let n = match tlsconn.writer().write(src) {
-            Ok(n) => n,
+        match tlsconn.write(src) {
+            Ok(n) => {
+                let _ = tlsconn.flush();
+                unsafe {
+                    if !bytes_written.is_null() {
+                        *bytes_written = n;
+                    }
+                }
+                return NS_OK;
+            }
             Err(_) => return NS_ERROR_FAILURE,
-        };
-        
-        // 2. Flush ciphertext to socket
-        while tlsconn.wants_write() {
-            match tlsconn.write_tls(&mut connection.stream) {
-                Ok(_) => {},
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => return NS_ERROR_FAILURE,
-            }
         }
-        
-        unsafe {
-            if !bytes_written.is_null() {
-                *bytes_written = n;
-            }
-        }
-        return NS_OK;
     }
-    
+
     // Non-TLS path
     match connection.stream.write(src) {
         Ok(n) => {
@@ -1230,70 +1120,24 @@ pub extern "C" fn net_http3_connect(
         return null_mut();
     }
 
-    let local_addr = match socket.local_addr() {
-        Ok(a) => a,
-        Err(_) => return null_mut(),
-    };
-
-    let udp_stream = socket;
-
     let conn_id = engine.next_quic_id;
     engine.next_quic_id += 1;
 
-    if engine.proactor.attach(udp_stream.as_raw_fd()).is_err() {
+    if engine.proactor.attach(socket.as_raw_fd()).is_err() {
         return null_mut();
     }
 
-    // Build the quinn-proto endpoint. We use the default `EndpointConfig`
-    // and a fresh `ClientConfig` backed by rustls 0.20 (the version
-    // pinned by quinn-proto 0.11). The engine's own `tls_config` is
-    // rustls 0.23, so we cannot share it.
-    let endpoint_config = Arc::new(quinn_proto::EndpointConfig::default());
-    let mut endpoint = quinn_proto::Endpoint::new(endpoint_config, None, false, None);
-
-    // quinn-proto re-exports rustls 0.20, so we build a self-signed
-    // client config with the default crypto provider and the
-    // `webpki` roots. In production we would load a platform root
-    // store; for the engine scaffolding we use the empty store and
-    // rely on QUIC's built-in certificate verification (which can be
-    // enabled per-connection via `ClientConfig`).
-    // Reuse the shared QuicClientConfig hosted on HttpClientEngine (avoids per-connection CA disk parse)
-    let quic_crypto = engine.http_engine.quic_crypto().clone();
-
-    let mut transport = quinn_proto::TransportConfig::default();
-    transport.max_idle_timeout(quinn_proto::IdleTimeout::try_from(
-        std::time::Duration::from_secs(30),
-    ).ok());
-    let client_config = quinn_proto::ClientConfig::new(quic_crypto);
-    let mut client_config = client_config;
-    client_config.transport_config(Arc::new(transport));
-
-    // Initiate the connection. The returned `Connection` is in the
-    // `Handshaking` state and will be driven forward by
-    // `net_http3_drive` on subsequent calls.
-    let now = std::time::Instant::now();
-    let (ch, connection) = match endpoint.connect(now, client_config, server_addr, &host_str) {
-        Ok(c) => c,
+    let quic_state = match crate::protocols::http3::QuicHandshakeState::connect_with_socket(
+        socket,
+        server_addr,
+        &host_str,
+        &engine.tls_config,
+    ) {
+        Ok(s) => s,
         Err(_) => return null_mut(),
     };
 
-    engine.quic_endpoints.insert(
-        conn_id,
-        QuicEndpointEntry {
-            socket: udp_stream,
-            endpoint: std::sync::Mutex::new(endpoint),
-            server_addr,
-            local_addr,
-        },
-    );
-    engine.quic_conns.insert(
-        conn_id,
-        QuicConnectionEntry {
-            handle: ch,
-            connection,
-            remote: server_addr,
-        },
-    );
+    engine.quic_conns.insert(conn_id, quic_state);
 
     conn_id as ConnHandle
 }
@@ -1362,7 +1206,7 @@ pub extern "C" fn net_get_metrics(engine_handle: NetEngineHandle) -> *const Netw
 // ============================================================
 //
 // The standalone TLS surface lets the Zig `z_tls` module obtain a
-// rustls-backed TLS connection without owning a TcpStream directly.
+// BoringSSL-backed TLS connection without owning a TcpStream directly.
 // Each `TlsHandle` is registered in the engine's `tls_states` map and
 // cleaned up by `net_tls_close`.
 //
@@ -1372,7 +1216,7 @@ pub extern "C" fn net_get_metrics(engine_handle: NetEngineHandle) -> *const Netw
 // other direct TLS consumers that are latency-tolerant and
 // low-throughput.
 
-/// Create a new standalone TLS connection and drive the rustls
+/// Create a new standalone TLS connection and drive the BoringSSL
 /// handshake to completion. Returns a heap-allocated opaque handle
 /// that the caller must release with `net_tls_close`.
 #[no_mangle]
@@ -1393,52 +1237,10 @@ pub extern "C" fn net_tls_create(
         }
     };
 
-    let mut state = match TlsState::new(host_str, port, engine.tls_config.clone()) {
+    let state = match TlsState::new(host_str, port, engine.tls_config.clone()) {
         Ok(s) => s,
         Err(_) => return null_mut(),
     };
-
-    // Drive the rustls handshake. We loop until we either complete the
-    // handshake or hit a non-WouldBlock I/O error.
-    use std::io::Read as IoRead;
-    while state.tls.is_handshaking() {
-        // Pump bytes from TLS into the socket.
-        if state.tls.wants_write() {
-            match state.tls.write_tls(&mut state.stream) {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(_) => return null_mut(),
-            }
-        }
-        // Pump bytes from the socket into TLS.
-        if state.tls.wants_read() {
-            let mut buf = [0u8; 16 * 1024];
-            match state.stream.read(&mut buf) {
-                Ok(0) => return null_mut(),
-                Ok(n) => {
-                    let mut cursor = std::io::Cursor::new(&buf[..n]);
-                    if state.tls.read_tls(&mut cursor).is_err() {
-                        return null_mut();
-                    }
-                    if state.tls.process_new_packets().is_err() {
-                        return null_mut();
-                    }
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // Spurious wakeup; loop again to check progress.
-                    break;
-                }
-                Err(_) => return null_mut(),
-            }
-        }
-        if !state.tls.is_handshaking() {
-            break;
-        }
-        if !state.tls.wants_read() && !state.tls.wants_write() {
-            // No forward progress possible; bail out to avoid spin.
-            break;
-        }
-    }
 
     let tls_id = engine.next_tls_id;
     engine.next_tls_id += 1;
@@ -1447,9 +1249,7 @@ pub extern "C" fn net_tls_create(
     tls_id as TlsHandle
 }
 
-/// Read plaintext from a TLS connection. On success returns 0 and
-/// writes the number of bytes into `*bytes_read`. Returns the
-/// engine error code on failure.
+/// Read plaintext from a TLS connection.
 #[no_mangle]
 pub extern "C" fn net_tls_read(
     engine_handle: NetEngineHandle,
@@ -1470,32 +1270,8 @@ pub extern "C" fn net_tls_read(
     if state.is_closed {
         return NS_ERROR_FAILURE;
     }
-
-    use std::io::Read as IoRead;
     let dst = unsafe { from_raw_parts_mut(buffer, buffer_len) };
-
-    // Drive TLS forward progress: read from socket into TLS, then
-    // expose plaintext to the caller.
-    let mut tmp = [0u8; 16 * 1024];
-    loop {
-        match state.stream.read(&mut tmp) {
-            Ok(0) => return NS_ERROR_FAILURE,
-            Ok(n) => {
-                let mut cursor = std::io::Cursor::new(&tmp[..n]);
-                if state.tls.read_tls(&mut cursor).is_err() {
-                    return NS_ERROR_FAILURE;
-                }
-                if state.tls.process_new_packets().is_err() {
-                    return NS_ERROR_FAILURE;
-                }
-            }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(_) => return NS_ERROR_FAILURE,
-        }
-    }
-
-    match state.tls.reader().read(dst) {
-        Ok(0) => NS_ERROR_FAILURE,
+    match state.tls.read(dst) {
         Ok(n) => {
             unsafe {
                 if !bytes_read.is_null() {
@@ -1504,13 +1280,11 @@ pub extern "C" fn net_tls_read(
             }
             NS_OK
         }
-        Err(ref e) if e.kind() == ErrorKind::WouldBlock => NS_ERROR_FAILURE,
         Err(_) => NS_ERROR_FAILURE,
     }
 }
 
-/// Write plaintext to a TLS connection. Returns 0 on success and
-/// writes the number of plaintext bytes accepted into `*bytes_written`.
+/// Write plaintext into a TLS connection.
 #[no_mangle]
 pub extern "C" fn net_tls_write(
     engine_handle: NetEngineHandle,
@@ -1531,34 +1305,22 @@ pub extern "C" fn net_tls_write(
     if state.is_closed {
         return NS_ERROR_FAILURE;
     }
-
-    use std::io::Write as IoWrite;
     let src = unsafe { from_raw_parts(data, data_len) };
-
-    let n = match state.tls.writer().write(src) {
-        Ok(n) => n,
-        Err(_) => return NS_ERROR_FAILURE,
-    };
-
-    while state.tls.wants_write() {
-        match state.tls.write_tls(&mut state.stream) {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(_) => return NS_ERROR_FAILURE,
+    match state.tls.write(src) {
+        Ok(n) => {
+            let _ = state.tls.flush();
+            unsafe {
+                if !bytes_written.is_null() {
+                    *bytes_written = n;
+                }
+            }
+            NS_OK
         }
+        Err(_) => NS_ERROR_FAILURE,
     }
-
-    unsafe {
-        if !bytes_written.is_null() {
-            *bytes_written = n;
-        }
-    }
-    NS_OK
 }
 
-/// Return the negotiated TLS protocol version as a 4-character
-/// identifier: `0x0303` for TLS 1.2, `0x0304` for TLS 1.3. Returns
-/// 0 on failure.
+/// Return the negotiated TLS protocol version as a 16-bit wire code (0x0303 = TLS 1.2, 0x0304 = TLS 1.3).
 #[no_mangle]
 pub extern "C" fn net_tls_protocol_version(
     engine_handle: NetEngineHandle,
@@ -1567,20 +1329,71 @@ pub extern "C" fn net_tls_protocol_version(
     if engine_handle.is_null() || tls_handle.is_null() {
         return 0;
     }
-    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
     let tls_id = tls_handle as usize;
     let state = match engine.tls_states.get(&tls_id) {
         Some(s) => s,
         None => return 0,
     };
-    match state.tls.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_2) => 0x0303,
-        Some(rustls::ProtocolVersion::TLSv1_3) => 0x0304,
-        _ => 0,
+    crate::protocols::tls::tls_version_wire(&state.tls)
+}
+
+/// Returns BoringSSL verification result after the handshake.
+#[no_mangle]
+pub extern "C" fn net_tls_verify_result(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+) -> TlsVerifyResult {
+    if engine_handle.is_null() || tls_handle.is_null() {
+        return TlsVerifyResult::Rejected;
+    }
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
+    let tls_id = tls_handle as usize;
+    let state = match engine.tls_states.get(&tls_id) {
+        Some(s) => s,
+        None => return TlsVerifyResult::Rejected,
+    };
+    if state.tls.ssl().verify_result().is_ok() {
+        TlsVerifyResult::Accepted
+    } else {
+        TlsVerifyResult::Rejected
     }
 }
 
-/// Close a TLS connection and release the handle.
+/// Copy the leaf peer certificate (DER bytes) into `out`.
+#[no_mangle]
+pub extern "C" fn net_tls_peer_certificate(
+    engine_handle: NetEngineHandle,
+    tls_handle: TlsHandle,
+    out: *mut c_uchar,
+    out_len: usize,
+) -> i32 {
+    if engine_handle.is_null() || tls_handle.is_null() || out.is_null() || out_len == 0 {
+        return -1;
+    }
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
+    let tls_id = tls_handle as usize;
+    let state = match engine.tls_states.get(&tls_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let cert = match state.tls.ssl().peer_certificate() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let der = match cert.to_der() {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+    if der.len() > out_len {
+        return -1;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(der.as_ptr(), out, der.len());
+    }
+    der.len() as i32
+}
+
 #[no_mangle]
 pub extern "C" fn net_tls_close(engine_handle: NetEngineHandle, tls_handle: TlsHandle) -> i32 {
     if engine_handle.is_null() || tls_handle.is_null() {
@@ -1591,7 +1404,7 @@ pub extern "C" fn net_tls_close(engine_handle: NetEngineHandle, tls_handle: TlsH
     match engine.tls_states.remove(&tls_id) {
         Some(mut state) => {
             state.is_closed = true;
-            let _ = state.stream.shutdown(std::net::Shutdown::Both);
+            let _ = state.tls.shutdown();
             NS_OK
         }
         None => NS_ERROR_FAILURE,
@@ -1606,82 +1419,6 @@ pub enum TlsVerifyResult {
     NotEstablished = -2,
 }
 
-/// Returns rustls's WebPKI verification result after the handshake.
-#[no_mangle]
-pub extern "C" fn net_tls_verify_result(
-    engine_handle: NetEngineHandle,
-    tls_handle: TlsHandle,
-) -> TlsVerifyResult {
-    if engine_handle.is_null() || tls_handle.is_null() {
-        return TlsVerifyResult::Rejected;
-    }
-    let engine = unsafe { &*(engine_handle as *mut NetEngine) };
-    let tls_id = tls_handle as usize;
-    match engine.tls_states.get(&tls_id) {
-        Some(state) => {
-            if state.is_closed {
-                return TlsVerifyResult::Rejected;
-            }
-            if state.tls.is_handshaking() {
-                return TlsVerifyResult::NotEstablished;
-            }
-            match state.tls.peer_certificates() {
-                Some(_) => TlsVerifyResult::Accepted,
-                None => TlsVerifyResult::Rejected,
-            }
-        }
-        None => TlsVerifyResult::Rejected,
-    }
-}
-
-/// Copies the peer certificate (first cert, DER-encoded) into the
-/// caller-provided buffer. Returns bytes written, or -1 on error.
-#[no_mangle]
-pub extern "C" fn net_tls_peer_certificate(
-    engine_handle: NetEngineHandle,
-    tls_handle: TlsHandle,
-    out: *mut u8,
-    out_len: usize,
-) -> i32 {
-    if engine_handle.is_null() || tls_handle.is_null() || out.is_null() {
-        return -1;
-    }
-    let engine = unsafe { &*(engine_handle as *mut NetEngine) };
-    let tls_id = tls_handle as usize;
-    match engine.tls_states.get(&tls_id) {
-        Some(state) => {
-            match state.tls.peer_certificates() {
-                Some(certs) if !certs.is_empty() => {
-                    let first_cert = &certs[0];
-                    let der = first_cert.as_ref();
-                    let len = der.len().min(out_len);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(der.as_ptr(), out, len);
-                    }
-                    len as i32
-                }
-                _ => -1,
-            }
-        }
-        None => -1,
-    }
-}
-
-// ============================================================
-// QUIC / HTTP/3 FFI (consumed by Zig `z_http3`)
-// ============================================================
-//
-// The QUIC surface drives the underlying quinn-proto state machine.
-// `net_http3_drive` reads any pending datagrams from the registered
-// UDP socket, feeds them into the `Endpoint`, then drains outgoing
-// transmits from each `Connection` and writes them to the socket.
-// HTTP/3 framing (HEADERS, DATA, QPACK) is the responsibility of
-// `z_http3`; this layer only carries the QUIC transport.
-
-/// Pump the QUIC state forward: process incoming datagrams on the
-/// UDP socket, advance the connection handshake, and emit any
-/// outgoing datagrams the connection wants to send. Returns the
-/// number of datagrams processed, or `-1` on error.
 #[no_mangle]
 pub extern "C" fn net_http3_drive(engine_handle: NetEngineHandle, conn_handle: ConnHandle) -> i32 {
     if engine_handle.is_null() || conn_handle.is_null() {
@@ -1690,68 +1427,10 @@ pub extern "C" fn net_http3_drive(engine_handle: NetEngineHandle, conn_handle: C
     let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
     let conn_id = conn_handle as usize;
 
-    let endpoint_entry = match engine.quic_endpoints.get_mut(&conn_id) {
-        Some(e) => e,
-        None => return -1,
-    };
-
-    let now = std::time::Instant::now();
-    let mut processed: i32 = 0;
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf: Vec<u8> = Vec::new();
-
-    // Read incoming datagrams off the UDP socket and feed them to
-    // the endpoint. We do non-blocking reads so a stalled socket
-    // does not block the engine.
-    loop {
-        match endpoint_entry.socket.recv_from(&mut rx_buf) {
-            Ok((n, remote)) => {
-                let data = bytes::BytesMut::from(&rx_buf[..n]);
-                let event = {
-                    let mut endpoint = endpoint_entry.endpoint.lock().unwrap();
-                    endpoint.handle(now, remote, None, None, data, &mut tx_buf)
-                };
-                if let Some(quinn_proto::DatagramEvent::ConnectionEvent(ch, conn_event)) = event {
-                    if let Some(conn_entry) = engine.quic_conns.get_mut(&conn_id) {
-                        if conn_entry.handle == ch {
-                            let _ = conn_entry.connection.handle_event(conn_event);
-                        }
-                    }
-                }
-                // `NewConnection` and `Response` are not produced for
-                // an outbound client flow; the endpoint simply
-                // discards them and the next transmit poll will pick
-                // up any state changes.
-                processed += 1;
-            }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(_) => break,
-        }
+    match engine.quic_conns.get_mut(&conn_id) {
+        Some(state) => state.drive_nonblocking(),
+        None => -1,
     }
-
-    // Poll the connection for outgoing transmits. Quinn-proto packs
-    // the datagram into `tx_buf`; we send it on the registered UDP
-    // socket.
-    if let Some(conn_entry) = engine.quic_conns.get_mut(&conn_id) {
-        // Connection-level timeouts / handshakes first.
-        while let Some(timeout) = conn_entry.connection.poll_timeout() {
-            if timeout > now {
-                break;
-            }
-            conn_entry.connection.handle_timeout(now);
-        }
-        let max_datagrams = 1usize;
-        while let Some(transmit) = conn_entry.connection.poll_transmit(now, max_datagrams, &mut tx_buf) {
-            if (transmit.size) > tx_buf.len() {
-                break;
-            }
-            let bytes = &tx_buf[..transmit.size];
-            let _ = endpoint_entry.socket.send_to(bytes, transmit.destination);
-            tx_buf.clear();
-        }
-    }
-
-    processed
 }
 
 /// Close a QUIC connection and release all associated state.
@@ -1764,13 +1443,8 @@ pub extern "C" fn net_http3_close(engine_handle: NetEngineHandle, conn_handle: C
     let conn_id = conn_handle as usize;
 
     // Drain the connection cleanly so the peer sees a CONNECTION_CLOSE.
-    if let Some(mut conn_entry) = engine.quic_conns.remove(&conn_id) {
-        let now = std::time::Instant::now();
-        conn_entry
-            .connection
-            .close(now, 0u32.into(), bytes::Bytes::from_static(b"client closed"));
-    }
-    if let Some(_endpoint_entry) = engine.quic_endpoints.remove(&conn_id) {
+    if let Some(mut state) = engine.quic_conns.remove(&conn_id) {
+        state.close_gracefully();
     }
     NS_OK
 }
@@ -1797,8 +1471,8 @@ pub extern "C" fn net_quic_migrate(
     };
     let new_addr = std::net::SocketAddr::new(ip, new_local_port);
 
-    let endpoint_entry = match engine.quic_endpoints.get_mut(&conn_id) {
-        Some(e) => e,
+    let state = match engine.quic_conns.get_mut(&conn_id) {
+        Some(s) => s,
         None => return NS_ERROR_FAILURE,
     };
 
@@ -1820,8 +1494,7 @@ pub extern "C" fn net_quic_migrate(
         Err(_) => new_addr,
     };
 
-    endpoint_entry.socket = new_socket;
-    endpoint_entry.local_addr = actual_local;
+    state.migrate_socket(new_socket, actual_local);
 
     NS_OK
 }
@@ -1831,42 +1504,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_store_contains_trust_anchors() {
-        let store = root_store();
-        assert!(!store.is_empty(), "trust store must contain roots");
-        assert!(store.len() >= webpki_roots::TLS_SERVER_ROOTS.len());
-    }
-
-    #[test]
-    fn engine_configures_alpn_for_h2_and_http11() {
+    fn engine_configures_boring_tls_profile() {
         let engine = NetEngine::new().expect("engine must initialize");
-        assert_eq!(
-            engine.tls_config.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            "ALPN must negotiate h2 and http/1.1 for streaming engine"
-        );
-    }
-
-    #[test]
-    fn test_load_pem_certs_parses_valid_cert() {
-        let pem_sample = "\
------BEGIN CERTIFICATE-----
-MIIBdDCCARugAwIBAgIQBwX1Iqjr8MdCPXLI8fgISjAKBggqhkjOPQQDAjAZMRcw
-FQYDVQQDEw5hbnRpZ3Jhdml0eSBDQTAeFw0yNjExMjEwNTUzMDlaFw0zNjExMjEw
-NTUzMDlaMBkxFzAVBgNVBAMTDmFudGlncmF2aXR5IENBMFkwEwYHKoZIzj0CAQYI
-KoZIzj0DAQcDQgAEl8B2nNIkTR4D1wul5vwunM97rfZXNAO8iUmvTgrYcsAI277f
-IyPh6m6bXqasXnKFL62EptHqz4weaRM8i+QmUaNFMEMwDgYDVR0PAQH/BAQDAgIE
-MBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFB7Bz8ieNJXYG22erK9B1IYY
-Np1AMAoGCCqGSM49BAMCA0cAMEQCIBN6PxS/+aMaOIoywLaD3/WKP0QVoZkcwGka
-J0wGoFpdAiB7n+1noxTxqbLQQ/aSI9vGSov/GskEh1Zpn4xh3kNtOg==
------END CERTIFICATE-----
-";
-        let temp_path = std::env::temp_dir().join("test_cert.pem");
-        std::fs::write(&temp_path, pem_sample).expect("write temp pem");
-        let certs = load_pem_certs(temp_path.to_str().unwrap());
-        let _ = std::fs::remove_file(temp_path);
-        assert_eq!(certs.len(), 1);
-        assert!(!certs[0].is_empty());
+        assert_eq!(engine.tls_config.profile, TlsFingerprintProfile::Chrome);
     }
 
     #[test]

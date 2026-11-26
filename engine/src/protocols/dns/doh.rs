@@ -5,20 +5,19 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use crate::protocols::tls::BoringTlsConfig;
 use url::Url;
 
 use super::wire::{DnsRecord, DnsRecordType, DnsWireCodec};
 
 pub struct DohClient {
-    tls_config: Arc<ClientConfig>,
+    tls_config: Arc<BoringTlsConfig>,
     endpoint_url: String, // e.g. "https://cloudflare-dns.com/dns-query"
     timeout: Duration,
 }
 
 impl DohClient {
-    pub fn new(tls_config: Arc<ClientConfig>, endpoint_url: &str) -> Self {
+    pub fn new(tls_config: Arc<BoringTlsConfig>, endpoint_url: &str) -> Self {
         Self {
             tls_config,
             endpoint_url: endpoint_url.to_string(),
@@ -53,14 +52,10 @@ impl DohClient {
         }
         let tcp = tcp.ok_or(format!("Could not connect to DoH server {}", addr_str))?;
 
-        let server_name = ServerName::try_from(host)
-            .map_err(|e| format!("Invalid DoH TLS server name: {}", e))?
-            .to_owned();
-
-        let tls_conn = ClientConnection::new(self.tls_config.clone(), server_name)
-            .map_err(|e| format!("DoH TLS handshake init failed: {}", e))?;
-
-        let mut stream = StreamOwned::new(tls_conn, tcp);
+        let mut stream = self
+            .tls_config
+            .connect_blocking(host, tcp, Some(b"\x08http/1.1"))
+            .map_err(|e| format!("DoH TLS handshake failed: {}", e))?;
 
         // Encode RFC 1035 query
         let query_id = 0u16; // DoH recommends ID=0 for HTTP/2 and HTTP/3 caching

@@ -1,13 +1,13 @@
 //! WebTransport wire-level support (Rust FFI backing for `z_webtransport`).
 //!
-//! Provides a thin wrapper over `quinn-proto` for the WebTransport
+//! Provides a thin wrapper over `quiche` for the WebTransport
 //! primitives the browser needs:
 //!   - ALPN advertisement
 //!   - `SETTINGS_WEBTRANSPORT_MAX_SESSIONS` negotiation
 //!   - Datagram accept/queue
 //!   - Stream acceptance
 //!
-//! The actual transport is implemented by `quinn-proto`; this module is
+//! The actual transport is implemented by `quiche`; this module is
 //! the C-ABI surface that the Zig `z_webtransport` calls into.
 
 use std::collections::VecDeque;

@@ -14,10 +14,23 @@ use boring::ssl::{
 use boring::x509::X509;
 use compio_driver::op::Interest;
 use compio_driver::SharedFd;
-use rustls::client::{ClientSessionMemoryCache, ClientSessionStore, Resumption};
-use rustls::pki_types::ServerName;
-use rustls::NamedGroup;
 use socket2::Socket as Socket2;
+
+pub type BoringStream = boring::ssl::SslStream<BoringIo>;
+pub type BoringMidHandshake = boring::ssl::MidHandshakeSslStream<BoringIo>;
+pub type BoringTcpStream = boring::ssl::SslStream<TcpStream>;
+
+pub fn random_bytes(buf: &mut [u8]) {
+    let _ = boring::rand::rand_bytes(buf);
+}
+
+pub fn tls_version_wire(stream: &BoringTcpStream) -> u16 {
+    match stream.ssl().version2() {
+        Some(SslVersion::TLS1_2) => 0x0303,
+        Some(SslVersion::TLS1_3) => 0x0304,
+        _ => 0,
+    }
+}
 
 /// Browser TLS fingerprint profile for outgoing TCP/TLS connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,140 +190,6 @@ impl BoringSessionStore {
     }
 }
 
-/// Persistent disk-backed `rustls::client::ClientSessionStore` with safe in-memory fallback.
-///
-/// Wraps `ClientSessionMemoryCache` for TLS 1.2/1.3 tickets and persists key-exchange
-/// group hints (`NamedGroup` per `ServerName`) to disk so subsequent restarts avoid
-/// HelloRetryRequest round-trips.
-#[derive(Debug)]
-pub struct PersistentRustlsSessionStore {
-    memory: ClientSessionMemoryCache,
-    kx_hints: Mutex<HashMap<String, u16>>,
-    path: Option<PathBuf>,
-    max_entries: usize,
-}
-
-impl PersistentRustlsSessionStore {
-    pub fn with_path(path: Option<PathBuf>, capacity: usize) -> Self {
-        let mut kx_hints = HashMap::new();
-        if let Some(ref p) = path {
-            if let Ok(text) = std::fs::read_to_string(p) {
-                for line in text.lines() {
-                    if let Some((host, group_str)) = line.split_once('\t') {
-                        if let Ok(code) = group_str.trim().parse::<u16>() {
-                            if kx_hints.len() < capacity {
-                                kx_hints.insert(host.to_string(), code);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Self {
-            memory: ClientSessionMemoryCache::new(capacity),
-            kx_hints: Mutex::new(kx_hints),
-            path,
-            max_entries: capacity,
-        }
-    }
-
-    pub fn new_default(capacity: usize) -> Self {
-        Self::with_path(default_session_store_path("rustls_sessions.db"), capacity)
-    }
-
-    pub fn into_resumption(self: Arc<Self>) -> Resumption {
-        Resumption::store(self)
-    }
-
-    fn persist_kx_hints(&self, map: &HashMap<String, u16>) {
-        if let Some(ref p) = self.path {
-            let mut out = String::new();
-            for (k, v) in map {
-                out.push_str(k);
-                out.push('\t');
-                out.push_str(&v.to_string());
-                out.push('\n');
-            }
-            let _ = atomic_write_private(p, out.as_bytes());
-        }
-    }
-}
-
-impl ClientSessionStore for PersistentRustlsSessionStore {
-    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
-        let key = server_name.to_str().to_ascii_lowercase();
-        let code = u16::from(group);
-        self.memory.set_kx_hint(server_name, group);
-
-        let snapshot = {
-            let mut guard = match self.kx_hints.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if guard.len() >= self.max_entries && !guard.contains_key(&key) {
-                if let Some(first_key) = guard.keys().next().cloned() {
-                    guard.remove(&first_key);
-                }
-            }
-            guard.insert(key, code);
-            if self.path.is_some() {
-                Some(guard.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(map) = snapshot {
-            self.persist_kx_hints(&map);
-        }
-    }
-
-    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
-        if let Some(g) = self.memory.kx_hint(server_name) {
-            return Some(g);
-        }
-        let key = server_name.to_str().to_ascii_lowercase();
-        let code = self.kx_hints.lock().ok()?.get(&key).copied()?;
-        Some(NamedGroup::from(code))
-    }
-
-    fn set_tls12_session(
-        &self,
-        server_name: ServerName<'static>,
-        value: rustls::client::Tls12ClientSessionValue,
-    ) {
-        self.memory.set_tls12_session(server_name, value);
-    }
-
-    fn tls12_session(
-        &self,
-        server_name: &ServerName<'_>,
-    ) -> Option<rustls::client::Tls12ClientSessionValue> {
-        self.memory.tls12_session(server_name)
-    }
-
-    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
-        self.memory.remove_tls12_session(server_name);
-    }
-
-    fn insert_tls13_ticket(
-        &self,
-        server_name: ServerName<'static>,
-        value: rustls::client::Tls13ClientSessionValue,
-    ) {
-        self.memory.insert_tls13_ticket(server_name, value);
-    }
-
-    fn take_tls13_ticket(
-        &self,
-        server_name: &ServerName<'static>,
-    ) -> Option<rustls::client::Tls13ClientSessionValue> {
-        self.memory.take_tls13_ticket(server_name)
-    }
-}
-
-/// Shared BoringSSL client connector configured with browser-grade ClientHello
-/// fingerprinting (GREASE, extension permutation, cipher/sigalg order, PQ
-/// X25519MLKEM768 when supported by BoringSSL, ECH GREASE, and persistent resumption).
 pub struct BoringTlsConfig {
     connector: SslConnector,
     pub profile: TlsFingerprintProfile,
@@ -320,6 +199,53 @@ pub struct BoringTlsConfig {
 }
 
 impl BoringTlsConfig {
+    /// Build a `boring::ssl::SslContextBuilder` configured with system trust anchors and
+    /// browser-like TLS fingerprinting for `quiche::Config::with_boring_ssl_ctx_builder`.
+    pub fn build_quic_ssl_context_builder(&self) -> Result<boring::ssl::SslContextBuilder, String> {
+        let mut builder = boring::ssl::SslContextBuilder::new(SslMethod::tls())
+            .map_err(|e| format!("BoringSSL QUIC context builder failed: {}", e))?;
+
+        let _ = builder.set_default_verify_paths();
+        if let Ok(pem) = std::fs::read("/etc/ssl/certs/ca-certificates.crt") {
+            if let Ok(certs) = X509::stack_from_pem(&pem) {
+                let store = builder.cert_store_mut();
+                for cert in certs {
+                    let _ = store.add_cert(cert);
+                }
+            }
+        }
+
+        let _ = builder.set_min_proto_version(Some(SslVersion::TLS1_3));
+        let _ = builder.set_max_proto_version(Some(SslVersion::TLS1_3));
+        builder.set_grease_enabled(true);
+        builder.set_permute_extensions(self.profile == TlsFingerprintProfile::Chrome);
+        let _ = builder.set_curves_list("X25519MLKEM768:X25519Kyber768Draft00:X25519:P-256:P-384");
+        let _ = builder.set_alpn_protos(b"\x02h3");
+        Ok(builder)
+    }
+
+    /// Build a `quiche::Config` backed by `BoringTlsConfig`'s `SslContextBuilder`.
+    pub fn build_quiche_config(&self) -> Result<quiche::Config, String> {
+        let ssl_ctx = self.build_quic_ssl_context_builder()?;
+        let mut config =
+            quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl_ctx)
+                .map_err(|e| format!("quiche::Config failed: {:?}", e))?;
+        config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .map_err(|e| format!("quiche ALPN failed: {:?}", e))?;
+        config.set_max_idle_timeout(30_000);
+        config.set_max_recv_udp_payload_size(1350);
+        config.set_max_send_udp_payload_size(1350);
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+        config.enable_early_data();
+        Ok(config)
+    }
+
     pub fn new(
         profile: TlsFingerprintProfile,
         session_store: Arc<BoringSessionStore>,
@@ -657,29 +583,5 @@ mod tests {
         assert_eq!(fallback.get("fallback.test"), Some(vec![1, 2, 3, 4]));
     }
 
-    #[test]
-    fn test_persistent_rustls_session_store_kx_hint_roundtrip_and_fallback() {
-        let dir = std::env::temp_dir().join(format!("znet_test_rustls_{}", std::process::id()));
-        let path = dir.join("rustls_sessions.db");
-        let _ = std::fs::remove_dir_all(&dir);
 
-        let sni = ServerName::try_from("quic.example.com".to_string()).unwrap();
-        {
-            let store = PersistentRustlsSessionStore::with_path(Some(path.clone()), 64);
-            store.set_kx_hint(sni.clone(), NamedGroup::X25519);
-            assert_eq!(store.kx_hint(&sni), Some(NamedGroup::X25519));
-        }
-        {
-            let reloaded = PersistentRustlsSessionStore::with_path(Some(path.clone()), 64);
-            assert_eq!(reloaded.kx_hint(&sni), Some(NamedGroup::X25519));
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let bad_store = PersistentRustlsSessionStore::with_path(
-            Some(PathBuf::from("/proc/nonexistent_znet_dir/rustls.db")),
-            64,
-        );
-        bad_store.set_kx_hint(sni.clone(), NamedGroup::secp256r1);
-        assert_eq!(bad_store.kx_hint(&sni), Some(NamedGroup::secp256r1));
-    }
 }
