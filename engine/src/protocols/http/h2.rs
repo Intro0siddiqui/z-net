@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::Ordering;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use h2_sans_io::{
-    settings_id, H2Codec, H2Event, H2Header, HpackDecoder, HpackEncoder, CONNECTION_PREFACE,
+    flags, frame_type, settings_id, H2Codec, H2Event, H2Header, HpackDecoder, HpackEncoder,
+    CONNECTION_PREFACE,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use url::Url;
@@ -12,6 +15,145 @@ use url::Url;
 use crate::protocols::compression::StreamDecompressor;
 use crate::protocols::http::client::HttpRequestOptions;
 use crate::BodyRingDescriptor;
+
+/// Browser HTTP/2 fingerprint profile controlling initial SETTINGS,
+/// Stream 0 WINDOW_UPDATE, and stream priority signaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2FingerprintProfile {
+    /// Modern Chrome / Chromium H2 fingerprint.
+    Chrome,
+    /// Modern Firefox H2 fingerprint.
+    Firefox,
+}
+
+impl Default for H2FingerprintProfile {
+    fn default() -> Self {
+        Self::Chrome
+    }
+}
+
+/// RFC 7540 §6.2 stream priority fields carried in HEADERS frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H2StreamPriority {
+    pub exclusive: bool,
+    pub stream_dependency: u32,
+    /// Wire weight (actual weight = wire_weight + 1; Chrome default is 255 => 256).
+    pub weight: u8,
+}
+
+impl Default for H2StreamPriority {
+    fn default() -> Self {
+        Self {
+            exclusive: true,
+            stream_dependency: 0,
+            weight: 255,
+        }
+    }
+}
+
+/// Returns the full browser initial SETTINGS pairs for `profile`.
+pub fn browser_settings_pairs(profile: H2FingerprintProfile) -> [(u16, u32); 6] {
+    match profile {
+        H2FingerprintProfile::Chrome => [
+            (settings_id::HEADER_TABLE_SIZE, 65_536),
+            (settings_id::ENABLE_PUSH, 0),
+            (settings_id::MAX_CONCURRENT_STREAMS, 1_000),
+            (settings_id::INITIAL_WINDOW_SIZE, 6_291_456),
+            (settings_id::MAX_FRAME_SIZE, 16_384),
+            (settings_id::MAX_HEADER_LIST_SIZE, 262_144),
+        ],
+        H2FingerprintProfile::Firefox => [
+            (settings_id::HEADER_TABLE_SIZE, 65_536),
+            (settings_id::ENABLE_PUSH, 0),
+            (settings_id::MAX_CONCURRENT_STREAMS, 100),
+            (settings_id::INITIAL_WINDOW_SIZE, 131_072),
+            (settings_id::MAX_FRAME_SIZE, 16_384),
+            (settings_id::MAX_HEADER_LIST_SIZE, 262_144),
+        ],
+    }
+}
+
+/// Build an RFC 7540 SETTINGS frame containing all 6 browser settings.
+pub fn build_browser_settings_frame(profile: H2FingerprintProfile) -> Vec<u8> {
+    let pairs = browser_settings_pairs(profile);
+    let payload_len = pairs.len() * 6;
+    let mut frame = Vec::with_capacity(9 + payload_len);
+    // 24-bit payload length
+    frame.push(((payload_len >> 16) & 0xFF) as u8);
+    frame.push(((payload_len >> 8) & 0xFF) as u8);
+    frame.push((payload_len & 0xFF) as u8);
+    // Frame type = SETTINGS (0x04), flags = 0x00, stream_id = 0
+    frame.push(frame_type::SETTINGS);
+    frame.push(0x00);
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    for (id, val) in pairs {
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.extend_from_slice(&val.to_be_bytes());
+    }
+    frame
+}
+
+/// Browser-sized Stream 0 WINDOW_UPDATE increment (Chrome: 15,663,105).
+pub fn browser_initial_window_update(profile: H2FingerprintProfile) -> u32 {
+    match profile {
+        H2FingerprintProfile::Chrome => 15_663_105,
+        H2FingerprintProfile::Firefox => 12_517_377,
+    }
+}
+
+/// Build HEADERS (+ optional CONTINUATION) frames with RFC 7540 PRIORITY signaling.
+pub fn build_headers_frames_with_priority(
+    stream_id: u32,
+    header_block: &[u8],
+    end_stream: bool,
+    max_frame_size: u32,
+    priority: H2StreamPriority,
+) -> Vec<Vec<u8>> {
+    let max_payload = (max_frame_size as usize).max(16_384);
+    let first_chunk_cap = max_payload.saturating_sub(5).max(1);
+    let first_len = header_block.len().min(first_chunk_cap);
+    let is_single = first_len == header_block.len();
+
+    let mut frame_flags = flags::PRIORITY;
+    if end_stream {
+        frame_flags |= flags::END_STREAM;
+    }
+    if is_single {
+        frame_flags |= flags::END_HEADERS;
+    }
+
+    let payload_len = 5 + first_len;
+    let mut first_frame = Vec::with_capacity(9 + payload_len);
+    first_frame.push(((payload_len >> 16) & 0xFF) as u8);
+    first_frame.push(((payload_len >> 8) & 0xFF) as u8);
+    first_frame.push((payload_len & 0xFF) as u8);
+    first_frame.push(frame_type::HEADERS);
+    first_frame.push(frame_flags);
+    first_frame.extend_from_slice(&(stream_id & 0x7FFF_FFFF).to_be_bytes());
+
+    let dep_word = if priority.exclusive {
+        (priority.stream_dependency & 0x7FFF_FFFF) | 0x8000_0000
+    } else {
+        priority.stream_dependency & 0x7FFF_FFFF
+    };
+    first_frame.extend_from_slice(&dep_word.to_be_bytes());
+    first_frame.push(priority.weight);
+    first_frame.extend_from_slice(&header_block[..first_len]);
+
+    let mut frames = vec![first_frame];
+    let mut offset = first_len;
+    while offset < header_block.len() {
+        let end = (offset + max_payload).min(header_block.len());
+        let is_last = end == header_block.len();
+        frames.push(H2Codec::create_continuation_frame(
+            stream_id,
+            &header_block[offset..end],
+            is_last,
+        ));
+        offset = end;
+    }
+    frames
+}
 
 /// Formats and prepares an HTTP/2 request with pseudo-headers.
 pub struct Http2RequestBuilder {
@@ -51,7 +193,7 @@ impl Http2RequestBuilder {
         self
     }
 
-    /// Build the standard `http::Request` containing pseudo-headers (:method, :scheme, :authority, :path).
+    /// Build the standard `http::Request` containing pseudo-headers (:method, :authority, :scheme, :path).
     pub fn build(mut self) -> Result<(Request<()>, Option<Bytes>), String> {
         let mut builder = Request::builder().method(self.method).uri(self.uri);
 
@@ -104,7 +246,7 @@ fn write_slice_to_ring(ring: &BodyRingDescriptor, slice: &[u8]) {
     }
 }
 
-fn is_hop_by_hop_header(name: &str) -> bool {
+pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-connection")
@@ -113,8 +255,42 @@ fn is_hop_by_hop_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("host")
 }
 
-/// Persistent HTTP/2 connection session that can be pooled and reused across multiple
-/// sequential requests on the same origin without repeating TCP/TLS/H2 handshakes.
+/// Per-stream state tracked during concurrent HTTP/2 multiplexing.
+struct ActiveStreamState {
+    transparent_decompression: bool,
+    has_range_header: bool,
+    headers_dispatched: bool,
+    decompressor: Option<StreamDecompressor>,
+}
+
+/// Events emitted by `H2Session::drive_once` for multiplexed streams.
+#[derive(Debug)]
+pub enum H2MuxEvent {
+    Headers {
+        stream_id: u32,
+        status: u16,
+        reason: &'static str,
+        headers: Vec<(String, String)>,
+    },
+    Data {
+        stream_id: u32,
+        data: Vec<u8>,
+    },
+    Complete {
+        stream_id: u32,
+    },
+    StreamReset {
+        stream_id: u32,
+        error_code: u32,
+    },
+    GoAway {
+        error_code: u32,
+    },
+}
+
+/// Persistent HTTP/2 connection session supporting concurrent multiplexed streams,
+/// browser-grade initial SETTINGS, Stream 0 WINDOW_UPDATE, Chrome pseudo-header order,
+/// and priority signaling.
 pub struct H2Session<S> {
     pub stream: S,
     pub codec: H2Codec,
@@ -122,20 +298,31 @@ pub struct H2Session<S> {
     pub decoder: HpackDecoder,
     pub next_stream_id: u32,
     pub peer_max_frame_size: u32,
+    pub peer_max_concurrent_streams: u32,
     pub goaway_received: bool,
+    pub profile: H2FingerprintProfile,
+    active_streams: HashMap<u32, ActiveStreamState>,
 }
 
 impl<S: Read + Write> H2Session<S> {
-    /// Initialize a new HTTP/2 session by sending the client connection preface and initial SETTINGS.
-    pub fn new(mut stream: S) -> Result<Self, String> {
+    /// Initialize a new HTTP/2 session with Chrome-like browser SETTINGS and Stream 0 WINDOW_UPDATE.
+    pub fn new(stream: S) -> Result<Self, String> {
+        Self::new_with_profile(stream, H2FingerprintProfile::Chrome)
+    }
+
+    /// Initialize a new HTTP/2 session with an explicit browser fingerprint profile.
+    pub fn new_with_profile(mut stream: S, profile: H2FingerprintProfile) -> Result<Self, String> {
         stream
             .write_all(CONNECTION_PREFACE)
             .map_err(|e| format!("h2 preface write failed: {}", e))?;
         stream
-            .write_all(&H2Codec::create_settings_with_window(1024 * 1024))
+            .write_all(&build_browser_settings_frame(profile))
             .map_err(|e| format!("h2 settings write failed: {}", e))?;
         stream
-            .write_all(&H2Codec::create_window_update(0, 1024 * 1024))
+            .write_all(&H2Codec::create_window_update(
+                0,
+                browser_initial_window_update(profile),
+            ))
             .map_err(|e| format!("h2 window update write failed: {}", e))?;
         stream
             .flush()
@@ -151,12 +338,339 @@ impl<S: Read + Write> H2Session<S> {
             decoder: HpackDecoder::new(),
             next_stream_id: 1,
             peer_max_frame_size: 16384,
+            peer_max_concurrent_streams: 100,
             goaway_received: false,
+            profile,
+            active_streams: HashMap::new(),
         })
     }
 
     pub fn is_reusable(&self) -> bool {
         !self.goaway_received && self.next_stream_id < u32::MAX - 2
+    }
+
+    pub fn active_stream_count(&self) -> usize {
+        self.active_streams.len()
+    }
+
+    /// Submit a request on a new multiplexed stream without blocking for its response.
+    /// Encodes pseudo-headers in Chrome order (`:method`, `:authority`, `:scheme`, `:path`)
+    /// with RFC 7540 priority signaling.
+    pub fn submit_request(&mut self, options: &HttpRequestOptions) -> Result<u32, String> {
+        self.submit_request_with_priority(options, H2StreamPriority::default())
+    }
+
+    /// Submit a request on a new multiplexed stream with explicit priority signaling.
+    pub fn submit_request_with_priority(
+        &mut self,
+        options: &HttpRequestOptions,
+        priority: H2StreamPriority,
+    ) -> Result<u32, String> {
+        if self.goaway_received {
+            return Err("h2 session received GOAWAY".to_string());
+        }
+
+        let parsed_url =
+            Url::parse(&options.url).map_err(|e| format!("Invalid URL for h2: {}", e))?;
+        let scheme = parsed_url.scheme();
+        let host = parsed_url.host_str().ok_or("Missing host in URL")?;
+        let authority = match parsed_url.port() {
+            Some(p) => format!("{}:{}", host, p),
+            None => host.to_string(),
+        };
+        let mut path_and_query = parsed_url.path().to_string();
+        if let Some(q) = parsed_url.query() {
+            path_and_query.push('?');
+            path_and_query.push_str(q);
+        }
+        if path_and_query.is_empty() {
+            path_and_query = "/".to_string();
+        }
+
+        let has_range_header = options
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let has_accept_encoding = options
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
+
+        // Chrome pseudo-header order: :method, :authority, :scheme, :path
+        let mut h2_headers = Vec::with_capacity(4 + options.headers.len() + 1);
+        h2_headers.push(H2Header::new(":method", options.method.as_bytes()));
+        h2_headers.push(H2Header::new(":authority", authority.as_bytes()));
+        h2_headers.push(H2Header::new(":scheme", scheme.as_bytes()));
+        h2_headers.push(H2Header::new(":path", path_and_query.as_bytes()));
+
+        for (k, v) in &options.headers {
+            if is_hop_by_hop_header(k) {
+                continue;
+            }
+            h2_headers.push(H2Header::new(
+                k.to_ascii_lowercase().into_bytes(),
+                v.as_bytes(),
+            ));
+        }
+        if options.transparent_decompression && !has_range_header && !has_accept_encoding {
+            h2_headers.push(H2Header::new("accept-encoding", "gzip, deflate, br, zstd"));
+        }
+
+        let header_block = self.encoder.encode(&h2_headers);
+
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.saturating_add(2);
+
+        let max_frame_size = self.peer_max_frame_size;
+        let has_body = options.body.as_ref().map_or(false, |b| !b.is_empty());
+        for frame in build_headers_frames_with_priority(
+            stream_id,
+            &header_block,
+            !has_body,
+            max_frame_size,
+            priority,
+        ) {
+            self.stream
+                .write_all(&frame)
+                .map_err(|e| format!("h2 headers write failed: {}", e))?;
+        }
+        if let Some(ref body) = options.body {
+            if !body.is_empty() {
+                for frame in H2Codec::create_data_frames(stream_id, body, true, max_frame_size) {
+                    self.stream
+                        .write_all(&frame)
+                        .map_err(|e| format!("h2 data write failed: {}", e))?;
+                }
+            }
+        }
+        self.stream
+            .flush()
+            .map_err(|e| format!("h2 flush failed: {}", e))?;
+
+        self.active_streams.insert(
+            stream_id,
+            ActiveStreamState {
+                transparent_decompression: options.transparent_decompression,
+                has_range_header,
+                headers_dispatched: false,
+                decompressor: None,
+            },
+        );
+
+        Ok(stream_id)
+    }
+
+    /// Read once from the underlying transport and demultiplex any decoded HTTP/2 events
+    /// across all currently active streams. Returns `Ok(vec![])` on `WouldBlock`/`TimedOut`.
+    pub fn drive_once(&mut self) -> Result<Vec<H2MuxEvent>, String> {
+        let mut read_buf = [0u8; 16384];
+        let n = match self.stream.read(&mut read_buf) {
+            Ok(0) => {
+                self.goaway_received = true;
+                return Err("h2 connection closed by peer".to_string());
+            }
+            Ok(n) => n,
+            Err(ref e)
+                if e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut
+                    || e.kind() == ErrorKind::Interrupted =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                self.goaway_received = true;
+                return Err(format!("h2 read error: {}", e));
+            }
+        };
+
+        let events = self.codec.process(&read_buf[..n]).map_err(|e| {
+            self.goaway_received = true;
+            format!("h2 frame decode error: {}", e)
+        })?;
+
+        let mut out = Vec::new();
+        for event in events {
+            match event {
+                H2Event::Settings {
+                    ack: false,
+                    settings,
+                } => {
+                    for (id, val) in settings {
+                        if id == settings_id::MAX_FRAME_SIZE && val >= 16384 && val <= 16_777_215 {
+                            self.peer_max_frame_size = val;
+                        } else if id == settings_id::MAX_CONCURRENT_STREAMS && val > 0 {
+                            self.peer_max_concurrent_streams = val;
+                        }
+                    }
+                    let _ = self.stream.write_all(&H2Codec::create_settings_ack());
+                    let _ = self.stream.flush();
+                }
+                H2Event::Ping { ack: false, data } => {
+                    let _ = self.stream.write_all(&H2Codec::create_ping_ack(data));
+                    let _ = self.stream.flush();
+                }
+                H2Event::Headers {
+                    stream_id,
+                    header_block,
+                    end_stream,
+                } => {
+                    // Always decode HPACK to keep dynamic table synchronized across all streams
+                    let decoded = self.decoder.decode(&header_block).map_err(|e| {
+                        self.goaway_received = true;
+                        format!("h2 HPACK decode error: {}", e)
+                    })?;
+
+                    let mut status: u16 = 200;
+                    let mut headers_vec = Vec::with_capacity(decoded.len());
+                    for h in decoded {
+                        let name = String::from_utf8_lossy(&h.name).to_string();
+                        let value = String::from_utf8_lossy(&h.value).to_string();
+                        if name == ":status" {
+                            if let Ok(code) = value.parse::<u16>() {
+                                status = code;
+                            }
+                        } else if !name.starts_with(':') {
+                            headers_vec.push((name, value));
+                        }
+                    }
+
+                    if (100..200).contains(&status) {
+                        continue;
+                    }
+
+                    let reason = StatusCode::from_u16(status)
+                        .ok()
+                        .and_then(|s| s.canonical_reason())
+                        .unwrap_or("OK");
+
+                    if let Some(st) = self.active_streams.get_mut(&stream_id) {
+                        let should_decompress = st.transparent_decompression
+                            && !st.has_range_header
+                            && status != 206;
+
+                        if should_decompress {
+                            if let Some((_, enc)) = headers_vec
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                            {
+                                if let Some(dec) = StreamDecompressor::new(enc) {
+                                    st.decompressor = Some(dec);
+                                }
+                            }
+                        }
+
+                        let emitted_headers = if st.decompressor.is_some() {
+                            headers_vec
+                                .into_iter()
+                                .filter(|(k, _)| {
+                                    !k.eq_ignore_ascii_case("content-encoding")
+                                        && !k.eq_ignore_ascii_case("content-length")
+                                })
+                                .collect()
+                        } else {
+                            headers_vec
+                        };
+
+                        st.headers_dispatched = true;
+                        out.push(H2MuxEvent::Headers {
+                            stream_id,
+                            status,
+                            reason,
+                            headers: emitted_headers,
+                        });
+
+                        if end_stream {
+                            if let Some(dec) = st.decompressor.take() {
+                                let mut tail = Vec::new();
+                                dec.finish(|s| tail.extend_from_slice(s))
+                                    .map_err(|e| format!("h2 decompression finish error: {}", e))?;
+                                if !tail.is_empty() {
+                                    out.push(H2MuxEvent::Data {
+                                        stream_id,
+                                        data: tail,
+                                    });
+                                }
+                            }
+                            self.active_streams.remove(&stream_id);
+                            self.codec.remove_stream(stream_id);
+                            out.push(H2MuxEvent::Complete { stream_id });
+                        }
+                    }
+                }
+                H2Event::Data {
+                    stream_id,
+                    data,
+                    end_stream,
+                } => {
+                    if !data.is_empty() {
+                        let len_u32 = data.len() as u32;
+                        let _ = self
+                            .stream
+                            .write_all(&H2Codec::create_window_update(0, len_u32));
+                        let _ = self
+                            .stream
+                            .write_all(&H2Codec::create_window_update(stream_id, len_u32));
+                        let _ = self.stream.flush();
+                    }
+
+                    if let Some(st) = self.active_streams.get_mut(&stream_id) {
+                        if !data.is_empty() {
+                            if let Some(ref mut dec) = st.decompressor {
+                                let mut decoded_buf = Vec::new();
+                                dec.feed(&data, |s| decoded_buf.extend_from_slice(s))
+                                    .map_err(|e| format!("h2 decompression error: {}", e))?;
+                                if !decoded_buf.is_empty() {
+                                    out.push(H2MuxEvent::Data {
+                                        stream_id,
+                                        data: decoded_buf,
+                                    });
+                                }
+                            } else {
+                                out.push(H2MuxEvent::Data {
+                                    stream_id,
+                                    data: data.to_vec(),
+                                });
+                            }
+                        }
+
+                        if end_stream {
+                            if let Some(dec) = st.decompressor.take() {
+                                let mut tail = Vec::new();
+                                dec.finish(|s| tail.extend_from_slice(s))
+                                    .map_err(|e| format!("h2 decompression finish error: {}", e))?;
+                                if !tail.is_empty() {
+                                    out.push(H2MuxEvent::Data {
+                                        stream_id,
+                                        data: tail,
+                                    });
+                                }
+                            }
+                            self.active_streams.remove(&stream_id);
+                            self.codec.remove_stream(stream_id);
+                            out.push(H2MuxEvent::Complete { stream_id });
+                        }
+                    }
+                }
+                H2Event::StreamReset {
+                    stream_id,
+                    error_code,
+                } => {
+                    self.active_streams.remove(&stream_id);
+                    self.codec.remove_stream(stream_id);
+                    out.push(H2MuxEvent::StreamReset {
+                        stream_id,
+                        error_code,
+                    });
+                }
+                H2Event::GoAway { error_code, .. } => {
+                    self.goaway_received = true;
+                    out.push(H2MuxEvent::GoAway { error_code });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(out)
     }
 
     /// Execute a single HTTP/2 request/response stream on this persistent session.
@@ -175,249 +689,79 @@ impl<S: Read + Write> H2Session<S> {
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
-        if self.goaway_received {
-            return Err("h2 session received GOAWAY".to_string());
-        }
-
-        let parsed_url = Url::parse(&options.url)
-            .map_err(|e| format!("Invalid URL for h2: {}", e))?;
-        let scheme = parsed_url.scheme();
-        let host = parsed_url.host_str().ok_or("Missing host in URL")?;
-        let authority = match parsed_url.port() {
-            Some(p) => format!("{}:{}", host, p),
-            None => host.to_string(),
-        };
-        let mut path_and_query = parsed_url.path().to_string();
-        if let Some(q) = parsed_url.query() {
-            path_and_query.push('?');
-            path_and_query.push_str(q);
-        }
-        if path_and_query.is_empty() {
-            path_and_query = "/".to_string();
-        }
-
-        let has_range_header = options.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
-        let has_accept_encoding = options
-            .headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
-
-        // 1. Encode HTTP/2 pseudo-headers and request headers via HPACK
-        let mut h2_headers = Vec::with_capacity(4 + options.headers.len() + 1);
-        h2_headers.push(H2Header::new(":method", options.method.as_bytes()));
-        h2_headers.push(H2Header::new(":scheme", scheme.as_bytes()));
-        h2_headers.push(H2Header::new(":authority", authority.as_bytes()));
-        h2_headers.push(H2Header::new(":path", path_and_query.as_bytes()));
-
-        for (k, v) in &options.headers {
-            if is_hop_by_hop_header(k) {
-                continue;
-            }
-            h2_headers.push(H2Header::new(k.to_ascii_lowercase().into_bytes(), v.as_bytes()));
-        }
-        if options.transparent_decompression && !has_range_header && !has_accept_encoding {
-            h2_headers.push(H2Header::new("accept-encoding", "gzip, deflate, br, zstd"));
-        }
-
-        let header_block = self.encoder.encode(&h2_headers);
-
-        // 2. Allocate stream ID and send request HEADERS (+ optional DATA) frames
-        let stream_id = self.next_stream_id;
-        self.next_stream_id = self.next_stream_id.saturating_add(2);
-
-        let max_frame_size = self.peer_max_frame_size;
-        let has_body = options.body.as_ref().map_or(false, |b| !b.is_empty());
-        for frame in H2Codec::create_headers_frames(stream_id, &header_block, !has_body, max_frame_size) {
-            self.stream
-                .write_all(&frame)
-                .map_err(|e| format!("h2 headers write failed: {}", e))?;
-        }
-        if let Some(ref body) = options.body {
-            if !body.is_empty() {
-                for frame in H2Codec::create_data_frames(stream_id, body, true, max_frame_size) {
-                    self.stream
-                        .write_all(&frame)
-                        .map_err(|e| format!("h2 data write failed: {}", e))?;
-                }
-            }
-        }
-        self.stream
-            .flush()
-            .map_err(|e| format!("h2 flush failed: {}", e))?;
-
-        // 3. Progressive frame read & decode loop
-        let mut read_buf = [0u8; 16384];
+        let stream_id = self.submit_request(options)?;
         let mut headers_dispatched = false;
         let mut stream_ended = false;
-        let mut decompressor: Option<StreamDecompressor> = None;
 
         while !stream_ended {
             if is_cancelled() {
-                self.goaway_received = true;
+                self.active_streams.remove(&stream_id);
+                let _ = self
+                    .stream
+                    .write_all(&H2Codec::create_rst_stream(stream_id, 0x8));
+                let _ = self.stream.flush();
                 return Ok(headers_dispatched);
             }
 
             if let Some(ring) = body_ring {
                 while ring.should_stop_reading() && !ring.is_closed.load(Ordering::Acquire) {
                     if is_cancelled() {
-                        self.goaway_received = true;
+                        self.active_streams.remove(&stream_id);
                         return Ok(headers_dispatched);
                     }
                     ring.wait_drain(5);
                 }
             }
 
-            let n = match self.stream.read(&mut read_buf) {
-                Ok(0) => {
-                    self.goaway_received = true;
-                    if headers_dispatched {
-                        break;
-                    }
-                    return Err("h2 connection closed before response headers".to_string());
-                }
-                Ok(n) => n,
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+            let events = match self.drive_once() {
+                Ok(ev) if ev.is_empty() => {
+                    std::thread::sleep(Duration::from_millis(2));
                     continue;
                 }
+                Ok(ev) => ev,
                 Err(e) => {
-                    self.goaway_received = true;
-                    return Err(format!("h2 read error: {}", e));
+                    if headers_dispatched && self.goaway_received {
+                        break;
+                    }
+                    return Err(e);
                 }
             };
 
-            let events = self
-                .codec
-                .process(&read_buf[..n])
-                .map_err(|e| {
-                    self.goaway_received = true;
-                    format!("h2 frame decode error: {}", e)
-                })?;
-
-            for event in events {
-                match event {
-                    H2Event::Settings { ack: false, settings } => {
-                        for (id, val) in settings {
-                            if id == settings_id::MAX_FRAME_SIZE && val >= 16384 && val <= 16_777_215 {
-                                self.peer_max_frame_size = val;
-                            }
-                        }
-                        let _ = self.stream.write_all(&H2Codec::create_settings_ack());
-                        let _ = self.stream.flush();
-                    }
-                    H2Event::Ping { ack: false, data } => {
-                        let _ = self.stream.write_all(&H2Codec::create_ping_ack(data));
-                        let _ = self.stream.flush();
-                    }
-                    H2Event::Headers {
-                        stream_id: ev_sid,
-                        header_block,
-                        end_stream,
-                    } if ev_sid == stream_id => {
-                        let decoded = self
-                            .decoder
-                            .decode(&header_block)
-                            .map_err(|e| {
-                                self.goaway_received = true;
-                                format!("h2 HPACK decode error: {}", e)
-                            })?;
-
-                        let mut status: u16 = 200;
-                        let mut headers_vec = Vec::with_capacity(decoded.len());
-                        for h in decoded {
-                            let name = String::from_utf8_lossy(&h.name).to_string();
-                            let value = String::from_utf8_lossy(&h.value).to_string();
-                            if name == ":status" {
-                                if let Ok(code) = value.parse::<u16>() {
-                                    status = code;
-                                }
-                            } else if !name.starts_with(':') {
-                                headers_vec.push((name, value));
-                            }
-                        }
-
-                        if (100..200).contains(&status) {
-                            continue;
-                        }
-
-                        let reason = StatusCode::from_u16(status)
-                            .ok()
-                            .and_then(|s| s.canonical_reason())
-                            .unwrap_or("OK");
-
-                        let should_decompress = options.transparent_decompression
-                            && !has_range_header
-                            && status != 206;
-
-                        if should_decompress {
-                            if let Some((_, enc)) = headers_vec
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-                            {
-                                if let Some(dec) = StreamDecompressor::new(enc) {
-                                    decompressor = Some(dec);
-                                }
-                            }
-                        }
-
-                        if decompressor.is_some() {
-                            let filtered_headers: Vec<(String, String)> = headers_vec
-                                .into_iter()
-                                .filter(|(k, _)| {
-                                    !k.eq_ignore_ascii_case("content-encoding")
-                                        && !k.eq_ignore_ascii_case("content-length")
-                                })
-                                .collect();
-                            on_headers(status, reason, &filtered_headers);
-                        } else {
-                            on_headers(status, reason, &headers_vec);
-                        }
-
+            for ev in events {
+                match ev {
+                    H2MuxEvent::Headers {
+                        stream_id: sid,
+                        status,
+                        reason,
+                        headers,
+                    } if sid == stream_id => {
+                        on_headers(status, reason, &headers);
                         headers_dispatched = true;
-                        if end_stream {
-                            stream_ended = true;
-                        }
                     }
-                    H2Event::Data {
-                        stream_id: ev_sid,
+                    H2MuxEvent::Data {
+                        stream_id: sid,
                         data,
-                        end_stream,
-                    } if ev_sid == stream_id => {
-                        if !data.is_empty() {
-                            let len_u32 = data.len() as u32;
-                            let _ = self.stream.write_all(&H2Codec::create_window_update(0, len_u32));
-                            let _ = self.stream.write_all(&H2Codec::create_window_update(stream_id, len_u32));
-                            let _ = self.stream.flush();
-
-                            if let Some(ref mut dec) = decompressor {
-                                dec.feed(&data, |decompressed_slice| {
-                                    if let Some(ring) = body_ring {
-                                        write_slice_to_ring(ring, decompressed_slice);
-                                    }
-                                    on_data_chunk(decompressed_slice);
-                                })
-                                .map_err(|e| format!("h2 decompression error: {}", e))?;
-                            } else {
-                                if let Some(ring) = body_ring {
-                                    write_slice_to_ring(ring, &data);
-                                }
-                                on_data_chunk(&data);
-                            }
+                    } if sid == stream_id => {
+                        if let Some(ring) = body_ring {
+                            write_slice_to_ring(ring, &data);
                         }
-                        if end_stream {
-                            stream_ended = true;
-                        }
+                        on_data_chunk(&data);
                     }
-                    H2Event::StreamReset {
-                        stream_id: ev_sid,
+                    H2MuxEvent::Complete { stream_id: sid } if sid == stream_id => {
+                        stream_ended = true;
+                    }
+                    H2MuxEvent::StreamReset {
+                        stream_id: sid,
                         error_code,
-                    } if ev_sid == stream_id => {
+                    } if sid == stream_id => {
                         return Err(format!("h2 stream reset (error code {})", error_code));
                     }
-                    H2Event::GoAway { error_code, .. } => {
-                        self.goaway_received = true;
+                    H2MuxEvent::GoAway { error_code } => {
                         if !headers_dispatched {
-                            return Err(format!("h2 GOAWAY before headers (error code {})", error_code));
+                            return Err(format!(
+                                "h2 GOAWAY before headers (error code {})",
+                                error_code
+                            ));
                         }
                         stream_ended = true;
                     }
@@ -426,14 +770,233 @@ impl<S: Read + Write> H2Session<S> {
             }
         }
 
-        if let Some(dec) = decompressor.take() {
-            dec.finish(|decompressed_slice| {
-                if let Some(ring) = body_ring {
-                    write_slice_to_ring(ring, decompressed_slice);
+        on_complete(true);
+        Ok(headers_dispatched)
+    }
+}
+
+/// Signal delivered to a caller waiting on a multiplexed stream in `SharedH2Session`.
+enum SharedStreamSignal {
+    Headers {
+        status: u16,
+        reason: &'static str,
+        headers: Vec<(String, String)>,
+    },
+    Data(Vec<u8>),
+    Complete,
+    Error(String),
+}
+
+struct SharedH2Inner<S> {
+    session: H2Session<S>,
+    waiters: HashMap<u32, mpsc::Sender<SharedStreamSignal>>,
+    closed_error: Option<String>,
+}
+
+/// Thread-safe, zero-tokio multiplexed HTTP/2 session wrapper allowing multiple
+/// concurrent callers to share a single pooled HTTP/2 connection simultaneously.
+pub struct SharedH2Session<S> {
+    inner: Mutex<SharedH2Inner<S>>,
+    wake: Condvar,
+}
+
+impl<S: Read + Write> SharedH2Session<S> {
+    pub fn new(session: H2Session<S>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(SharedH2Inner {
+                session,
+                waiters: HashMap::new(),
+                closed_error: None,
+            }),
+            wake: Condvar::new(),
+        })
+    }
+
+    pub fn is_reusable(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.closed_error.is_none() && g.session.is_reusable())
+            .unwrap_or(false)
+    }
+
+    pub fn active_streams(&self) -> usize {
+        self.inner.lock().map(|g| g.waiters.len()).unwrap_or(0)
+    }
+
+    /// Execute a request concurrently on this shared HTTP/2 connection.
+    /// Multiple threads can invoke this simultaneously and multiplex streams over the same socket.
+    pub fn execute_request<H, D, C, K>(
+        &self,
+        options: &HttpRequestOptions,
+        body_ring: Option<&BodyRingDescriptor>,
+        mut on_headers: H,
+        mut on_data_chunk: D,
+        mut on_complete: C,
+        mut is_cancelled: K,
+    ) -> Result<bool, String>
+    where
+        H: FnMut(u16, &str, &[(String, String)]),
+        D: FnMut(&[u8]),
+        C: FnMut(bool),
+        K: FnMut() -> bool,
+    {
+        let (tx, rx) = mpsc::channel();
+        let stream_id = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| "SharedH2Session lock poisoned".to_string())?;
+            if let Some(ref err) = guard.closed_error {
+                return Err(err.clone());
+            }
+            let sid = guard.session.submit_request(options)?;
+            guard.waiters.insert(sid, tx);
+            self.wake.notify_all();
+            sid
+        };
+
+        let mut headers_dispatched = false;
+        let mut completed = false;
+
+        while !completed {
+            if is_cancelled() {
+                if let Ok(mut guard) = self.inner.lock() {
+                    guard.waiters.remove(&stream_id);
+                    guard.session.active_streams.remove(&stream_id);
+                    let _ = guard
+                        .session
+                        .stream
+                        .write_all(&H2Codec::create_rst_stream(stream_id, 0x8));
+                    let _ = guard.session.stream.flush();
                 }
-                on_data_chunk(decompressed_slice);
-            })
-            .map_err(|e| format!("h2 decompression finish error: {}", e))?;
+                return Ok(headers_dispatched);
+            }
+
+            if let Some(ring) = body_ring {
+                while ring.should_stop_reading() && !ring.is_closed.load(Ordering::Acquire) {
+                    if is_cancelled() {
+                        return Ok(headers_dispatched);
+                    }
+                    ring.wait_drain(5);
+                }
+            }
+
+            // Drain any already-dispatched signals for our stream first
+            let mut got_signal = false;
+            while let Ok(sig) = rx.try_recv() {
+                got_signal = true;
+                match sig {
+                    SharedStreamSignal::Headers {
+                        status,
+                        reason,
+                        headers,
+                    } => {
+                        on_headers(status, reason, &headers);
+                        headers_dispatched = true;
+                    }
+                    SharedStreamSignal::Data(data) => {
+                        if let Some(ring) = body_ring {
+                            write_slice_to_ring(ring, &data);
+                        }
+                        on_data_chunk(&data);
+                    }
+                    SharedStreamSignal::Complete => {
+                        completed = true;
+                        break;
+                    }
+                    SharedStreamSignal::Error(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+            if completed {
+                break;
+            }
+            if got_signal {
+                continue;
+            }
+
+            // Drive one read step on the shared H2 session and fan out events to all waiting streams
+            let drive_res = {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| "SharedH2Session lock poisoned".to_string())?;
+                // Re-check if another thread already delivered our signals while we waited on the lock
+                if !guard.waiters.contains_key(&stream_id) {
+                    Ok(false)
+                } else {
+                    match guard.session.drive_once() {
+                        Ok(events) => {
+                            let had_events = !events.is_empty();
+                            for ev in events {
+                                match ev {
+                                    H2MuxEvent::Headers {
+                                        stream_id: sid,
+                                        status,
+                                        reason,
+                                        headers,
+                                    } => {
+                                        if let Some(w) = guard.waiters.get(&sid) {
+                                            let _ = w.send(SharedStreamSignal::Headers {
+                                                status,
+                                                reason,
+                                                headers,
+                                            });
+                                        }
+                                    }
+                                    H2MuxEvent::Data {
+                                        stream_id: sid,
+                                        data,
+                                    } => {
+                                        if let Some(w) = guard.waiters.get(&sid) {
+                                            let _ = w.send(SharedStreamSignal::Data(data));
+                                        }
+                                    }
+                                    H2MuxEvent::Complete { stream_id: sid } => {
+                                        if let Some(w) = guard.waiters.remove(&sid) {
+                                            let _ = w.send(SharedStreamSignal::Complete);
+                                        }
+                                    }
+                                    H2MuxEvent::StreamReset {
+                                        stream_id: sid,
+                                        error_code,
+                                    } => {
+                                        if let Some(w) = guard.waiters.remove(&sid) {
+                                            let _ = w.send(SharedStreamSignal::Error(format!(
+                                                "h2 stream reset (error code {})",
+                                                error_code
+                                            )));
+                                        }
+                                    }
+                                    H2MuxEvent::GoAway { error_code } => {
+                                        let msg = format!(
+                                            "h2 GOAWAY (error code {})",
+                                            error_code
+                                        );
+                                        guard.closed_error = Some(msg.clone());
+                                        for (_, w) in guard.waiters.drain() {
+                                            let _ = w.send(SharedStreamSignal::Error(msg.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(had_events)
+                        }
+                        Err(e) => {
+                            guard.closed_error = Some(e.clone());
+                            for (_, w) in guard.waiters.drain() {
+                                let _ = w.send(SharedStreamSignal::Error(e.clone()));
+                            }
+                            Err(e)
+                        }
+                    }
+                }
+            };
+
+            if let Ok(false) = drive_res {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
 
         on_complete(true);
@@ -518,6 +1081,189 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.headers.get("content-type").unwrap(), "text/html");
         assert_eq!(resp.headers.get("server").unwrap(), "cloudflare");
+    }
+
+    #[test]
+    fn test_h2_browser_settings_window_update_and_chrome_pseudo_header_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local h2 fingerprint server");
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut codec = H2Codec::new();
+            let mut dec = HpackDecoder::new();
+            let mut enc = HpackEncoder::new();
+            let mut buf = [0u8; 4096];
+
+            let mut got_settings = Vec::new();
+            let mut got_win_update = 0u32;
+            let mut pseudo_order = Vec::new();
+
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                let events = codec.process(&buf[..n]).expect("server decode");
+                for ev in events {
+                    match ev {
+                        H2Event::Settings { ack: false, settings } => {
+                            got_settings = settings;
+                            conn.write_all(&H2Codec::create_settings()).unwrap();
+                            conn.write_all(&H2Codec::create_settings_ack()).unwrap();
+                            conn.flush().unwrap();
+                        }
+                        H2Event::WindowUpdate { stream_id: 0, increment } => {
+                            got_win_update = increment;
+                        }
+                        H2Event::Headers { stream_id, header_block, .. } => {
+                            let hdrs = dec.decode(&header_block).expect("decode req headers");
+                            pseudo_order = hdrs
+                                .iter()
+                                .take(4)
+                                .map(|h| String::from_utf8_lossy(&h.name).to_string())
+                                .collect();
+                            let block = enc.encode(&[H2Header::new(":status", "200")]);
+                            conn.write_all(&H2Codec::create_headers_frame(stream_id, &block, true))
+                                .unwrap();
+                            conn.flush().unwrap();
+                            let _ = conn.shutdown(Shutdown::Write);
+                            return (got_settings, got_win_update, pseudo_order);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (got_settings, got_win_update, pseudo_order)
+        });
+
+        let client_tcp = TcpStream::connect(addr).expect("connect");
+        let opts = HttpRequestOptions::new("GET", &format!("https://{}/fp", addr));
+        Http2Client::execute_streaming(
+            client_tcp,
+            &opts,
+            None,
+            |status, _, _| assert_eq!(status, 200),
+            |_| {},
+            |_| {},
+            || false,
+        )
+        .expect("h2 request");
+
+        let (settings, win_update, pseudo_order) = server_thread.join().expect("server join");
+        assert_eq!(settings, browser_settings_pairs(H2FingerprintProfile::Chrome).to_vec());
+        assert_eq!(win_update, 15_663_105);
+        assert_eq!(
+            pseudo_order,
+            vec![":method", ":authority", ":scheme", ":path"]
+        );
+    }
+
+    #[test]
+    fn test_h2_concurrent_multiplexed_streams_on_same_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local h2 mux server");
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut codec = H2Codec::new();
+            let mut dec = HpackDecoder::new();
+            let mut enc = HpackEncoder::new();
+            let mut buf = [0u8; 8192];
+            let mut received_streams: Vec<(u32, String)> = Vec::new();
+
+            // Wait until BOTH concurrent streams arrive before replying in reverse order (interleaved!)
+            while received_streams.len() < 2 {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                let events = codec.process(&buf[..n]).expect("server decode");
+                for ev in events {
+                    if let H2Event::Settings { ack: false, .. } = ev {
+                        conn.write_all(&H2Codec::create_settings()).unwrap();
+                        conn.write_all(&H2Codec::create_settings_ack()).unwrap();
+                        conn.flush().unwrap();
+                    } else if let H2Event::Headers { stream_id, header_block, .. } = ev {
+                        let hdrs = dec.decode(&header_block).expect("decode");
+                        let path = hdrs
+                            .iter()
+                            .find(|h| h.name == b":path")
+                            .map(|h| String::from_utf8_lossy(&h.value).to_string())
+                            .unwrap_or_default();
+                        received_streams.push((stream_id, path));
+                    }
+                }
+            }
+
+            assert_eq!(received_streams.len(), 2);
+            // Interleave responses for both streams simultaneously
+            for &(sid, _) in received_streams.iter().rev() {
+                let block = enc.encode(&[H2Header::new(":status", "200")]);
+                conn.write_all(&H2Codec::create_headers_frame(sid, &block, false))
+                    .unwrap();
+            }
+            for (sid, path) in received_streams.iter().rev() {
+                let payload = format!("resp:{}:{}", sid, path);
+                for f in H2Codec::create_data_frames(*sid, payload.as_bytes(), true, 16384) {
+                    conn.write_all(&f).unwrap();
+                }
+            }
+            conn.flush().unwrap();
+            let _ = conn.shutdown(Shutdown::Write);
+            while conn.read(&mut buf).unwrap_or(0) > 0 {}
+        });
+
+        let client_tcp = TcpStream::connect(addr).expect("connect");
+        client_tcp
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let session = H2Session::new(client_tcp).expect("H2Session::new");
+        let shared = SharedH2Session::new(session);
+
+        let shared_a = shared.clone();
+        let url_a = format!("http://{}/alpha", addr);
+        let t1 = std::thread::spawn(move || {
+            let opts = HttpRequestOptions::new("GET", &url_a);
+            let mut body = Vec::new();
+            shared_a
+                .execute_request(
+                    &opts,
+                    None,
+                    |status, _, _| assert_eq!(status, 200),
+                    |c| body.extend_from_slice(c),
+                    |_| {},
+                    || false,
+                )
+                .expect("stream alpha");
+            String::from_utf8(body).unwrap()
+        });
+
+        let shared_b = shared.clone();
+        let url_b = format!("http://{}/beta", addr);
+        let t2 = std::thread::spawn(move || {
+            let opts = HttpRequestOptions::new("GET", &url_b);
+            let mut body = Vec::new();
+            shared_b
+                .execute_request(
+                    &opts,
+                    None,
+                    |status, _, _| assert_eq!(status, 200),
+                    |c| body.extend_from_slice(c),
+                    |_| {},
+                    || false,
+                )
+                .expect("stream beta");
+            String::from_utf8(body).unwrap()
+        });
+
+        let r1 = t1.join().expect("t1 join");
+        let r2 = t2.join().expect("t2 join");
+        drop(shared);
+        server_thread.join().expect("server join");
+
+        assert!(r1.ends_with(":/alpha"), "unexpected r1: {}", r1);
+        assert!(r2.ends_with(":/beta"), "unexpected r2: {}", r2);
     }
 
     #[test]
