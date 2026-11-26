@@ -52,7 +52,6 @@ impl Drop for PerfTelemetry {
 use compio_buf::BufResult;
 use compio_driver::op::{Connect, Interest, PollOnce};
 use compio_driver::{AsRawFd, Key, Proactor, PushEntry, SharedFd};
-use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use socket2::{Domain, Protocol, SockAddr, Socket as Socket2, Type};
 use url::Url;
@@ -63,7 +62,12 @@ use super::h1::{Http1FeedResult, Http1RequestBuilder, Http1ResponseParser};
 use super::pool::{ConnectionPool, PoolKey};
 use crate::protocols::compression::{decompress_payload, StreamDecompressor};
 use crate::protocols::dns::{DnsResolver, DnsResolverConfig};
-use crate::protocols::http3::Http3Client;
+use super::h2::{is_hop_by_hop_header, H2Session, SharedH2Session};
+use crate::protocols::http3::{build_shared_quic_client_config, Http3Client};
+use crate::protocols::tls::{
+    step_boring_handshake, BoringIo, BoringSessionStore, BoringTlsConfig,
+    NonBlockingHandshakeStep, TlsFingerprintProfile,
+};
 use crate::protocols::proxy::{
     establish_http_connect_tunnel, establish_socks5_tunnel, ProxyConfig, ProxyRule, ProxyScheme,
 };
@@ -121,14 +125,17 @@ impl HttpRequestOptions {
 
 enum ActiveStream {
     Plain(TcpStream),
-    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    BoringTls(Box<boring::ssl::SslStream<BoringIo>>),
+    #[allow(dead_code)]
+    RustlsTls(Box<StreamOwned<ClientConnection, TcpStream>>),
 }
 
 impl Read for ActiveStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(s) => s.read(buf),
-            Self::Tls(s) => s.read(buf),
+            Self::BoringTls(s) => s.read(buf),
+            Self::RustlsTls(s) => s.read(buf),
         }
     }
 }
@@ -137,14 +144,16 @@ impl Write for ActiveStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(s) => s.write(buf),
-            Self::Tls(s) => s.write(buf),
+            Self::BoringTls(s) => s.write(buf),
+            Self::RustlsTls(s) => s.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => s.flush(),
-            Self::Tls(s) => s.flush(),
+            Self::BoringTls(s) => s.flush(),
+            Self::RustlsTls(s) => s.flush(),
         }
     }
 }
@@ -158,8 +167,8 @@ enum He3Winner {
         h3_ms: f64,
     },
     H2OrH1 {
-        tls_conn: ClientConnection,
-        tcp_stream: TcpStream,
+        stream: ActiveStream,
+        alpn: Option<Vec<u8>>,
         h3_ms: f64,
         h2_ms: f64,
         demoted: bool,
@@ -170,70 +179,62 @@ enum TcpTlsState {
     NotStarted,
     Connecting(Key<Connect<SharedFd<Socket2>>>),
     Handshaking {
-        tls: ClientConnection,
+        mid: boring::ssl::MidHandshakeSslStream<BoringIo>,
         poll_key: Option<Key<PollOnce<SharedFd<Socket2>>>>,
     },
     Failed(String),
 }
 
-/// Drive a non-blocking `rustls::ClientConnection` TLS handshake until it either
-/// completes (`Ok(None)`) or needs socket readiness (`Ok(Some(Interest))`).
-fn step_tls_handshake(
-    tls: &mut ClientConnection,
-    sock: &Socket2,
-) -> Result<Option<Interest>, String> {
-    let mut io_ref = sock;
-    loop {
-        let mut progressed = false;
-        while tls.wants_write() {
-            match tls.write_tls(&mut io_ref) {
-                Ok(0) => break,
-                Ok(_) => progressed = true,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(Some(Interest::Writable));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("TLS write failed: {}", e)),
+/// Non-exclusive HTTP/2 connection pool sharing live `Arc<SharedH2Session>`
+/// instances so concurrent requests multiplex streams on the same TCP/TLS connection.
+struct SharedH2Pool {
+    sessions: HashMap<PoolKey, (Arc<SharedH2Session<ActiveStream>>, Instant)>,
+    idle_timeout: Duration,
+}
+
+impl SharedH2Pool {
+    fn new(idle_timeout: Duration) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            idle_timeout,
+        }
+    }
+
+    fn get(&mut self, key: &PoolKey) -> Option<Arc<SharedH2Session<ActiveStream>>> {
+        let now = Instant::now();
+        if let Some((session, last_used)) = self.sessions.get_mut(key) {
+            if session.is_reusable() && now.duration_since(*last_used) <= self.idle_timeout {
+                *last_used = now;
+                return Some(session.clone());
             }
         }
-        if !tls.is_handshaking() {
-            return Ok(None);
+        self.sessions.remove(key);
+        None
+    }
+
+    fn put(&mut self, key: PoolKey, session: Arc<SharedH2Session<ActiveStream>>) {
+        if session.is_reusable() {
+            self.sessions.insert(key, (session, Instant::now()));
         }
-        if tls.wants_read() {
-            match tls.read_tls(&mut io_ref) {
-                Ok(0) => return Err("TLS EOF during handshake".to_string()),
-                Ok(_) => {
-                    tls.process_new_packets()
-                        .map_err(|e| format!("TLS handshake error: {}", e))?;
-                    progressed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if !tls.is_handshaking() {
-                        return Ok(None);
-                    }
-                    if tls.wants_write() {
-                        continue;
-                    }
-                    return Ok(Some(Interest::Readable));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("TLS read failed: {}", e)),
-            }
-        }
-        if !tls.is_handshaking() {
-            return Ok(None);
-        }
-        if !progressed {
-            return Ok(Some(Interest::Readable));
-        }
+    }
+
+    fn remove(&mut self, key: &PoolKey) {
+        self.sessions.remove(key);
+    }
+
+    fn clear_session(&mut self, session_id: u64) {
+        self.sessions.retain(|k, _| k.session_id != session_id);
     }
 }
 
 /// Standalone HTTP client engine orchestrating connections, pooling, serialization, cookies, and streaming.
 pub struct HttpClientEngine {
+    #[allow(dead_code)]
     tls_config: Arc<ClientConfig>,
+    boring_tls: Arc<BoringTlsConfig>,
+    quic_crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
     pool: ConnectionPool<ActiveStream>,
-    h2_pool: ConnectionPool<super::h2::H2Session<ActiveStream>>,
+    h2_pool: SharedH2Pool,
     pub http_cache: super::cache::HttpCache,
     pub cookie_jar: Arc<CookieJar>,
     pub proxy_config: Option<ProxyConfig>,
@@ -247,16 +248,42 @@ impl HttpClientEngine {
             tls_config.clone(),
             DnsResolverConfig::default(),
         ));
+        let boring_store = Arc::new(BoringSessionStore::new_default());
+        let boring_tls = Arc::new(
+            BoringTlsConfig::new(TlsFingerprintProfile::Chrome, boring_store)
+                .expect("BoringSSL client config must initialize"),
+        );
+        let quic_crypto = build_shared_quic_client_config()
+            .expect("Shared QUIC client config must initialize");
         Self {
             tls_config,
+            boring_tls,
+            quic_crypto,
             pool: ConnectionPool::new(6, Duration::from_secs(60)),
-            h2_pool: ConnectionPool::new(4, Duration::from_secs(60)),
+            h2_pool: SharedH2Pool::new(Duration::from_secs(60)),
             http_cache: super::cache::HttpCache::new(512, 4 * 1024 * 1024),
             cookie_jar: Arc::new(CookieJar::new()),
             proxy_config: Some(ProxyConfig::from_env()),
             alt_svc_registry: Arc::new(AltSvcRegistry::new()),
             dns_resolver,
         }
+    }
+
+    /// Access the shared `Arc<quinn_proto::crypto::rustls::QuicClientConfig>` hosted on this engine.
+    pub fn quic_crypto(&self) -> &Arc<quinn_proto::crypto::rustls::QuicClientConfig> {
+        &self.quic_crypto
+    }
+
+    /// Access the BoringSSL TLS configuration used for TCP/TLS connections.
+    pub fn boring_tls(&self) -> &Arc<BoringTlsConfig> {
+        &self.boring_tls
+    }
+
+    /// Switch the browser TLS fingerprint profile (`Chrome` or `Firefox`).
+    pub fn set_tls_profile(&mut self, profile: TlsFingerprintProfile) -> Result<(), String> {
+        let store = self.boring_tls.session_store.clone();
+        self.boring_tls = Arc::new(BoringTlsConfig::new(profile, store)?);
+        Ok(())
     }
 
     /// Helper to connect a TCP stream to `host:port` with DNS resolution, IPv4 prioritization, and timeout.
@@ -295,7 +322,7 @@ impl HttpClientEngine {
     /// Single-threaded `compio-driver::Proactor`-driven Happy Eyeballs v3 race.
     ///
     /// Starts the QUIC UDP handshake first, then after `cad` (75 ms) — or immediately if
-    /// QUIC fails early — starts TCP Connect + `rustls::ClientConnection` TLS handshake in
+    /// QUIC fails early — starts TCP Connect + BoringSSL TLS handshake in
     /// the same Proactor loop. Whichever completes handshake first wins.
     #[allow(clippy::too_many_arguments)]
     fn race_happy_eyeballs_v3<K>(
@@ -304,7 +331,8 @@ impl HttpClientEngine {
         h3_host: &str,
         h3_port: u16,
         dns_resolver: &DnsResolver,
-        tls_config: &Arc<ClientConfig>,
+        boring_tls: &Arc<BoringTlsConfig>,
+        quic_crypto: &Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
         timeout: Duration,
         cad: Duration,
         is_cancelled: &mut K,
@@ -355,7 +383,7 @@ impl HttpClientEngine {
         let mut h3_failed = false;
         let mut h3_elapsed_ms = 0.0_f64;
 
-        match QuicHandshakeState::start(h3_addr, host) {
+        match QuicHandshakeState::start_with_config(h3_addr, host, quic_crypto.clone()) {
             Ok((mut quic_state, udp_sock)) => {
                 let udp_fd = SharedFd::new(udp_sock);
                 if let Err(e) = proactor.attach(udp_fd.as_raw_fd()) {
@@ -417,11 +445,7 @@ impl HttpClientEngine {
         let mut tcp_state = TcpTlsState::NotStarted;
         let mut tcp_start: Option<Instant> = None;
 
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| format!("Invalid TLS server name: {}", e))?;
-
-        let finish_tcp_win = |tcp_fd: SharedFd<Socket2>,
-                              tls_conn: ClientConnection,
+        let finish_tcp_win = |ssl_stream: boring::ssl::SslStream<BoringIo>,
                               h3_ms: f64,
                               h2_ms: f64,
                               proactor: &mut Proactor,
@@ -433,21 +457,15 @@ impl HttpClientEngine {
             }
             *quic_opt = None;
 
-            let sock2 = match tcp_fd.try_unwrap() {
-                Ok(s) => s,
-                Err(shared) => shared
-                    .try_clone()
-                    .map_err(|e| format!("TCP socket clone failed: {}", e))?,
-            };
-            let tcp_stream: TcpStream = sock2.into();
-            let _ = tcp_stream.set_nonblocking(false);
-            let _ = tcp_stream.set_nodelay(true);
-            let _ = tcp_stream.set_read_timeout(Some(timeout));
-            let _ = tcp_stream.set_write_timeout(Some(timeout));
+            ssl_stream.get_ref().configure_blocking(timeout);
+            let alpn = ssl_stream
+                .ssl()
+                .selected_alpn_protocol()
+                .map(|s| s.to_vec());
 
             Ok(He3Winner::H2OrH1 {
-                tls_conn,
-                tcp_stream,
+                stream: ActiveStream::BoringTls(Box::new(ssl_stream)),
+                alpn,
                 h3_ms,
                 h2_ms,
                 demoted: true,
@@ -506,44 +524,39 @@ impl HttpClientEngine {
                                     tcp_state = TcpTlsState::Connecting(k);
                                 }
                                 PushEntry::Ready(BufResult(Ok(_), _)) => {
-                                    match ClientConnection::new(tls_config.clone(), server_name.clone()) {
-                                        Ok(mut tls) => match step_tls_handshake(&mut tls, &tcp_fd) {
-                                            Ok(None) => {
-                                                let h2_ms = tcp_start
-                                                    .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                                                    .unwrap_or(0.0);
-                                                let h3_ms = if h3_failed {
-                                                    h3_elapsed_ms
-                                                } else {
-                                                    race_start.elapsed().as_secs_f64() * 1000.0
-                                                };
-                                                return finish_tcp_win(
-                                                    tcp_fd_opt.take().unwrap(),
-                                                    tls,
-                                                    h3_ms,
-                                                    h2_ms,
-                                                    &mut proactor,
-                                                    &mut udp_poll_key,
-                                                    &mut quic_opt,
-                                                );
-                                            }
-                                            Ok(Some(interest)) => {
-                                                let poll_key = match proactor
-                                                    .push(PollOnce::new(tcp_fd.clone(), interest))
-                                                {
-                                                    PushEntry::Pending(k) => Some(k),
-                                                    PushEntry::Ready(_) => None,
-                                                };
-                                                tcp_state = TcpTlsState::Handshaking { tls, poll_key };
-                                            }
-                                            Err(e) => tcp_state = TcpTlsState::Failed(e),
-                                        },
-                                        Err(e) => {
-                                            tcp_state = TcpTlsState::Failed(format!(
-                                                "TLS init failed: {}",
-                                                e
-                                            ));
+                                    match boring_tls.start_nonblocking(
+                                        host,
+                                        BoringIo::SharedSock(tcp_fd.clone()),
+                                        None,
+                                    ) {
+                                        Ok(NonBlockingHandshakeStep::Complete(ssl_stream)) => {
+                                            let h2_ms = tcp_start
+                                                .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                                                .unwrap_or(0.0);
+                                            let h3_ms = if h3_failed {
+                                                h3_elapsed_ms
+                                            } else {
+                                                race_start.elapsed().as_secs_f64() * 1000.0
+                                            };
+                                            return finish_tcp_win(
+                                                ssl_stream,
+                                                h3_ms,
+                                                h2_ms,
+                                                &mut proactor,
+                                                &mut udp_poll_key,
+                                                &mut quic_opt,
+                                            );
                                         }
+                                        Ok(NonBlockingHandshakeStep::Pending { mid, interest }) => {
+                                            let poll_key = match proactor
+                                                .push(PollOnce::new(tcp_fd.clone(), interest))
+                                            {
+                                                PushEntry::Pending(k) => Some(k),
+                                                PushEntry::Ready(_) => None,
+                                            };
+                                            tcp_state = TcpTlsState::Handshaking { mid, poll_key };
+                                        }
+                                        Err(e) => tcp_state = TcpTlsState::Failed(e),
                                     }
                                 }
                                 PushEntry::Ready(BufResult(Err(e), _)) => {
@@ -684,48 +697,46 @@ impl HttpClientEngine {
                     }
                     PushEntry::Ready(BufResult(Ok(_), _)) => {
                         let tcp_fd = tcp_fd_opt.as_ref().unwrap();
-                        match ClientConnection::new(tls_config.clone(), server_name.clone()) {
-                            Ok(mut tls) => match step_tls_handshake(&mut tls, tcp_fd) {
-                                Ok(None) => {
-                                    let h2_ms = tcp_start
-                                        .map(|s| s.elapsed().as_secs_f64() * 1000.0)
-                                        .unwrap_or(0.0);
-                                    let h3_ms = if h3_failed {
-                                        h3_elapsed_ms
-                                    } else {
-                                        race_start.elapsed().as_secs_f64() * 1000.0
-                                    };
-                                    return finish_tcp_win(
-                                        tcp_fd_opt.take().unwrap(),
-                                        tls,
-                                        h3_ms,
-                                        h2_ms,
-                                        &mut proactor,
-                                        &mut udp_poll_key,
-                                        &mut quic_opt,
-                                    );
-                                }
-                                Ok(Some(interest)) => {
-                                    let poll_key = match proactor
-                                        .push(PollOnce::new(tcp_fd.clone(), interest))
-                                    {
-                                        PushEntry::Pending(k) => Some(k),
-                                        PushEntry::Ready(_) => None,
-                                    };
-                                    tcp_state = TcpTlsState::Handshaking { tls, poll_key };
-                                }
-                                Err(e) => tcp_state = TcpTlsState::Failed(e),
-                            },
-                            Err(e) => {
-                                tcp_state = TcpTlsState::Failed(format!("TLS init failed: {}", e));
+                        match boring_tls.start_nonblocking(
+                            host,
+                            BoringIo::SharedSock(tcp_fd.clone()),
+                            None,
+                        ) {
+                            Ok(NonBlockingHandshakeStep::Complete(ssl_stream)) => {
+                                let h2_ms = tcp_start
+                                    .map(|s| s.elapsed().as_secs_f64() * 1000.0)
+                                    .unwrap_or(0.0);
+                                let h3_ms = if h3_failed {
+                                    h3_elapsed_ms
+                                } else {
+                                    race_start.elapsed().as_secs_f64() * 1000.0
+                                };
+                                return finish_tcp_win(
+                                    ssl_stream,
+                                    h3_ms,
+                                    h2_ms,
+                                    &mut proactor,
+                                    &mut udp_poll_key,
+                                    &mut quic_opt,
+                                );
                             }
+                            Ok(NonBlockingHandshakeStep::Pending { mid, interest }) => {
+                                let poll_key = match proactor
+                                    .push(PollOnce::new(tcp_fd.clone(), interest))
+                                {
+                                    PushEntry::Pending(k) => Some(k),
+                                    PushEntry::Ready(_) => None,
+                                };
+                                tcp_state = TcpTlsState::Handshaking { mid, poll_key };
+                            }
+                            Err(e) => tcp_state = TcpTlsState::Failed(e),
                         }
                     }
                     PushEntry::Ready(BufResult(Err(e), _)) => {
                         tcp_state = TcpTlsState::Failed(format!("TCP connect failed: {}", e));
                     }
                 },
-                TcpTlsState::Handshaking { mut tls, poll_key } => {
+                TcpTlsState::Handshaking { mid, poll_key } => {
                     let mut ready = poll_key.is_none();
                     let mut still_pending = None;
                     if let Some(k) = poll_key {
@@ -737,8 +748,8 @@ impl HttpClientEngine {
 
                     if ready {
                         let tcp_fd = tcp_fd_opt.as_ref().unwrap();
-                        match step_tls_handshake(&mut tls, tcp_fd) {
-                            Ok(None) => {
+                        match step_boring_handshake(mid) {
+                            Ok(NonBlockingHandshakeStep::Complete(ssl_stream)) => {
                                 let h2_ms = tcp_start
                                     .map(|s| s.elapsed().as_secs_f64() * 1000.0)
                                     .unwrap_or(0.0);
@@ -748,8 +759,7 @@ impl HttpClientEngine {
                                     race_start.elapsed().as_secs_f64() * 1000.0
                                 };
                                 return finish_tcp_win(
-                                    tcp_fd_opt.take().unwrap(),
-                                    tls,
+                                    ssl_stream,
                                     h3_ms,
                                     h2_ms,
                                     &mut proactor,
@@ -757,7 +767,7 @@ impl HttpClientEngine {
                                     &mut quic_opt,
                                 );
                             }
-                            Ok(Some(interest)) => {
+                            Ok(NonBlockingHandshakeStep::Pending { mid, interest }) => {
                                 let next_key = match proactor
                                     .push(PollOnce::new(tcp_fd.clone(), interest))
                                 {
@@ -765,7 +775,7 @@ impl HttpClientEngine {
                                     PushEntry::Ready(_) => None,
                                 };
                                 tcp_state = TcpTlsState::Handshaking {
-                                    tls,
+                                    mid,
                                     poll_key: next_key,
                                 };
                             }
@@ -773,7 +783,7 @@ impl HttpClientEngine {
                         }
                     } else {
                         tcp_state = TcpTlsState::Handshaking {
-                            tls,
+                            mid,
                             poll_key: still_pending,
                         };
                     }
@@ -827,12 +837,42 @@ impl HttpClientEngine {
         h2_options
     }
 
+    /// Prepare HTTP/3 request options with full middleware parity to H1/H2:
+    /// merges CookieJar + caller Cookie header, strips hop-by-hop headers, and
+    /// injects `accept-encoding: gzip, deflate, br, zstd` when transparent decompression applies.
+    pub(crate) fn prepare_h3_options(
+        cookie_jar: &CookieJar,
+        options: &HttpRequestOptions,
+        parsed_url: &Url,
+    ) -> HttpRequestOptions {
+        let mut h3_options = Self::prepare_h2_options(cookie_jar, options, parsed_url);
+        h3_options
+            .headers
+            .retain(|(k, _)| !is_hop_by_hop_header(k));
+
+        let has_range = h3_options
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let has_accept_encoding = h3_options
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"));
+        if h3_options.transparent_decompression && !has_range && !has_accept_encoding {
+            h3_options.headers.push((
+                "accept-encoding".to_string(),
+                "gzip, deflate, br, zstd".to_string(),
+            ));
+        }
+        h3_options
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_h2_session<H, D, C, K>(
         cookie_jar: &Arc<CookieJar>,
         alt_svc_registry: &Arc<AltSvcRegistry>,
-        h2_pool: &mut ConnectionPool<super::h2::H2Session<ActiveStream>>,
-        mut h2_session: super::h2::H2Session<ActiveStream>,
+        h2_pool: &mut SharedH2Pool,
+        h2_session: Arc<SharedH2Session<ActiveStream>>,
         pool_key: &PoolKey,
         options: &HttpRequestOptions,
         parsed_url: &Url,
@@ -851,6 +891,9 @@ impl HttpClientEngine {
         C: FnMut(bool),
         K: FnMut() -> bool,
     {
+        // Register in shared pool immediately so concurrent callers can multiplex on this session
+        h2_pool.put(pool_key.clone(), h2_session.clone());
+
         let h2_options = Self::prepare_h2_options(cookie_jar, options, parsed_url);
         let cookie_jar = cookie_jar.clone();
         let alt_svc_registry = alt_svc_registry.clone();
@@ -901,8 +944,8 @@ impl HttpClientEngine {
         perf.body_ms = body_ms_cell.get();
         perf.status = status_cell.get();
 
-        if res.is_ok() && h2_session.is_reusable() {
-            h2_pool.put(pool_key.clone(), h2_session, true);
+        if !h2_session.is_reusable() {
+            h2_pool.remove(pool_key);
         }
 
         res
@@ -1165,7 +1208,7 @@ impl HttpClientEngine {
                 &self.cookie_jar,
                 &self.alt_svc_registry,
                 &mut self.h2_pool,
-                pooled_h2.socket,
+                pooled_h2,
                 &pool_key,
                 options,
                 &parsed_url,
@@ -1200,7 +1243,8 @@ impl HttpClientEngine {
                     &h3_host,
                     h3_port,
                     &self.dns_resolver,
-                    &self.tls_config,
+                    &self.boring_tls,
+                    &self.quic_crypto,
                     options.timeout,
                     HE3_CAD,
                     &mut is_cancelled,
@@ -1217,17 +1261,54 @@ impl HttpClientEngine {
                             host, port, cad_ms, h3_ms
                         );
                         perf.tcp_tls_ms = h3_ms;
-                        match Http3Client::execute_connected_streaming(
+
+                        // Full middleware parity for HTTP/3: CookieJar merge/Set-Cookie, hop-by-hop strip, Accept-Encoding
+                        let h3_options = Self::prepare_h3_options(&self.cookie_jar, options, &parsed_url);
+                        let cookie_jar_h3 = self.cookie_jar.clone();
+                        let alt_svc_h3 = self.alt_svc_registry.clone();
+                        let parsed_url_h3 = parsed_url.clone();
+                        let host_h3 = host.clone();
+                        let session_id_h3 = options.session_id;
+                        let req_ready_at = Instant::now();
+                        let headers_at = Cell::new(None::<Instant>);
+                        let ttfb_ms_cell = Cell::new(0.0_f64);
+                        let body_ms_cell = Cell::new(0.0_f64);
+                        let status_cell = Cell::new(0_u16);
+
+                        let h3_res = Http3Client::execute_connected_streaming(
                             quic_state,
                             udp_socket,
                             &host,
-                            options,
+                            &h3_options,
                             body_ring,
-                            &mut on_headers,
-                            &mut on_data_chunk,
-                            &mut on_complete,
+                            |status, reason, headers| {
+                                headers_at.set(Some(Instant::now()));
+                                ttfb_ms_cell.set(req_ready_at.elapsed().as_secs_f64() * 1000.0);
+                                status_cell.set(status);
+                                for (k, v) in headers {
+                                    if k.eq_ignore_ascii_case("set-cookie") {
+                                        cookie_jar_h3.process_set_cookie(session_id_h3, &parsed_url_h3, v);
+                                    }
+                                    if k.eq_ignore_ascii_case("alt-svc") {
+                                        alt_svc_h3.insert(&host_h3, port, v);
+                                    }
+                                }
+                                on_headers(status, reason, headers);
+                            },
+                            |chunk| on_data_chunk(chunk),
+                            |keep_alive| {
+                                if let Some(h_at) = headers_at.get() {
+                                    body_ms_cell.set(h_at.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                on_complete(keep_alive);
+                            },
                             &mut is_cancelled,
-                        ) {
+                        );
+                        perf.ttfb_ms = ttfb_ms_cell.get();
+                        perf.body_ms = body_ms_cell.get();
+                        perf.status = status_cell.get();
+
+                        match h3_res {
                             Ok(true) => {
                                 perf.proto = "h3";
                                 return Ok(true);
@@ -1239,8 +1320,8 @@ impl HttpClientEngine {
                         }
                     }
                     Ok(He3Winner::H2OrH1 {
-                        tls_conn,
-                        tcp_stream,
+                        stream: tls_stream,
+                        alpn,
                         h3_ms,
                         h2_ms,
                         demoted,
@@ -1253,12 +1334,9 @@ impl HttpClientEngine {
                             host, port, cad_ms, h3_ms, h2_ms, demoted
                         );
                         perf.tcp_tls_ms = h2_ms;
-                        let alpn = tls_conn.alpn_protocol().map(|s| s.to_vec());
-                        let tls_stream =
-                            ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp_stream)));
                         if alpn.as_deref() == Some(b"h2") {
                             perf.proto = "h2";
-                            let h2_session = super::h2::H2Session::new(tls_stream)?;
+                            let h2_session = SharedH2Session::new(H2Session::new(tls_stream)?);
                             return Self::execute_h2_session(
                                 &self.cookie_jar,
                                 &self.alt_svc_registry,
@@ -1295,7 +1373,7 @@ impl HttpClientEngine {
             pooled.socket
         } else {
             let mut tcp_ms = 0.0;
-            let mut tcp = match proxy_rule.scheme {
+            let tcp = match proxy_rule.scheme {
                 ProxyScheme::Direct => {
                     Self::connect_tcp(&self.dns_resolver, &host, port, options.timeout, &mut perf.dns_ms, &mut tcp_ms)?
                 }
@@ -1329,26 +1407,23 @@ impl HttpClientEngine {
 
             if is_tls {
                 let tls_start = Instant::now();
-                let server_name = ServerName::try_from(host.as_str())
-                    .map_err(|e| format!("Invalid TLS server name: {}", e))?
-                    .to_owned();
-
-                let mut tls_conn = ClientConnection::new(self.tls_config.clone(), server_name)
-                    .map_err(|e| format!("TLS handshake init failed: {}", e))?;
-
-                while tls_conn.is_handshaking() {
-                    if let Err(e) = tls_conn.complete_io(&mut tcp) {
+                let ssl_stream = match self.boring_tls.connect_blocking_io(&host, BoringIo::Tcp(tcp), None) {
+                    Ok(s) => s,
+                    Err(e) => {
                         perf.tcp_tls_ms = tcp_ms + tls_start.elapsed().as_secs_f64() * 1000.0;
-                        return Err(format!("TLS handshake failed: {}", e));
+                        return Err(e);
                     }
-                }
+                };
                 perf.tcp_tls_ms = tcp_ms + tls_start.elapsed().as_secs_f64() * 1000.0;
 
-                let alpn = tls_conn.alpn_protocol().map(|s| s.to_vec());
+                let alpn = ssl_stream
+                    .ssl()
+                    .selected_alpn_protocol()
+                    .map(|s| s.to_vec());
+                let tls_stream = ActiveStream::BoringTls(Box::new(ssl_stream));
                 if alpn.as_deref() == Some(b"h2") {
                     perf.proto = "h2";
-                    let tls_stream = ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp)));
-                    let h2_session = super::h2::H2Session::new(tls_stream)?;
+                    let h2_session = SharedH2Session::new(H2Session::new(tls_stream)?);
                     return Self::execute_h2_session(
                         &self.cookie_jar,
                         &self.alt_svc_registry,
@@ -1368,7 +1443,7 @@ impl HttpClientEngine {
                     );
                 }
 
-                ActiveStream::Tls(Box::new(StreamOwned::new(tls_conn, tcp)))
+                tls_stream
             } else {
                 ActiveStream::Plain(tcp)
             }
@@ -2378,9 +2453,9 @@ mod tests {
 
         // Pre-populate h2_pool with a warm H2Session for (0, "127.0.0.1", port, true)
         let tcp = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-        let h2_session = super::super::h2::H2Session::new(ActiveStream::Plain(tcp)).unwrap();
+        let h2_session = SharedH2Session::new(H2Session::new(ActiveStream::Plain(tcp)).unwrap());
         let pool_key = PoolKey::new(0, "127.0.0.1", port, true);
-        client.h2_pool.put(pool_key, h2_session, true);
+        client.h2_pool.put(pool_key, h2_session);
 
         let url = format!("https://127.0.0.1:{}/warm_h2", port);
         let opts = HttpRequestOptions::new("GET", &url);
@@ -2403,5 +2478,65 @@ mod tests {
 
         drop(client);
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_h3_middleware_parity_prepare_options() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/app").unwrap();
+        assert!(jar.process_set_cookie(7, &url, "sid=jar_val; Path=/; HttpOnly"));
+
+        let opts = HttpRequestOptions::new("GET", "https://example.com/app")
+            .with_session(7)
+            .header("Cookie", "dom=dom_val")
+            .header("Connection", "keep-alive")
+            .header("Host", "example.com")
+            .header("Transfer-Encoding", "chunked")
+            .header("User-Agent", "Zawra/1.0");
+
+        let prepared = HttpClientEngine::prepare_h3_options(&jar, &opts, &url);
+        // Hop-by-hop headers must be stripped
+        assert!(!prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")));
+        assert!(!prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")));
+        assert!(!prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")));
+        // Cookies must be merged from jar + caller
+        let cookie_hdr = prepared
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.as_str())
+            .expect("merged cookie header");
+        assert!(cookie_hdr.contains("sid=jar_val"));
+        assert!(cookie_hdr.contains("dom=dom_val"));
+        // Accept-Encoding must be injected
+        assert!(prepared.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("accept-encoding") && v.contains("zstd")
+        }));
+
+        // Range requests must NOT inject Accept-Encoding
+        let range_opts = HttpRequestOptions::new("GET", "https://example.com/video.mp4")
+            .header("Range", "bytes=0-1023");
+        let prepared_range = HttpClientEngine::prepare_h3_options(&jar, &range_opts, &url);
+        assert!(!prepared_range
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding")));
+    }
+
+    #[test]
+    fn test_http_client_engine_hoists_shared_quic_and_boring_tls() {
+        let roots = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut client = HttpClientEngine::new(tls_cfg);
+        assert_eq!(client.boring_tls().profile, TlsFingerprintProfile::Chrome);
+        assert!(Arc::strong_count(client.quic_crypto()) >= 1);
+        client
+            .set_tls_profile(TlsFingerprintProfile::Firefox)
+            .expect("switch to Firefox profile");
+        assert_eq!(client.boring_tls().profile, TlsFingerprintProfile::Firefox);
     }
 }
