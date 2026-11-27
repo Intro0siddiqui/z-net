@@ -894,8 +894,8 @@ pub extern "C" fn net_engine_set_manage_cookies(engine_handle: NetEngineHandle, 
     if engine_handle.is_null() {
         return;
     }
-    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
-    engine.http_engine.manage_cookies = enabled;
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
+    engine.http_engine.manage_cookies.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -915,7 +915,7 @@ pub extern "C" fn net_http_execute_streaming(
     if engine_handle.is_null() || method.is_null() || url.is_null() || callbacks.is_null() {
         return NS_ERROR_FAILURE;
     }
-    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    let engine = unsafe { &*(engine_handle as *const NetEngine) };
     let cb = unsafe { &*callbacks };
 
     let method_str = unsafe { std::ffi::CStr::from_ptr(method).to_string_lossy().into_owned() };

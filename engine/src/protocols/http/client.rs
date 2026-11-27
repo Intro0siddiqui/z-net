@@ -182,53 +182,60 @@ enum TcpTlsState {
 /// Non-exclusive HTTP/2 connection pool sharing live `Arc<SharedH2Session>`
 /// instances so concurrent requests multiplex streams on the same TCP/TLS connection.
 struct SharedH2Pool {
-    sessions: HashMap<PoolKey, (Arc<SharedH2Session<ActiveStream>>, Instant)>,
+    sessions: std::sync::Mutex<HashMap<PoolKey, (Arc<SharedH2Session<ActiveStream>>, Instant)>>,
     idle_timeout: Duration,
 }
 
 impl SharedH2Pool {
     fn new(idle_timeout: Duration) -> Self {
         Self {
-            sessions: HashMap::new(),
+            sessions: std::sync::Mutex::new(HashMap::new()),
             idle_timeout,
         }
     }
 
-    fn get(&mut self, key: &PoolKey) -> Option<Arc<SharedH2Session<ActiveStream>>> {
+    fn get(&self, key: &PoolKey) -> Option<Arc<SharedH2Session<ActiveStream>>> {
         let now = Instant::now();
-        if let Some((session, last_used)) = self.sessions.get_mut(key) {
+        let mut sessions = self.sessions.lock().ok()?;
+        if let Some((session, last_used)) = sessions.get_mut(key) {
             if session.is_reusable() && now.duration_since(*last_used) <= self.idle_timeout {
                 *last_used = now;
                 return Some(session.clone());
             }
         }
-        self.sessions.remove(key);
+        sessions.remove(key);
         None
     }
 
-    fn put(&mut self, key: PoolKey, session: Arc<SharedH2Session<ActiveStream>>) {
+    fn put(&self, key: PoolKey, session: Arc<SharedH2Session<ActiveStream>>) {
         if session.is_reusable() {
-            self.sessions.insert(key, (session, Instant::now()));
+            if let Ok(mut sessions) = self.sessions.lock() {
+                sessions.insert(key, (session, Instant::now()));
+            }
         }
     }
 
-    fn remove(&mut self, key: &PoolKey) {
-        self.sessions.remove(key);
+    fn remove(&self, key: &PoolKey) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(key);
+        }
     }
 
-    fn clear_session(&mut self, session_id: u64) {
-        self.sessions.retain(|k, _| k.session_id != session_id);
+    fn clear_session(&self, session_id: u64) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|k, _| k.session_id != session_id);
+        }
     }
 }
 
 /// Standalone HTTP client engine orchestrating connections, pooling, serialization, cookies, and streaming.
 pub struct HttpClientEngine {
     boring_tls: Arc<BoringTlsConfig>,
-    pool: ConnectionPool<ActiveStream>,
+    pool: std::sync::Mutex<ConnectionPool<ActiveStream>>,
     h2_pool: SharedH2Pool,
-    pub http_cache: super::cache::HttpCache,
+    pub http_cache: std::sync::Mutex<super::cache::HttpCache>,
     pub cookie_jar: Arc<CookieJar>,
-    pub manage_cookies: bool,
+    pub manage_cookies: std::sync::atomic::AtomicBool,
     pub proxy_config: Option<ProxyConfig>,
     pub alt_svc_registry: Arc<AltSvcRegistry>,
     pub dns_resolver: Arc<DnsResolver>,
@@ -242,11 +249,11 @@ impl HttpClientEngine {
         ));
         Self {
             boring_tls,
-            pool: ConnectionPool::new(6, Duration::from_secs(60)),
+            pool: std::sync::Mutex::new(ConnectionPool::new(6, Duration::from_secs(60))),
             h2_pool: SharedH2Pool::new(Duration::from_secs(60)),
-            http_cache: super::cache::HttpCache::new(512, 4 * 1024 * 1024),
+            http_cache: std::sync::Mutex::new(super::cache::HttpCache::new(512, 4 * 1024 * 1024)),
             cookie_jar: Arc::new(CookieJar::new()),
-            manage_cookies: true,
+            manage_cookies: std::sync::atomic::AtomicBool::new(true),
             proxy_config: Some(ProxyConfig::from_env()),
             alt_svc_registry: Arc::new(AltSvcRegistry::new()),
             dns_resolver,
@@ -753,10 +760,14 @@ impl HttpClientEngine {
     }
 
     /// Clear pooled connections and cookies for a specific session.
-    pub fn clear_session(&mut self, session_id: u64) {
-        self.pool.clear_session(session_id);
+    pub fn clear_session(&self, session_id: u64) {
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.clear_session(session_id);
+        }
         self.h2_pool.clear_session(session_id);
-        self.http_cache.clear_session(session_id);
+        if let Ok(mut cache) = self.http_cache.lock() {
+            cache.clear_session(session_id);
+        }
         self.cookie_jar.clear_session(session_id);
     }
 
@@ -834,7 +845,7 @@ impl HttpClientEngine {
     fn execute_h2_session<H, D, C, K>(
         cookie_jar: Option<&Arc<CookieJar>>,
         alt_svc_registry: &Arc<AltSvcRegistry>,
-        h2_pool: &mut SharedH2Pool,
+        h2_pool: &SharedH2Pool,
         h2_session: Arc<SharedH2Session<ActiveStream>>,
         pool_key: &PoolKey,
         options: &HttpRequestOptions,
@@ -918,7 +929,7 @@ impl HttpClientEngine {
 
     /// Execute an HTTP request with progressive streaming and optional zero-copy BodyRing piping.
     pub fn execute_streaming<H, D, C>(
-        &mut self,
+        &self,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         on_headers: H,
@@ -936,7 +947,7 @@ impl HttpClientEngine {
     /// Execute an HTTP request with progressive streaming, zero-copy BodyRing, and early cancellation check.
     /// Integrates in-memory HTTP caching (`Cache-Control` freshness + `ETag`/`Last-Modified` 304 revalidation).
     pub fn execute_streaming_with_cancel<H, D, C, K>(
-        &mut self,
+        &self,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         mut on_headers: H,
@@ -955,12 +966,18 @@ impl HttpClientEngine {
         let mut is_revalidating = false;
         let mut reval_options: Option<HttpRequestOptions> = None;
 
-        match self.http_cache.lookup(
-            options.session_id,
-            &options.method,
-            &options.url,
-            &options.headers,
-        ) {
+        let cache_lookup = if let Ok(mut cache) = self.http_cache.lock() {
+            cache.lookup(
+                options.session_id,
+                &options.method,
+                &options.url,
+                &options.headers,
+            )
+        } else {
+            CacheLookup::Miss
+        };
+
+        match cache_lookup {
             CacheLookup::Fresh(entry) => {
                 if is_cancelled() {
                     return Ok(false);
@@ -1053,11 +1070,12 @@ impl HttpClientEngine {
         );
 
         if got_304.get() {
-            if let Some(refreshed) = self.http_cache.revalidate_304(
-                options.session_id,
-                &options.url,
-                &cap_headers,
-            ) {
+            let reval = if let Ok(mut cache) = self.http_cache.lock() {
+                cache.revalidate_304(options.session_id, &options.url, &cap_headers)
+            } else {
+                None
+            };
+            if let Some(refreshed) = reval {
                 on_headers(refreshed.status, &refreshed.reason, &refreshed.headers);
                 if !refreshed.body.is_empty() {
                     if let Some(ring) = body_ring {
@@ -1082,22 +1100,24 @@ impl HttpClientEngine {
         }
 
         if res.is_ok() && should_capture && !cap_overflow {
-            self.http_cache.store(
-                options.session_id,
-                &options.method,
-                &options.url,
-                cap_status,
-                &cap_reason,
-                &cap_headers,
-                cap_body,
-            );
+            if let Ok(mut cache) = self.http_cache.lock() {
+                cache.store(
+                    options.session_id,
+                    &options.method,
+                    &options.url,
+                    cap_status,
+                    &cap_reason,
+                    &cap_headers,
+                    cap_body,
+                );
+            }
         }
 
         res
     }
 
     fn execute_streaming_uncached<H, D, C, K>(
-        &mut self,
+        &self,
         options: &HttpRequestOptions,
         body_ring: Option<&BodyRingDescriptor>,
         mut on_headers: H,
@@ -1165,7 +1185,7 @@ impl HttpClientEngine {
 
         let pool_key = PoolKey::new(options.session_id, &host, port, is_tls);
 
-        let active_cookie_jar = if self.manage_cookies {
+        let active_cookie_jar = if self.manage_cookies.load(std::sync::atomic::Ordering::Relaxed) {
             Some(&self.cookie_jar)
         } else {
             None
@@ -1178,7 +1198,7 @@ impl HttpClientEngine {
             match Self::execute_h2_session(
                 active_cookie_jar,
                 &self.alt_svc_registry,
-                &mut self.h2_pool,
+                &self.h2_pool,
                 pooled_h2,
                 &pool_key,
                 options,
@@ -1311,7 +1331,7 @@ impl HttpClientEngine {
                             return Self::execute_h2_session(
                                 active_cookie_jar,
                                 &self.alt_svc_registry,
-                                &mut self.h2_pool,
+                                &self.h2_pool,
                                 h2_session,
                                 &pool_key,
                                 options,
@@ -1337,9 +1357,10 @@ impl HttpClientEngine {
         }
 
         // 1. Check HTTP/1.1 connection pool or establish new connection
+        let pooled_h1 = self.pool.lock().ok().and_then(|mut p| p.get(&pool_key));
         let mut stream = if let Some(s) = preconnected_tls_stream {
             s
-        } else if let Some(pooled) = self.pool.get(&pool_key) {
+        } else if let Some(pooled) = pooled_h1 {
             perf.reused = true;
             pooled.socket
         } else {
@@ -1398,7 +1419,7 @@ impl HttpClientEngine {
                     return Self::execute_h2_session(
                         active_cookie_jar,
                         &self.alt_svc_registry,
-                        &mut self.h2_pool,
+                        &self.h2_pool,
                         h2_session,
                         &pool_key,
                         options,
@@ -1426,7 +1447,7 @@ impl HttpClientEngine {
         let mut has_range_header = false;
         let mut has_accept_encoding = false;
 
-        if self.manage_cookies {
+        if self.manage_cookies.load(std::sync::atomic::Ordering::Relaxed) {
             let mut cookie_map: HashMap<String, String> = HashMap::new();
 
             // 1. Preload matching cookies from RFC 6265 CookieJar (HttpOnly, cross-domain, session cookies)
@@ -1569,7 +1590,7 @@ impl HttpClientEngine {
                             Http1FeedResult::HeadersParsed { status_code, reason, headers, .. } => {
                                 for (k, v) in &headers {
                                     // Automatic Set-Cookie processing into RFC 6265 CookieJar
-                                    if self.manage_cookies && k.eq_ignore_ascii_case("set-cookie") {
+                                    if self.manage_cookies.load(std::sync::atomic::Ordering::Relaxed) && k.eq_ignore_ascii_case("set-cookie") {
                                         self.cookie_jar.process_set_cookie(options.session_id, &parsed_url, v);
                                     }
                                     // Automatic Alt-Svc discovery for HTTP/3
@@ -1675,14 +1696,16 @@ impl HttpClientEngine {
 
         // Return Connection to Pool if keep-alive is active
         if can_keep_alive {
-            self.pool.put(pool_key, stream, false);
+            if let Ok(mut pool) = self.pool.lock() {
+                pool.put(pool_key, stream, false);
+            }
         }
 
         Ok(headers_dispatched)
     }
 
     /// Execute an HTTP request, buffering the response for complete payload retrieval.
-    pub fn execute(&mut self, options: &HttpRequestOptions) -> Result<HttpResponse, String> {
+    pub fn execute(&self, options: &HttpRequestOptions) -> Result<HttpResponse, String> {
         let mut status_code = 0;
         let mut reason_phrase = String::new();
         let mut resp_headers = HashMap::new();
@@ -2530,7 +2553,7 @@ mod tests {
         let store = Arc::new(BoringSessionStore::in_memory());
         let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
         let mut client = HttpClientEngine::new(tls_cfg);
-        client.manage_cookies = false;
+        client.manage_cookies.store(false, std::sync::atomic::Ordering::Relaxed);
 
         let url = format!("http://127.0.0.1:{}/test", port);
         let parsed = Url::parse(&url).unwrap();
