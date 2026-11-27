@@ -228,6 +228,7 @@ pub struct HttpClientEngine {
     h2_pool: SharedH2Pool,
     pub http_cache: super::cache::HttpCache,
     pub cookie_jar: Arc<CookieJar>,
+    pub manage_cookies: bool,
     pub proxy_config: Option<ProxyConfig>,
     pub alt_svc_registry: Arc<AltSvcRegistry>,
     pub dns_resolver: Arc<DnsResolver>,
@@ -245,6 +246,7 @@ impl HttpClientEngine {
             h2_pool: SharedH2Pool::new(Duration::from_secs(60)),
             http_cache: super::cache::HttpCache::new(512, 4 * 1024 * 1024),
             cookie_jar: Arc::new(CookieJar::new()),
+            manage_cookies: true,
             proxy_config: Some(ProxyConfig::from_env()),
             alt_svc_registry: Arc::new(AltSvcRegistry::new()),
             dns_resolver,
@@ -759,11 +761,14 @@ impl HttpClientEngine {
     }
 
     fn prepare_h2_options(
-        cookie_jar: &CookieJar,
+        cookie_jar: Option<&CookieJar>,
         options: &HttpRequestOptions,
         parsed_url: &Url,
     ) -> HttpRequestOptions {
         let mut h2_options = options.clone();
+        let Some(cookie_jar) = cookie_jar else {
+            return h2_options;
+        };
         let mut cookie_map: HashMap<String, String> = HashMap::new();
         if let Some(cookie_val) = cookie_jar.get_cookie_header(options.session_id, parsed_url) {
             for part in cookie_val.split(';') {
@@ -799,7 +804,7 @@ impl HttpClientEngine {
     /// merges CookieJar + caller Cookie header, strips hop-by-hop headers, and
     /// injects `accept-encoding: gzip, deflate, br, zstd` when transparent decompression applies.
     pub(crate) fn prepare_h3_options(
-        cookie_jar: &CookieJar,
+        cookie_jar: Option<&CookieJar>,
         options: &HttpRequestOptions,
         parsed_url: &Url,
     ) -> HttpRequestOptions {
@@ -827,7 +832,7 @@ impl HttpClientEngine {
 
     #[allow(clippy::too_many_arguments)]
     fn execute_h2_session<H, D, C, K>(
-        cookie_jar: &Arc<CookieJar>,
+        cookie_jar: Option<&Arc<CookieJar>>,
         alt_svc_registry: &Arc<AltSvcRegistry>,
         h2_pool: &mut SharedH2Pool,
         h2_session: Arc<SharedH2Session<ActiveStream>>,
@@ -852,8 +857,8 @@ impl HttpClientEngine {
         // Register in shared pool immediately so concurrent callers can multiplex on this session
         h2_pool.put(pool_key.clone(), h2_session.clone());
 
-        let h2_options = Self::prepare_h2_options(cookie_jar, options, parsed_url);
-        let cookie_jar = cookie_jar.clone();
+        let h2_options = Self::prepare_h2_options(cookie_jar.map(|j| j.as_ref()), options, parsed_url);
+        let cookie_jar = cookie_jar.cloned();
         let alt_svc_registry = alt_svc_registry.clone();
         let session_id = options.session_id;
         let parsed_url_clone = parsed_url.clone();
@@ -880,7 +885,9 @@ impl HttpClientEngine {
                 status_ref.set(status);
                 for (k, v) in headers {
                     if k.eq_ignore_ascii_case("set-cookie") {
-                        cookie_jar.process_set_cookie(session_id, &parsed_url_clone, v);
+                        if let Some(ref jar) = cookie_jar {
+                            jar.process_set_cookie(session_id, &parsed_url_clone, v);
+                        }
                     }
                     if k.eq_ignore_ascii_case("alt-svc") {
                         alt_svc_registry.insert(&host_clone, port, v);
@@ -1158,12 +1165,18 @@ impl HttpClientEngine {
 
         let pool_key = PoolKey::new(options.session_id, &host, port, is_tls);
 
+        let active_cookie_jar = if self.manage_cookies {
+            Some(&self.cookie_jar)
+        } else {
+            None
+        };
+
         // 0. Check pooled HTTP/2 sessions FIRST before any H3 attempt (skips HEv3 race if warm H2Session exists)
         if let Some(pooled_h2) = self.h2_pool.get(&pool_key) {
             perf.proto = "h2";
             perf.reused = true;
             match Self::execute_h2_session(
-                &self.cookie_jar,
+                active_cookie_jar,
                 &self.alt_svc_registry,
                 &mut self.h2_pool,
                 pooled_h2,
@@ -1219,9 +1232,9 @@ impl HttpClientEngine {
                         );
                         perf.tcp_tls_ms = h3_ms;
 
-                        // Full middleware parity for HTTP/3: CookieJar merge/Set-Cookie, hop-by-hop strip, Accept-Encoding
-                        let h3_options = Self::prepare_h3_options(&self.cookie_jar, options, &parsed_url);
-                        let cookie_jar_h3 = self.cookie_jar.clone();
+                        // Full middleware parity for HTTP/3: optional CookieJar merge/Set-Cookie, hop-by-hop strip, Accept-Encoding
+                        let h3_options = Self::prepare_h3_options(active_cookie_jar.map(|j| j.as_ref()), options, &parsed_url);
+                        let cookie_jar_h3 = active_cookie_jar.cloned();
                         let alt_svc_h3 = self.alt_svc_registry.clone();
                         let parsed_url_h3 = parsed_url.clone();
                         let host_h3 = host.clone();
@@ -1243,7 +1256,9 @@ impl HttpClientEngine {
                                 status_cell.set(status);
                                 for (k, v) in headers {
                                     if k.eq_ignore_ascii_case("set-cookie") {
-                                        cookie_jar_h3.process_set_cookie(session_id_h3, &parsed_url_h3, v);
+                                        if let Some(ref jar) = cookie_jar_h3 {
+                                            jar.process_set_cookie(session_id_h3, &parsed_url_h3, v);
+                                        }
                                     }
                                     if k.eq_ignore_ascii_case("alt-svc") {
                                         alt_svc_h3.insert(&host_h3, port, v);
@@ -1294,7 +1309,7 @@ impl HttpClientEngine {
                             perf.proto = "h2";
                             let h2_session = SharedH2Session::new(H2Session::new(tls_stream)?);
                             return Self::execute_h2_session(
-                                &self.cookie_jar,
+                                active_cookie_jar,
                                 &self.alt_svc_registry,
                                 &mut self.h2_pool,
                                 h2_session,
@@ -1381,7 +1396,7 @@ impl HttpClientEngine {
                     perf.proto = "h2";
                     let h2_session = SharedH2Session::new(H2Session::new(tls_stream)?);
                     return Self::execute_h2_session(
-                        &self.cookie_jar,
+                        active_cookie_jar,
                         &self.alt_svc_registry,
                         &mut self.h2_pool,
                         h2_session,
@@ -1411,28 +1426,51 @@ impl HttpClientEngine {
         let mut has_range_header = false;
         let mut has_accept_encoding = false;
 
-        let mut cookie_map: HashMap<String, String> = HashMap::new();
+        if self.manage_cookies {
+            let mut cookie_map: HashMap<String, String> = HashMap::new();
 
-        // 1. Preload matching cookies from RFC 6265 CookieJar (HttpOnly, cross-domain, session cookies)
-        if let Some(cookie_val) = self.cookie_jar.get_cookie_header(options.session_id, &parsed_url) {
-            for part in cookie_val.split(';') {
-                let trimmed = part.trim();
-                if let Some((ck, cv)) = trimmed.split_once('=') {
-                    cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
-                }
-            }
-        }
-
-        // 2. Process caller headers: merge any Cookie header with jar cookies, track range/encoding
-        for (k, v) in &options.headers {
-            if k.eq_ignore_ascii_case("cookie") {
-                for part in v.split(';') {
+            // 1. Preload matching cookies from RFC 6265 CookieJar (HttpOnly, cross-domain, session cookies)
+            if let Some(cookie_val) = self.cookie_jar.get_cookie_header(options.session_id, &parsed_url) {
+                for part in cookie_val.split(';') {
                     let trimmed = part.trim();
                     if let Some((ck, cv)) = trimmed.split_once('=') {
                         cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
                     }
                 }
-            } else {
+            }
+
+            // 2. Process caller headers: merge any Cookie header with jar cookies, track range/encoding
+            for (k, v) in &options.headers {
+                if k.eq_ignore_ascii_case("cookie") {
+                    for part in v.split(';') {
+                        let trimmed = part.trim();
+                        if let Some((ck, cv)) = trimmed.split_once('=') {
+                            cookie_map.insert(ck.trim().to_string(), cv.trim().to_string());
+                        }
+                    }
+                } else {
+                    if k.eq_ignore_ascii_case("range") {
+                        has_range_header = true;
+                    }
+                    if k.eq_ignore_ascii_case("accept-encoding") {
+                        has_accept_encoding = true;
+                    }
+                    req_builder = req_builder.header(k, v);
+                }
+            }
+
+            // 3. Inject unified merged Cookie header if any cookies exist
+            if !cookie_map.is_empty() {
+                let mut cookie_pairs: Vec<String> = cookie_map
+                    .into_iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect();
+                cookie_pairs.sort();
+                req_builder = req_builder.header("Cookie", &cookie_pairs.join("; "));
+            }
+        } else {
+            // Caller (e.g. WebKit NetworkStorageSession) manages cookies exclusively.
+            for (k, v) in &options.headers {
                 if k.eq_ignore_ascii_case("range") {
                     has_range_header = true;
                 }
@@ -1441,16 +1479,6 @@ impl HttpClientEngine {
                 }
                 req_builder = req_builder.header(k, v);
             }
-        }
-
-        // 3. Inject unified merged Cookie header if any cookies exist
-        if !cookie_map.is_empty() {
-            let mut cookie_pairs: Vec<String> = cookie_map
-                .into_iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
-            cookie_pairs.sort();
-            req_builder = req_builder.header("Cookie", &cookie_pairs.join("; "));
         }
 
         // Range requests must not request transparent compression because partial slices cannot
@@ -1541,7 +1569,7 @@ impl HttpClientEngine {
                             Http1FeedResult::HeadersParsed { status_code, reason, headers, .. } => {
                                 for (k, v) in &headers {
                                     // Automatic Set-Cookie processing into RFC 6265 CookieJar
-                                    if k.eq_ignore_ascii_case("set-cookie") {
+                                    if self.manage_cookies && k.eq_ignore_ascii_case("set-cookie") {
                                         self.cookie_jar.process_set_cookie(options.session_id, &parsed_url, v);
                                     }
                                     // Automatic Alt-Svc discovery for HTTP/3
@@ -2441,7 +2469,7 @@ mod tests {
             .header("Transfer-Encoding", "chunked")
             .header("User-Agent", "Zawra/1.0");
 
-        let prepared = HttpClientEngine::prepare_h3_options(&jar, &opts, &url);
+        let prepared = HttpClientEngine::prepare_h3_options(Some(&jar), &opts, &url);
         // Hop-by-hop headers must be stripped
         assert!(!prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")));
         assert!(!prepared.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")));
@@ -2463,7 +2491,7 @@ mod tests {
         // Range requests must NOT inject Accept-Encoding
         let range_opts = HttpRequestOptions::new("GET", "https://example.com/video.mp4")
             .header("Range", "bytes=0-1023");
-        let prepared_range = HttpClientEngine::prepare_h3_options(&jar, &range_opts, &url);
+        let prepared_range = HttpClientEngine::prepare_h3_options(Some(&jar), &range_opts, &url);
         assert!(!prepared_range
             .headers
             .iter()
@@ -2481,5 +2509,59 @@ mod tests {
             .set_tls_profile(TlsFingerprintProfile::Firefox)
             .expect("switch to Firefox profile");
         assert_eq!(client.boring_tls().profile, TlsFingerprintProfile::Firefox);
+    }
+
+    #[test]
+    fn test_manage_cookies_false_bypasses_cookie_jar_and_forwards_caller_cookies() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let response = "HTTP/1.1 200 OK\r\nSet-Cookie: server_cookie=abc; Path=/\r\nContent-Length: 2\r\n\r\nok";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let store = Arc::new(BoringSessionStore::in_memory());
+        let tls_cfg = Arc::new(BoringTlsConfig::new(TlsFingerprintProfile::Chrome, store).unwrap());
+        let mut client = HttpClientEngine::new(tls_cfg);
+        client.manage_cookies = false;
+
+        let url = format!("http://127.0.0.1:{}/test", port);
+        let parsed = Url::parse(&url).unwrap();
+        assert!(client.cookie_jar.process_set_cookie(1, &parsed, "jar_only=should_not_send; Path=/"));
+
+        let opts = HttpRequestOptions::new("GET", &url)
+            .with_session(1)
+            .header("Cookie", "webkit_cookie=from_webkit");
+
+        let mut emitted_set_cookie = false;
+        let _ = client
+            .execute_streaming(
+                &opts,
+                None,
+                |_status, _reason, headers| {
+                    if headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("set-cookie") && v.contains("server_cookie=abc")) {
+                        emitted_set_cookie = true;
+                    }
+                },
+                |_chunk| {},
+                |_ka| {},
+            )
+            .expect("request succeeds");
+        let _ = server_thread.join();
+
+        let raw_req = rx.recv().expect("received request");
+        assert!(raw_req.contains("Cookie: webkit_cookie=from_webkit"), "expected caller Cookie untouched, got: {}", raw_req);
+        assert!(!raw_req.contains("jar_only=should_not_send"), "jar cookie must not be merged when manage_cookies=false");
+        assert!(emitted_set_cookie, "Set-Cookie must still be emitted to on_headers");
+
+        let jar_after = client.cookie_jar.get_cookie_header(1, &parsed).unwrap_or_default();
+        assert!(!jar_after.contains("server_cookie=abc"), "Set-Cookie must not be stored in z-net CookieJar when manage_cookies=false");
     }
 }

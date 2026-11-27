@@ -884,6 +884,20 @@ pub extern "C" fn net_get_last_error(
     NS_OK
 }
 
+/// Enable or disable `z-net`'s internal `CookieJar` management.
+/// When disabled (`false`), `z-net` passes caller `Cookie` headers untouched and
+/// skips writing `Set-Cookie` headers into its internal `CookieJar`, while still
+/// forwarding all `Set-Cookie` headers to `on_headers` callbacks (e.g. for WebKit's
+/// `NetworkStorageSession` to manage cookies exclusively).
+#[no_mangle]
+pub extern "C" fn net_engine_set_manage_cookies(engine_handle: NetEngineHandle, enabled: bool) {
+    if engine_handle.is_null() {
+        return;
+    }
+    let engine = unsafe { &mut *(engine_handle as *mut NetEngine) };
+    engine.http_engine.manage_cookies = enabled;
+}
+
 #[no_mangle]
 pub extern "C" fn net_http_execute_streaming(
     engine_handle: NetEngineHandle,
